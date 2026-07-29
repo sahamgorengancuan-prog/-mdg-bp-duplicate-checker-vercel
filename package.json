@@ -1,0 +1,10 @@
+{
+  "name": "mdg-bp-duplicate-checker",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "MDG BP Duplicate Checker API - Vercel Functions (Node.js runtime). Ported from the Cloudflare Pages Functions version: same duplicate-check logic, same defaults, same environment variable names.",
+  "engines": {
+    "node": ">=20"
+  }
+}

@@ -1,0 +1,41 @@
+MDG BP Duplicate Checker - Vercel-ready package
+
+Deploy target:
+- Vercel (Vercel Functions, Node.js runtime), Framework Preset: Other
+- Import via Git (GitHub/GitLab/Bitbucket) at vercel.com/new, or `vercel --prod` from CLI
+- No Wrangler / Cloudflare dashboard needed
+
+Logic parity with the Cloudflare Pages version:
+- _lib/duplicate.js is unchanged except 2 message strings (Vercel dashboard wording
+  instead of Cloudflare dashboard wording). Same algorithm core, same env var names,
+  same defaults for threshold/candidates/batch/cache/rate-limit.
+- Similarity weighting is now configurable: SIMILARITY_WEIGHT_LEVENSHTEIN (default 60),
+  SIMILARITY_WEIGHT_JACCARD (default 30), SIMILARITY_WEIGHT_NUMERIC (default 10).
+  Values are normalized by their own sum, so any ratio works. Check the active
+  weights anytime via GET /api/health -> config.similarity_weights.
+- Fixed 3 over-sensitivity bugs found in the original matching logic:
+  1. A hard ±5-character length cutoff (in 3 places) that fully excluded candidates
+     missing/adding one ordinary word. Now proportional and configurable via
+     LENGTH_TOLERANCE_PERCENT (default 30) / LENGTH_TOLERANCE_MIN_CHARS (default 12).
+  2. Exact-token Jaccard treated a 1-character typo as a complete token mismatch.
+     Now fuzzy for tokens >=4 chars (short admin codes like rt/rw stay exact-only).
+  3. Numeric similarity concatenated house number + RT + RW into one digit blob before
+     comparing, so a single-digit house-number change scored 0% even with identical
+     RT/RW. Now compares each number as its own chunk (extracted from norm_text,
+     which still preserves the original spacing) - no re-sync of the Google Sheet
+     needed, this is a comparison-time fix only.
+- api/*.js are thin routing adapters (Vercel `fetch(request)` convention) that call
+  the exact same handleCheck/handleHealth/handleOptions/json functions.
+- public/index.html unchanged except 3 cosmetic UI labels ("Cloudflare" -> "Vercel").
+
+Important:
+- Do not commit .env
+- Do not commit service_account.json
+- Set GOOGLE_SERVICE_ACCOUNT_JSON_B64 in Vercel Project > Settings > Environment Variables
+  (mark it Sensitive)
+- Non-secret vars (SHEET_ID, SIMILARITY_THRESHOLD, etc.) are optional — defaults are
+  already baked into _lib/duplicate.js
+- Run Python sync locally/on Windows server to populate the protected Google Sheet
+  (unrelated to hosting platform, works the same as before)
+- package.json has "type": "module" — required for the import/export syntax to work
+  on Node.js; do not delete it
