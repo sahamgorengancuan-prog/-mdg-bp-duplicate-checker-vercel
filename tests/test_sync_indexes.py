@@ -116,3 +116,21 @@ def test_full_12000_row_fixture_all_exact_hashes_and_row_pointers_complete():
         record = bp.iloc[int(e.bp_db_row) - 2]
         assert e.bp_id == record.bp_id
         assert e.exact_hash == mod.exact_hash(record.name_1, record.address)
+
+
+def test_sync_lock_rejects_overlapping_jobs_and_releases_on_exit(tmp_path, monkeypatch):
+    import pytest
+    monkeypatch.setattr(mod, "LOG_DIR", str(tmp_path))
+    with mod.single_sync_lock():
+        with pytest.raises(RuntimeError, match="SYNC ALREADY RUNNING"):
+            with mod.single_sync_lock():
+                pass
+    with mod.single_sync_lock():
+        pass
+
+
+def test_sync_logging_has_no_unsupported_thousands_separator():
+    source = MODULE_PATH.read_text(encoding="utf-8")
+    assert 'logging.info("Fetched %,d' not in source
+    assert 'logging.info("Writing %s: %,d' not in source
+    assert "ws.update(range_name=" in source

@@ -30,6 +30,7 @@ import logging
 import uuid
 import hashlib
 import unicodedata
+from contextlib import contextmanager
 from datetime import datetime
 from typing import Dict, Iterable, List, Tuple
 
@@ -139,7 +140,7 @@ def fetch_pg_dataframe() -> pd.DataFrame:
     with db_connect() as conn:
         logging.info("Running query...")
         df = pd.read_sql_query(query, conn)
-    logging.info("Fetched %,d rows", len(df))
+    logging.info("Fetched %s rows", f"{len(df):,}")
     if df.empty:
         raise ValueError("PostgreSQL returned zero BP rows. Refusing to replace the live database with an empty snapshot.")
     return df
@@ -227,7 +228,7 @@ def prepare_indexes(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame, pd.Da
     cell_estimate = len(bp_out) * len(bp_out.columns) + len(ktp_out) * len(ktp_out.columns) + len(exact_out) * len(exact_out.columns) + 10000
     if cell_estimate > int(os.environ.get("GSHEET_MAX_CELL_WARNING", "9500000")):
         logging.warning(
-            "Estimated Google Sheet cells %,d is close to or above safe limit. Consider reducing columns or moving index to a dedicated database.",
+            "Estimated Google Sheet cells %s is close to or above safe limit. Consider reducing columns or moving index to a dedicated database.",
             cell_estimate,
         )
 
@@ -325,7 +326,7 @@ def write_dataframe(sh, title: str, df: pd.DataFrame, chunk_size: int = 20000) -
     rows = len(df) + 1
     cols = len(df.columns)
     ws = get_or_create_worksheet(sh, title, rows=max(rows, 100), cols=cols)
-    logging.info("Writing %s: %,d rows x %,d cols", title, rows, cols)
+    logging.info("Writing %s: %s rows x %s cols", title, f"{rows:,}", f"{cols:,}")
     ws.clear()
     # Google Sheets has a 10-million-CELL limit per workbook.  Old code padded
     # every large data tab to 10 columns even when only 4 or 8 were needed.
@@ -339,8 +340,8 @@ def write_dataframe(sh, title: str, df: pd.DataFrame, chunk_size: int = 20000) -
         row_start = start_idx + 1
         row_end = start_idx + len(chunk)
         col_end = column_letter(cols)
-        ws.update(f"A{row_start}:{col_end}{row_end}", chunk, value_input_option="RAW")
-        logging.info("%s updated rows %,d-%,d", title, row_start, row_end)
+        ws.update(range_name=f"A{row_start}:{col_end}{row_end}", values=chunk, value_input_option="RAW")
+        logging.info("%s updated rows %s-%s", title, f"{row_start:,}", f"{row_end:,}")
         time.sleep(float(os.environ.get("GSHEET_WRITE_SLEEP_SECONDS", "0.2")))
     return ws.id
 
@@ -416,9 +417,52 @@ def preflight_sheet_capacity(sh, planned: Dict[str, pd.DataFrame]) -> None:
         other_cells += int(grid.get("rowCount", 0)) * int(grid.get("columnCount", 0))
     projected = other_cells + sum(max(len(df) + 1, 100) * len(df.columns) for df in planned.values())
     max_cells = int(os.environ.get("GSHEET_MAX_CELLS", "10000000"))
-    logging.info("Projected workbook cells after column compaction: %,d / %,d", projected, max_cells)
+    logging.info("Projected workbook cells after column compaction: %s / %s", f"{projected:,}", f"{max_cells:,}")
     if projected > max_cells:
         raise ValueError(f"Insufficient Google Sheets capacity: projected {projected:,} cells exceeds {max_cells:,}. No tabs were modified.")
+
+
+@contextmanager
+def single_sync_lock():
+    """Hold an OS-level nonblocking lock for the entire sync (including DB fetch).
+
+    The lock file may remain on disk after a crash. The operating system releases
+    its byte-range lock when the owning process exits. Do not delete it.
+    """
+    path = os.path.join(LOG_DIR, ".sync_gsheet_indexed.lock")
+    with open(path, "a+b") as lock_file:
+        lock_file.seek(0, os.SEEK_END)
+        if lock_file.tell() == 0:
+            lock_file.write(b"0")
+            lock_file.flush()
+        lock_file.seek(0)
+        if os.name == "nt":
+            import msvcrt
+            try:
+                msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
+            except OSError as exc:
+                raise RuntimeError(
+                    "SYNC ALREADY RUNNING: another scheduled/manual job holds the sync lock. "
+                    "This job has NOT written any Sheet data."
+                ) from exc
+            try:
+                yield
+            finally:
+                lock_file.seek(0)
+                msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+            try:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError as exc:
+                raise RuntimeError(
+                    "SYNC ALREADY RUNNING: another job holds the sync lock. "
+                    "This job has NOT written any Sheet data."
+                ) from exc
+            try:
+                yield
+            finally:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 
 def main():
@@ -465,4 +509,9 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        with single_sync_lock():
+            main()
+    except RuntimeError as exc:
+        logging.error("%s", exc)
+        sys.exit(2)
