@@ -323,6 +323,7 @@
     const result = $('result');
     const btn = $('submitBtn');
     const API_BASE = location.origin;
+    const EXPECTED_ENGINE_VERSION = '2026-09-22-exact-index-v2';
 
     async function checkHealth() {
       const dot = $('healthDot');
@@ -330,12 +331,15 @@
       try {
         const res = await fetch(API_BASE + '/api/health', { cache: 'no-store' });
         const json = await res.json();
-        if (!json.ok) throw new Error(json.error || 'API unhealthy');
+        if (!json.ok) throw new Error(json.sheet_error || json.error || 'API unhealthy');
+        if (json.engine_version !== EXPECTED_ENGINE_VERSION || json.meta?.exact_index_version !== '1' || json.meta?.sync_state !== 'READY' || !json.exact_index_ready) {
+          throw new Error('API/snapshot mismatch: deploy exact-index API and run patched full sync.');
+        }
         dot.classList.add('ok');
-        txt.textContent = json.meta?.last_sync_at ? `Online · Last sync ${json.meta.last_sync_at}` : 'Online · API ready';
+        txt.textContent = `Ready · Exact index v${json.meta.exact_index_version} · Sync ${json.meta?.last_sync_at || 'unknown'}`;
       } catch (e) {
         dot.classList.remove('ok');
-        txt.textContent = 'API not connected';
+        txt.textContent = e.message || 'API not connected';
       }
     }
 
@@ -359,6 +363,9 @@
         });
         const json = await res.json();
         if (!res.ok || !json.ok) throw new Error(json.error || 'Check failed');
+        if (json.engine_version !== EXPECTED_ENGINE_VERSION || json.meta?.exact_index_version !== '1' || json.meta?.sync_state !== 'READY') {
+          throw new Error('Backend version or exact index is outdated; result cannot be treated as PASS.');
+        }
         renderResult(json);
       } catch (err) {
         result.innerHTML = errorHtml(err.message || 'Unexpected error');
@@ -398,6 +405,8 @@
             <div class="kv"><span>Scanned</span><strong>${data.stats?.scanned_candidates ?? 0}</strong></div>
             <div class="kv"><span>Compared</span><strong>${data.stats?.compared_candidates ?? 0}</strong></div>
             <div class="kv"><span>Coverage</span><strong>${data.exact_ktp_match || data.exact_name_address_match ? "Exact verified" : data.stats?.coverage_complete ? "Complete" : "Partial / not PASS"}</strong></div>
+            <div class="kv"><span>Exact lookup</span><strong>${data.exact_lookup?.attempted ? `Shard ${data.exact_lookup.shard_present ? "present" : "absent"}; matches ${data.exact_lookup.matching_index_rows}` : "Not requested"}</strong></div>
+            <div class="kv"><span>Engine</span><strong>${escapeHtml(data.engine_version || "unknown")}</strong></div>
             <div class="kv"><span>Elapsed</span><strong>${data.stats?.elapsed_ms ?? 0} ms</strong></div>
           </div>
           <p class="footer-note">Result only returns relevant match previews. Full protected Google Sheet data is not exposed to the browser.</p>

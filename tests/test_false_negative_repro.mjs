@@ -207,3 +207,29 @@ test('health rejects old snapshots and accepts new prepared indexes',async()=>{
 });
 
 test.after(()=>{globalThis.fetch=originalFetch;});
+
+
+test('health and exact response disclose running engine and index readiness without secrets', async()=>{
+  const f=fixture([row('TEST-BP','Example Shop','A sample street address')]);
+  const health = await handleHealth({env:f.env});
+  const hb = await health.json();
+  assert.equal(hb.engine_version,'2026-09-22-exact-index-v2');
+  assert.equal(hb.exact_index_ready,true);
+  assert.equal(health.headers.get('x-bp-checker-engine'),'2026-09-22-exact-index-v2');
+  const r=await run(f,{name_1:'Example Shop',address:'A sample street address'});
+  assert.equal(r.body.decision,'FAIL');
+  assert.equal(r.body.exact_lookup.attempted,true);
+  assert.equal(r.body.exact_lookup.matching_index_rows,1);
+  assert.equal(r.body.exact_lookup.verified_matches,1);
+});
+
+test('health fails closed when META claims exact index smaller than BP_DATABASE',async()=>{
+  const f=fixture([row('TEST-BP','Example Shop','A sample street address')]);
+  const exactTotal=f.data.get('META').find(r=>r[0]==='total_exact_index_rows');
+  exactTotal[1]='0';
+  const r=await run(f,{name_1:'Example Shop',address:'A sample street address'});
+  assert.equal(r.status,503);
+  const health=await handleHealth({env:f.env});
+  assert.equal(health.status,503);
+  assert.equal((await health.json()).exact_index_ready,false);
+});

@@ -10,6 +10,7 @@ import { createHash } from 'node:crypto';
   Browser never receives OAuth credential, refresh token, or raw database dump.
 */
 
+export const ENGINE_VERSION = '2026-09-22-exact-index-v2';
 const GOOGLE_TOKEN_URL = 'https://oauth2.googleapis.com/token';
 const TOKEN_TTL_SAFETY_SECONDS = 90;
 
@@ -84,9 +85,7 @@ export async function handleHealth(context) {
   if (cfg.sheet_id_configured && cfg.oauth_configured) {
     try {
       meta = await getMeta(context.env);
-      if (!meta.sync_id || meta.exact_index_version !== '1' || meta.sync_state !== 'READY') {
-        throw httpError(503, 'Exact match index not ready: run new full sync.');
-      }
+      requireReadyExactIndex(meta);
       await getIndexMap(context.env, 'INDEX_LEN', 'len', meta);
       await getIndexMap(context.env, 'INDEX_EXACT_SHARD', 'exact', meta);
       sheet_ok = true;
@@ -97,6 +96,8 @@ export async function handleHealth(context) {
 
   return json({
     ok: cfg.sheet_id_configured && cfg.oauth_configured && sheet_ok,
+    engine_version: ENGINE_VERSION,
+    exact_index_ready: sheet_ok,
     service: 'MDG BP Duplicate Checker API',
     config: cfg,
     sheet_ok,
@@ -110,12 +111,13 @@ export function handleOptions() {
 }
 
 export function json(data, status = 200) {
-  return new Response(JSON.stringify(data), {
+  return new Response(JSON.stringify({ engine_version: ENGINE_VERSION, ...data }), {
     status,
     headers: {
       ...corsHeaders(),
       'content-type': 'application/json; charset=utf-8',
-      'cache-control': 'no-store'
+      'cache-control': 'no-store',
+      'x-bp-checker-engine': ENGINE_VERSION
     }
   });
 }
@@ -212,9 +214,7 @@ async function duplicateCheck(payload, env) {
   const batchRows = Math.max(1, Number(env.MAX_BATCH_ROWS || DEFAULT_MAX_BATCH_ROWS));
   const weights = getSimilarityWeights(env);
   const meta = await getMeta(env);
-  if (!meta.sync_id || meta.sync_state !== 'READY' || !Number.isSafeInteger(Number(meta.total_bp_rows))) {
-    throw httpError(503, 'META is incomplete or sync is in progress. Run the indexed sync fully before checking BP.');
-  }
+  requireReadyExactIndex(meta);
   const result = {
     ok: true,
     decision: 'INCONCLUSIVE',
@@ -226,6 +226,7 @@ async function duplicateCheck(payload, env) {
     exact_ktp_match: null,
     exact_name_address_match: null,
     exact_match_count: 0,
+    exact_lookup: { attempted: false, index_version: meta.exact_index_version, shard_present: null, shard_rows: 0, matching_index_rows: 0, verified_matches: 0 },
     similarity_match: null,
     top_candidates: [],
     stats: {
@@ -252,6 +253,7 @@ async function duplicateCheck(payload, env) {
   // never a silent PASS. Validate collision candidates against BOTH actual fields.
   if (name1 && address) {
     const exact = await findExactNameAddress(name1, address, env, meta);
+    result.exact_lookup = exact.diagnostics;
     result.exact_match_count = exact.count;
     if (exact.count) {
       result.decision = 'FAIL';
@@ -363,6 +365,20 @@ async function duplicateCheck(payload, env) {
   return result;
 }
 
+function requireReadyExactIndex(meta) {
+  const bp = Number(meta.total_bp_rows);
+  const exact = Number(meta.total_exact_index_rows);
+  if (meta.sync_state === 'IN_PROGRESS') {
+    throw httpError(503, 'META sync is in progress: wait until the patched full sync has completed.');
+  }
+  if (!meta.sync_id || meta.sync_state !== 'READY'
+      || meta.exact_index_version !== '1'
+      || !Number.isSafeInteger(bp) || bp <= 0
+      || !Number.isSafeInteger(exact) || exact !== bp) {
+    throw httpError(503, 'Exact name/address index not ready: run the patched full sync and verify META sync_state=READY, exact_index_version=1, total_exact_index_rows=total_bp_rows.');
+  }
+}
+
 function exactNameAddressHash(name, address) {
   return createHash('sha256')
     .update(`${normalizeText(name)}\x1f${normalizeText(address)}`, 'utf8')
@@ -376,7 +392,7 @@ async function findExactNameAddress(name, address, env, meta) {
   const shardMap = await getIndexMap(env, 'INDEX_EXACT_SHARD', 'exact', meta);
   const hash = exactNameAddressHash(name, address);
   const info = shardMap.get(hash.slice(0, 2));
-  if (!info) return { matches: [], count: 0 };
+  if (!info) return { matches: [], count: 0, diagnostics: { attempted: true, index_version: meta.exact_index_version, shard_present: false, shard_rows: 0, matching_index_rows: 0, verified_matches: 0 } };
   const rows = await getSheetRange(env, `EXACT_INDEX!A${info.row_start}:D${info.row_end}`, meta.sync_id);
   if (rows.length !== info.count) {
     throw httpError(503, 'EXACT_INDEX shard contains fewer rows than advertised. Run a full sync.');
@@ -412,7 +428,7 @@ async function findExactNameAddress(name, address, env, meta) {
       if (matches.length < 5) matches.push(candidate);
     }
   }
-  return { matches, count: pointers.length };
+  return { matches, count: pointers.length, diagnostics: { attempted: true, index_version: meta.exact_index_version, shard_present: true, shard_rows: rows.length, matching_index_rows: pointers.length, verified_matches: matches.length } }; 
 }
 
 async function findExactKtp(ktpDigits, env, activeMeta) {
