@@ -1,3 +1,5 @@
+import { createHash } from 'node:crypto';
+
 /*
   MDG BP Duplicate Checker - shared duplicate-check engine (Vercel Functions, Node.js runtime)
   Ported from the Cloudflare Pages Functions version: same algorithm, same thresholds,
@@ -5,14 +7,13 @@
   (see /api/*.js), because this file only receives a plain { request, env } context object
   and never touches Cloudflare- or Vercel-specific APIs directly.
   Data source remains protected Google Sheet.
-  Browser never receives service account credential or raw database dump.
+  Browser never receives OAuth credential, refresh token, or raw database dump.
 */
 
 const GOOGLE_TOKEN_URL = 'https://oauth2.googleapis.com/token';
-const GOOGLE_SCOPE = 'https://www.googleapis.com/auth/spreadsheets.readonly';
 const TOKEN_TTL_SAFETY_SECONDS = 90;
 
-const DEFAULT_SHEET_ID = '1VepIImbAMSMaDvRo6Vos9nRzxjiVWUYcestTizNJSjo';
+const DEFAULT_SHEET_ID = '1ZtNDikRHklwQMYxWQ6hkL1clvdH6g_Xfd3ojr5APDjo';
 const DEFAULT_SIMILARITY_THRESHOLD = 92;
 const DEFAULT_SIMILARITY_DIRECT_REJECT_THRESHOLD = 80;
 const DEFAULT_MAX_CANDIDATES = 60000;
@@ -80,9 +81,14 @@ export async function handleHealth(context) {
   let sheet_ok = false;
   let sheet_error = '';
 
-  if (cfg.sheet_id_configured && cfg.service_account_configured) {
+  if (cfg.sheet_id_configured && cfg.oauth_configured) {
     try {
       meta = await getMeta(context.env);
+      if (!meta.sync_id || meta.exact_index_version !== '1' || meta.sync_state !== 'READY') {
+        throw httpError(503, 'Exact match index not ready: run new full sync.');
+      }
+      await getIndexMap(context.env, 'INDEX_LEN', 'len', meta);
+      await getIndexMap(context.env, 'INDEX_EXACT_SHARD', 'exact', meta);
       sheet_ok = true;
     } catch (err) {
       sheet_error = err?.message || String(err);
@@ -90,13 +96,13 @@ export async function handleHealth(context) {
   }
 
   return json({
-    ok: cfg.sheet_id_configured && cfg.service_account_configured && sheet_ok,
+    ok: cfg.sheet_id_configured && cfg.oauth_configured && sheet_ok,
     service: 'MDG BP Duplicate Checker API',
     config: cfg,
     sheet_ok,
     sheet_error,
     meta
-  }, cfg.sheet_id_configured && cfg.service_account_configured ? 200 : 500);
+  }, !(cfg.sheet_id_configured && cfg.oauth_configured) ? 500 : sheet_ok ? 200 : 503);
 }
 
 export function handleOptions() {
@@ -126,7 +132,8 @@ function corsHeaders() {
 export function configStatus(env) {
   return {
     sheet_id_configured: Boolean(getSheetId(env)),
-    service_account_configured: Boolean(env.GOOGLE_SERVICE_ACCOUNT_JSON_B64 || env.GOOGLE_SERVICE_ACCOUNT_JSON || (env.GOOGLE_CLIENT_EMAIL && env.GOOGLE_PRIVATE_KEY)),
+    oauth_configured: Boolean(env.GOOGLE_OAUTH_CLIENT_ID && env.GOOGLE_OAUTH_CLIENT_SECRET && env.GOOGLE_OAUTH_REFRESH_TOKEN),
+    auth_mode: 'oauth_user_refresh_token',
     using_default_sheet_id: !Boolean(env.SHEET_ID),
     similarity_threshold: Number(env.SIMILARITY_THRESHOLD || DEFAULT_SIMILARITY_THRESHOLD),
     similarity_direct_reject_threshold: getSimilarityDirectRejectThreshold(env),
@@ -182,10 +189,10 @@ function getSimilarityDirectRejectThreshold(env) {
 
 function configHint(message = '') {
   const m = String(message).toLowerCase();
-  if (m.includes('service account')) return 'Set GOOGLE_SERVICE_ACCOUNT_JSON_B64 or GOOGLE_SERVICE_ACCOUNT_JSON in Vercel Project > Settings > Environment Variables. Share the Google Sheet to the service account client_email.';
-  if (m.includes('sheet_id')) return 'Set SHEET_ID in Vercel Environment Variables if you want to override it (optional — a default is already baked into this file). Redeploy after adding it.';
-  if (m.includes('google sheets api')) return 'Check Google Sheet sharing permission, service account, tab names, and whether the sync already created BP_DATABASE/KTP_INDEX/INDEX_LEN/INDEX_KTP_SHARD/META.';
-  return 'Check Vercel Environment Variables, Google Sheet sharing, Google Sheet tab/index readiness, or Vercel Deployment Protection.';
+  if (m.includes('oauth') || m.includes('refresh token')) return 'Set GOOGLE_OAUTH_CLIENT_ID, GOOGLE_OAUTH_CLIENT_SECRET, and GOOGLE_OAUTH_REFRESH_TOKEN in Vercel Project > Settings > Environment Variables. Authorize with a @wingscorp.com account that has access to the Google Sheet.';
+  if (m.includes('sheet_id')) return 'Set SHEET_ID in Vercel Environment Variables if you want to override it (optional — the Wings company Sheet ID is already baked into this file). Redeploy after adding it.';
+  if (m.includes('google sheets api')) return 'Check OAuth account permission, company Google Sheet access, tab names, and whether the sync already created BP_DATABASE/KTP_INDEX/INDEX_LEN/INDEX_KTP_SHARD/META.';
+  return 'Check Vercel Environment Variables, OAuth consent/refresh token, Google Sheet access, Google Sheet tab/index readiness, or Vercel Deployment Protection.';
 }
 
 async function duplicateCheck(payload, env) {
@@ -195,63 +202,86 @@ async function duplicateCheck(payload, env) {
   const ktpInput = normalizeDigits(payload?.ktp_number || payload?.ktp || '');
   const queryText = normalizeText(`${name1} ${address}`);
   const textLen = queryText.length;
-
   if (!name1 && !address && !ktpInput) {
     throw httpError(400, 'Input minimal Name 1, Address, atau KTP Number.');
   }
 
   const threshold = Number(env.SIMILARITY_THRESHOLD || DEFAULT_SIMILARITY_THRESHOLD);
   const directRejectThreshold = getSimilarityDirectRejectThreshold(env);
-  const maxCandidates = Number(env.MAX_CANDIDATES || DEFAULT_MAX_CANDIDATES);
-  const batchRows = Number(env.MAX_BATCH_ROWS || DEFAULT_MAX_BATCH_ROWS);
+  const maxCandidates = Math.max(1, Number(env.MAX_CANDIDATES || DEFAULT_MAX_CANDIDATES));
+  const batchRows = Math.max(1, Number(env.MAX_BATCH_ROWS || DEFAULT_MAX_BATCH_ROWS));
   const weights = getSimilarityWeights(env);
-
   const meta = await getMeta(env);
+  if (!meta.sync_id || meta.sync_state !== 'READY' || !Number.isSafeInteger(Number(meta.total_bp_rows))) {
+    throw httpError(503, 'META is incomplete or sync is in progress. Run the indexed sync fully before checking BP.');
+  }
   const result = {
     ok: true,
-    decision: 'PASS',
-    reason: 'No duplicate found by direct or weighted thresholds.',
+    decision: 'INCONCLUSIVE',
+    reason: 'The check has not completed.',
     threshold,
     direct_reject_threshold: directRejectThreshold,
-    input: {
-      name_1: name1,
-      address,
-      ktp_masked: maskKtp(ktpInput),
-      normalized_length: textLen
-    },
+    input: { name_1: name1, address, ktp_masked: maskKtp(ktpInput), normalized_length: textLen },
     meta,
     exact_ktp_match: null,
+    exact_name_address_match: null,
+    exact_match_count: 0,
     similarity_match: null,
     top_candidates: [],
     stats: {
-      scanned_candidates: 0,
-      compared_candidates: 0,
-      skipped_by_prefilter: 0,
-      batches_processed: 0,
-      elapsed_ms: 0
+      scanned_candidates: 0, compared_candidates: 0, skipped_by_prefilter: 0,
+      batches_processed: 0, candidate_space: 0, coverage_complete: false,
+      scan_limit_reached: false, elapsed_ms: 0
     }
   };
 
   if (ktpInput) {
-    const ktpMatch = await findExactKtp(ktpInput, env);
+    const ktpMatch = await findExactKtp(ktpInput, env, meta);
     if (ktpMatch) {
       result.decision = 'FAIL';
       result.reason = 'KTP exact match found in protected database.';
       result.exact_ktp_match = sanitizeBpRow(ktpMatch, 100, { reason: 'KTP Exact Match' });
+      result.stats.coverage_complete = true;
+      result.stats.elapsed_ms = Date.now() - started;
+      return result;
+    }
+  }
+
+  // The name+address index is independent of fuzzy candidate caps or bucket order.
+  // It must exist for all checks with both fields; missing/old index is an error,
+  // never a silent PASS. Validate collision candidates against BOTH actual fields.
+  if (name1 && address) {
+    const exact = await findExactNameAddress(name1, address, env, meta);
+    result.exact_match_count = exact.count;
+    if (exact.count) {
+      result.decision = 'FAIL';
+      result.reason = `Exact Name 1 + Address match found (${exact.count} BP record(s)).`;
+      result.exact_name_address_match = sanitizeBpRow(exact.matches[0], 100, { reason: 'Exact Name 1 + Address Match' });
+      result.top_candidates = exact.matches.slice(1).map(m => sanitizeBpRow(m, 100, { reason: 'Exact Name 1 + Address Match' }));
+      result.stats.coverage_complete = true;
       result.stats.elapsed_ms = Date.now() - started;
       return result;
     }
   }
 
   if (!queryText || queryText.length < 3) {
-    result.reason = 'KTP not found and text input too short for similarity check.';
+    result.decision = ktpInput ? 'PASS' : 'INCONCLUSIVE';
+    result.reason = ktpInput
+      ? 'No matching KTP; insufficient text for a text similarity check.'
+      : 'Provide more Name 1 / Address information to check text similarity.';
+    result.stats.coverage_complete = Boolean(ktpInput);
     result.stats.elapsed_ms = Date.now() - started;
     return result;
   }
 
-  const lenIndex = await getIndexMap(env, 'INDEX_LEN', 'len');
+  const lenIndex = await getIndexMap(env, 'INDEX_LEN', 'len', meta);
   const maxLenDiff = getMaxLenDiff(env, textLen);
   const bucketIds = bucketRange(textLen, maxLenDiff);
+  const ordered = bucketIds.sort((a, b) =>
+    (Math.abs(Number(a) - Math.floor(textLen / 5)) - Math.abs(Number(b) - Math.floor(textLen / 5)))
+    || (Number(a) - Number(b)));
+  const candidateSpace = ordered.reduce((sum, bucket) => sum + (lenIndex.get(bucket)?.count || 0), 0);
+  result.stats.candidate_space = candidateSpace;
 
   const best = [];
   let found = null;
@@ -260,40 +290,29 @@ async function duplicateCheck(payload, env) {
   let skipped = 0;
   let batches = 0;
 
-  for (const bucket of bucketIds) {
+  for (const bucket of ordered) {
     const info = lenIndex.get(String(bucket));
     if (!info) continue;
-
     let rowStart = info.row_start;
-    const rowEnd = info.row_end;
-
-    while (rowStart <= rowEnd) {
-      const chunkEnd = Math.min(rowStart + batchRows - 1, rowEnd);
-      const rows = await getSheetRange(env, `BP_DATABASE!A${rowStart}:G${chunkEnd}`);
+    while (rowStart <= info.row_end && scanned < maxCandidates) {
+      const chunkEnd = Math.min(rowStart + batchRows - 1, info.row_end, rowStart + maxCandidates - scanned - 1);
+      const rows = await getSheetRange(env, `BP_DATABASE!A${rowStart}:H${chunkEnd}`, meta.sync_id);
       batches += 1;
-
+      if (rows.length !== chunkEnd - rowStart + 1) {
+        throw httpError(503, `Incomplete BP_DATABASE range ${rowStart}:${chunkEnd}; refusing a false PASS. Run a full sync.`);
+      }
       for (const row of rows) {
+        assertSnapshotConsistency(meta.sync_id, String(row[7] || ''), 'INDEX_LEN -> BP_DATABASE');
         scanned += 1;
-        if (scanned > maxCandidates) break;
-
         const candidate = bpRowFromSheet(row);
-        if (!candidate.norm_text) {
+        if (!candidate.norm_text || Math.abs(candidate.text_len - textLen) > maxLenDiff) {
           skipped += 1;
           continue;
         }
-
-        const lenDiff = Math.abs(candidate.text_len - textLen);
-        if (lenDiff > maxLenDiff) {
+        if (candidate.norm_text !== queryText && !quickPrefilter(queryText, candidate.norm_text).pass) {
           skipped += 1;
           continue;
         }
-
-        const quick = quickPrefilter(queryText, candidate.norm_text);
-        if (!quick.pass) {
-          skipped += 1;
-          continue;
-        }
-
         compared += 1;
         const score = computeSimilarity(queryText, candidate.norm_text, weights, directRejectThreshold);
         const displayedScore = score.direct_reject ? score.trigger_score : score.combined;
@@ -309,117 +328,198 @@ async function duplicateCheck(payload, env) {
             ? `${score.direct_reject_metric} Direct Reject`
             : 'Name 1 + Address Weighted Similarity'
         });
-
         pushTop(best, entry, 5);
-
         if (score.direct_reject || score.combined >= threshold) {
-          found = entry;
-          break;
+          // Retain the highest score, not whichever BP happened to be stored first.
+          if (!found || entry.score > found.score) found = entry;
         }
       }
-
-      if (found || scanned > maxCandidates) break;
       rowStart = chunkEnd + 1;
     }
-
-    if (found || scanned > maxCandidates) break;
+    if (scanned >= maxCandidates) break;
   }
 
-  result.stats.scanned_candidates = scanned;
-  result.stats.compared_candidates = compared;
-  result.stats.skipped_by_prefilter = skipped;
-  result.stats.batches_processed = batches;
-  result.stats.elapsed_ms = Date.now() - started;
+  const complete = scanned === candidateSpace;
+  result.stats = {
+    scanned_candidates: scanned, compared_candidates: compared,
+    skipped_by_prefilter: skipped, batches_processed: batches,
+    candidate_space: candidateSpace, coverage_complete: complete,
+    scan_limit_reached: !complete, elapsed_ms: Date.now() - started
+  };
   result.top_candidates = best;
-
   if (found) {
     result.decision = 'FAIL';
-    if (found.decision_rule === 'DIRECT_REJECT') {
-      result.reason = `Direct reject: ${found.direct_reject_metric} similarity ${found.score}% >= ${directRejectThreshold}%. Combined weighted score was skipped.`;
-    } else {
-      result.reason = `Combined weighted similarity match found >= ${threshold}.`;
-    }
     result.similarity_match = found;
+    result.reason = complete
+      ? `Name 1 + Address similarity match found (score ${found.score}%).`
+      : `Name 1 + Address similarity match found (score ${found.score}%). Search cap reached; additional candidates were not checked.`;
+  } else if (complete) {
+    result.decision = 'PASS';
+    result.reason = 'No exact or fuzzy duplicate found in the completed configured search space.';
+  } else {
+    result.decision = 'INCONCLUSIVE';
+    result.reason = `No match in ${scanned} of ${candidateSpace} indexed candidates; scan limit reached. This is NOT a PASS.`;
   }
-
   return result;
 }
 
-async function findExactKtp(ktpDigits, env) {
-  const ktpShardMap = await getIndexMap(env, 'INDEX_KTP_SHARD', 'ktp');
+function exactNameAddressHash(name, address) {
+  return createHash('sha256')
+    .update(`${normalizeText(name)}\x1f${normalizeText(address)}`, 'utf8')
+    .digest('hex');
+}
+
+async function findExactNameAddress(name, address, env, meta) {
+  if (meta.exact_index_version !== '1' || Number(meta.total_exact_index_rows) !== Number(meta.total_bp_rows)) {
+    throw httpError(503, 'Exact name/address index not synchronized; update sync script and run full sync before deploying the new API.');
+  }
+  const shardMap = await getIndexMap(env, 'INDEX_EXACT_SHARD', 'exact', meta);
+  const hash = exactNameAddressHash(name, address);
+  const info = shardMap.get(hash.slice(0, 2));
+  if (!info) return { matches: [], count: 0 };
+  const rows = await getSheetRange(env, `EXACT_INDEX!A${info.row_start}:D${info.row_end}`, meta.sync_id);
+  if (rows.length !== info.count) {
+    throw httpError(503, 'EXACT_INDEX shard contains fewer rows than advertised. Run a full sync.');
+  }
+  const pointers = [];
+  for (const row of rows) {
+    assertSnapshotConsistency(meta.sync_id, String(row[3] || ''), 'INDEX_EXACT_SHARD -> EXACT_INDEX');
+    if (String(row[0]).slice(0, 2) !== hash.slice(0, 2)) {
+      throw httpError(503, 'EXACT_INDEX shard integrity mismatch. Run a full sync.');
+    }
+    if (String(row[0]) === hash) pointers.push(row);
+  }
+  const matches = [];
+  // Bound row lookups if many BP share the same name and address.  The index
+  // supplies the total number of identical keys; five previews are sufficient.
+  for (const pointer of pointers.slice(0, 5)) {
+    const rowNo = Number(pointer[1]);
+    if (!Number.isSafeInteger(rowNo) || rowNo < 2 || rowNo > Number(meta.total_bp_rows) + 1) {
+      throw httpError(503, 'Invalid EXACT_INDEX BP pointer. Run a full sync.');
+    }
+    const bpRows = await getSheetRange(env, `BP_DATABASE!A${rowNo}:H${rowNo}`, meta.sync_id);
+    const row = bpRows[0];
+    if (!row || String(row[0]) !== String(pointer[2])) {
+      throw httpError(503, 'EXACT_INDEX BP pointer does not match BP_DATABASE. Run a full sync.');
+    }
+    assertSnapshotConsistency(meta.sync_id, String(row[7] || ''), 'EXACT_INDEX -> BP_DATABASE');
+    const candidate = bpRowFromSheet(row);
+    if (exactNameAddressHash(candidate.name_1, candidate.address) !== hash) {
+      throw httpError(503, 'EXACT_INDEX hash differs from BP_DATABASE data. Run a full sync.');
+    }
+    if (normalizeText(candidate.name_1) === normalizeText(name)
+        && normalizeText(candidate.address) === normalizeText(address)) {
+      if (matches.length < 5) matches.push(candidate);
+    }
+  }
+  return { matches, count: pointers.length };
+}
+
+async function findExactKtp(ktpDigits, env, activeMeta) {
+  const activeSyncId = activeMeta.sync_id;
+  const ktpShardMap = await getIndexMap(env, 'INDEX_KTP_SHARD', 'ktp', activeMeta);
   const shard = ktpDigits.slice(-2).padStart(2, '0');
   const info = ktpShardMap.get(shard);
   if (!info) return null;
 
-  const rows = await getSheetRange(env, `KTP_INDEX!A${info.row_start}:B${info.row_end}`);
+  assertSnapshotConsistency(activeSyncId, info.sync_id, 'META -> INDEX_KTP_SHARD');
+  const rows = await getSheetRange(env, `KTP_INDEX!A${info.row_start}:D${info.row_end}`, activeSyncId);
+  if (rows.length !== info.count) {
+    throw httpError(503, `INDEX_KTP_SHARD points to an empty KTP_INDEX range ${info.row_start}:${info.row_end}. Run a full sync.`);
+  }
   for (const row of rows) {
+    const candidateSyncId = String(row[3] || '');
+    assertSnapshotConsistency(activeSyncId, candidateSyncId, 'META -> KTP_INDEX');
     const candidateKtp = normalizeDigits(row[0] || '');
     if (candidateKtp === ktpDigits) {
       const bpDbRow = Number(row[1] || 0);
-      if (!bpDbRow) return { bp_id: '', bp_type_id: '', name_1: '', address: '', norm_text: '', norm_digits: '', text_len: 0 };
-      const bpRows = await getSheetRange(env, `BP_DATABASE!A${bpDbRow}:G${bpDbRow}`);
-      return bpRows?.[0] ? bpRowFromSheet(bpRows[0]) : null;
+      const expectedBpId = String(row[2] || '').trim();
+      if (!bpDbRow) throw httpError(503, 'KTP index contains an invalid BP_DATABASE row pointer. Run a full sync.');
+      const bpRows = await getSheetRange(env, `BP_DATABASE!A${bpDbRow}:H${bpDbRow}`, activeSyncId);
+      if (!bpRows?.[0]) throw httpError(503, 'KTP index points to a missing BP_DATABASE row. Run a full sync.');
+      const bpRow = bpRows[0];
+      assertSnapshotConsistency(activeSyncId, String(bpRow[7] || ''), 'KTP_INDEX -> BP_DATABASE');
+      const actualBpId = String(bpRow[0] || '').trim();
+      if (expectedBpId && actualBpId !== expectedBpId) {
+        throw httpError(503, `KTP index integrity mismatch: expected BP ${expectedBpId}, found ${actualBpId || '(blank)'}. Run a full sync.`);
+      }
+      return bpRowFromSheet(bpRow);
     }
   }
   return null;
 }
 
-export async function getMeta(env) {
-  try {
-    const rows = await getSheetRange(env, 'META!A2:B50');
-    const out = {};
-    for (const r of rows) {
-      if (r[0]) out[String(r[0])] = r[1] || '';
-    }
-    return out;
-  } catch (err) {
-    // META not available should not block a duplicate check, but health will show it.
-    return { meta_error: err?.message || String(err) };
+export function assertSnapshotConsistency(expectedSyncId, actualSyncId, boundary = 'indexed sheet read') {
+  const expected = String(expectedSyncId || '').trim();
+  const actual = String(actualSyncId || '').trim();
+  // Legacy sheets without sync_id must be rebuilt before using pointer-based indexes.
+  if (!expected || !actual || expected !== actual) {
+    throw httpError(503, `Mixed or incomplete sheet snapshot detected at ${boundary}. Expected sync ${expected || '(missing)'}, got ${actual || '(missing)'}. Run sync_gsheet_indexed.py fully before retrying.`);
   }
 }
 
-async function getIndexMap(env, tabName, type) {
-  const cacheKey = `index:${tabName}`;
+export async function getMeta(env) {
+  // META is the sync commit marker; never reuse stale META across a full sync.
+  const rows = await getSheetRange(env, 'META!A2:B50', '', true);
+  const out = {};
+  for (const r of rows) if (r[0]) out[String(r[0])] = r[1] || '';
+  return out;
+}
+
+async function getIndexMap(env, tabName, type, meta) {
+  const sync = String(meta.sync_id || '');
+  if (!sync) throw httpError(503, 'META sync_id missing. Run a full sync.');
+  const cacheKey = `index:${getSheetId(env)}:${sync}:${tabName}`;
   const cached = getCached(cacheKey);
   if (cached) return cached;
-
-  const rows = await getSheetRange(env, `${tabName}!A2:D10000`);
+  const rows = await getSheetRange(env, `${tabName}!A2:E10000`, sync);
   const map = new Map();
+  let total = 0;
+  let expectedStart = 2;
   for (const r of rows) {
     const key = String(r[0] ?? '').trim();
     if (!key) continue;
-    map.set(key, {
-      key,
-      row_start: Number(r[1] || 0),
-      row_end: Number(r[2] || 0),
-      count: Number(r[3] || 0),
-      type
-    });
+    const info = {
+      key, row_start: Number(r[1]), row_end: Number(r[2]),
+      count: Number(r[3]), sync_id: String(r[4] || ''), type
+    };
+    assertSnapshotConsistency(sync, info.sync_id, `META -> ${tabName}`);
+    if (map.has(key) || !Number.isSafeInteger(info.count) || info.count < 1
+        || !Number.isSafeInteger(info.row_start) || !Number.isSafeInteger(info.row_end)
+        || info.row_start !== expectedStart || info.row_end - info.row_start + 1 !== info.count) {
+      throw httpError(503, `${tabName} has an incomplete, overlapping or invalid index range. Run a full sync.`);
+    }
+    expectedStart = info.row_end + 1;
+    total += info.count;
+    map.set(key, info);
+  }
+  const expectedKey = type === 'len' ? 'total_bp_rows'
+    : type === 'ktp' ? 'total_ktp_index_rows' : 'total_exact_index_rows';
+  const expected = Number(meta[expectedKey]);
+  if (!Number.isSafeInteger(expected) || total !== expected) {
+    throw httpError(503, `${tabName} row count ${total} differs from META ${expectedKey} ${meta[expectedKey]}. Run a full sync.`);
   }
   setCached(cacheKey, map, Number(env.RANGE_CACHE_SECONDS || DEFAULT_RANGE_CACHE_SECONDS));
   return map;
 }
 
-async function getSheetRange(env, rangeA1) {
+async function getSheetRange(env, rangeA1, syncId = '', fresh = false) {
   const cacheSeconds = Number(env.RANGE_CACHE_SECONDS || DEFAULT_RANGE_CACHE_SECONDS);
-  const cacheKey = `range:${rangeA1}`;
-  const cached = getCached(cacheKey);
-  if (cached) return cached;
-
   const sheetId = getSheetId(env);
   if (!sheetId) throw httpError(500, 'SHEET_ID is not configured.');
-
+  const cacheKey = `range:${sheetId}:${syncId}:${rangeA1}`;
+  const cached = fresh ? null : getCached(cacheKey);
+  if (cached) return cached;
   const token = await getGoogleAccessToken(env);
   const url = `https://sheets.googleapis.com/v4/spreadsheets/${encodeURIComponent(sheetId)}/values/${encodeURIComponent(rangeA1)}?majorDimension=ROWS`;
   const res = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
-
   if (!res.ok) {
     const txt = await res.text();
     throw httpError(502, `Google Sheets API error ${res.status}: ${txt.slice(0, 600)}`);
   }
   const data = await res.json();
   const values = data.values || [];
-  setCached(cacheKey, values, cacheSeconds);
+  if (!fresh) setCached(cacheKey, values, cacheSeconds);
   return values;
 }
 
@@ -431,82 +531,36 @@ async function getGoogleAccessToken(env) {
   const now = Math.floor(Date.now() / 1000);
   if (tokenCache.token && tokenCache.exp - TOKEN_TTL_SAFETY_SECONDS > now) return tokenCache.token;
 
-  const sa = parseServiceAccount(env);
-  const iat = now;
-  const exp = now + 3600;
-  const header = { alg: 'RS256', typ: 'JWT' };
-  const claim = {
-    iss: sa.client_email,
-    scope: GOOGLE_SCOPE,
-    aud: sa.token_uri || GOOGLE_TOKEN_URL,
-    exp,
-    iat
-  };
+  const clientId = String(env.GOOGLE_OAUTH_CLIENT_ID || '').trim();
+  const clientSecret = String(env.GOOGLE_OAUTH_CLIENT_SECRET || '').trim();
+  const refreshToken = String(env.GOOGLE_OAUTH_REFRESH_TOKEN || '').trim();
+  const tokenUrl = String(env.GOOGLE_OAUTH_TOKEN_URL || GOOGLE_TOKEN_URL).trim();
 
-  const unsigned = `${base64urlJson(header)}.${base64urlJson(claim)}`;
-  const signature = await signRs256(unsigned, sa.private_key);
-  const assertion = `${unsigned}.${signature}`;
+  if (!clientId || !clientSecret || !refreshToken) {
+    throw httpError(500, 'Google OAuth user refresh token is not configured. Required: GOOGLE_OAUTH_CLIENT_ID, GOOGLE_OAUTH_CLIENT_SECRET, GOOGLE_OAUTH_REFRESH_TOKEN.');
+  }
 
   const body = new URLSearchParams({
-    grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer',
-    assertion
+    grant_type: 'refresh_token',
+    client_id: clientId,
+    client_secret: clientSecret,
+    refresh_token: refreshToken
   });
 
-  const res = await fetch(sa.token_uri || GOOGLE_TOKEN_URL, {
+  const res = await fetch(tokenUrl, {
     method: 'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     body
   });
+
   if (!res.ok) {
     const txt = await res.text();
-    throw httpError(502, `Google OAuth error ${res.status}: ${txt.slice(0, 600)}`);
+    throw httpError(502, `Google OAuth refresh error ${res.status}: ${txt.slice(0, 600)}`);
   }
+
   const data = await res.json();
   tokenCache = { token: data.access_token, exp: now + Number(data.expires_in || 3600) };
   return tokenCache.token;
-}
-
-function parseServiceAccount(env) {
-  if (env.GOOGLE_SERVICE_ACCOUNT_JSON_B64) {
-    const raw = atob(String(env.GOOGLE_SERVICE_ACCOUNT_JSON_B64).trim());
-    return JSON.parse(raw);
-  }
-  if (env.GOOGLE_SERVICE_ACCOUNT_JSON) {
-    const raw = String(env.GOOGLE_SERVICE_ACCOUNT_JSON).trim();
-    return JSON.parse(raw);
-  }
-  if (env.GOOGLE_CLIENT_EMAIL && env.GOOGLE_PRIVATE_KEY) {
-    return {
-      client_email: env.GOOGLE_CLIENT_EMAIL,
-      private_key: String(env.GOOGLE_PRIVATE_KEY).replace(/\\n/g, '\n'),
-      token_uri: GOOGLE_TOKEN_URL
-    };
-  }
-  throw httpError(500, 'Google service account secret is not configured.');
-}
-
-async function signRs256(unsigned, privateKeyPem) {
-  const keyData = pemToArrayBuffer(privateKeyPem);
-  const key = await crypto.subtle.importKey(
-    'pkcs8',
-    keyData,
-    { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' },
-    false,
-    ['sign']
-  );
-  const sig = await crypto.subtle.sign('RSASSA-PKCS1-v1_5', key, new TextEncoder().encode(unsigned));
-  return base64urlBytes(new Uint8Array(sig));
-}
-
-function pemToArrayBuffer(pem) {
-  const b64 = String(pem || '')
-    .replace(/-----BEGIN PRIVATE KEY-----/g, '')
-    .replace(/-----END PRIVATE KEY-----/g, '')
-    .replace(/\s/g, '');
-  const binary = atob(b64);
-  const bytes = new Uint8Array(binary.length);
-  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-  return bytes.buffer;
 }
 
 function bpRowFromSheet(row) {
@@ -745,12 +799,11 @@ function lenBucket(len) {
 // this replaces the old fixed 3-point (textLen-5, textLen, textLen+5) lookup, which only ever
 // covered a ±5 window no matter how wide callers actually wanted to search.
 function bucketRange(centerLen, maxDiff) {
-  const lo = Math.max(0, centerLen - maxDiff);
-  const hi = centerLen + maxDiff;
-  const ids = new Set();
-  for (let l = lo; l <= hi; l += 5) ids.add(lenBucket(l));
-  ids.add(lenBucket(hi));
-  return [...ids];
+  const lo = Math.floor(Math.max(0, centerLen - maxDiff) / 5);
+  const hi = Math.floor((centerLen + maxDiff) / 5);
+  const ids = [];
+  for (let bucket = lo; bucket <= hi; bucket++) ids.push(String(bucket).padStart(3, '0'));
+  return ids;
 }
 
 function pushTop(arr, entry, max) {

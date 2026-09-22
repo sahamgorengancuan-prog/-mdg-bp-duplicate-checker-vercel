@@ -3,8 +3,13 @@
   "version": "1.0.0",
   "private": true,
   "type": "module",
-  "description": "MDG BP Duplicate Checker API - Vercel Functions (Node.js runtime). Ported from the Cloudflare Pages Functions version: same duplicate-check logic, same defaults, same environment variable names.",
+  "description": "MDG BP Duplicate Checker API - Koyeb/Node-ready. OAuth user refresh-token mode for Google Sheets; no service account required.",
   "engines": {
     "node": ">=20"
+  },
+  "scripts": {
+    "start": "node server.js",
+    "check": "node --check server.js && node --check _lib/duplicate.js && node --check api/index.js && node --check api/health.js && node --check api/check.js",
+    "test": "node --test tests/*.mjs"
   }
 }

@@ -370,18 +370,19 @@
 
 
     function loadingHtml() {
-      return `<div class="result-head"><div class="status">Scanning indexed database...</div><span class="badge">PROCESSING</span></div><div class="result-body"><p class="reason">Worker is checking KTP shard first, then Name+Address length index in optimized batches.</p></div>`;
+      return `<div class="result-head"><div class="status">Scanning indexed database...</div><span class="badge">PROCESSING</span></div><div class="result-body"><p class="reason">Worker is checking KTP shard first, then exact Name+Address index, then nearest length buckets for fuzzy matching.</p></div>`;
     }
 
     function errorHtml(msg) {
-      return `<div class="result-head"><div class="status">Unable to check</div><span class="badge fail">ERROR</span></div><div class="result-body"><p class="reason">${escapeHtml(msg)}</p><p class="small">Check Vercel environment variables, service account sharing, Google Sheet protection, or Vercel Deployment Protection.</p></div>`;
+      return `<div class="result-head"><div class="status">Unable to check</div><span class="badge fail">ERROR</span></div><div class="result-body"><p class="reason">${escapeHtml(msg)}</p><p class="small">Check Vercel environment variables, OAuth user access, Google Sheet protection, or Vercel Deployment Protection.</p></div>`;
     }
 
     function renderResult(data) {
       const fail = data.decision === 'FAIL';
-      const badge = fail ? 'fail' : 'pass';
-      const title = fail ? 'Duplicate Found' : 'No Duplicate Found';
-      const match = data.exact_ktp_match || data.similarity_match;
+      const inconclusive = data.decision === 'INCONCLUSIVE';
+      const badge = fail || inconclusive ? 'fail' : 'pass';
+      const title = fail ? 'Duplicate Found' : inconclusive ? 'Search Incomplete — NOT PASS' : 'No Duplicate Found';
+      const match = data.exact_ktp_match || data.exact_name_address_match || data.similarity_match;
       result.innerHTML = `
         <div class="result-head">
           <div class="status">${title}</div>
@@ -396,6 +397,7 @@
             <div class="kv"><span>Direct Reject</span><strong>${data.direct_reject_threshold ?? '-'}</strong></div>
             <div class="kv"><span>Scanned</span><strong>${data.stats?.scanned_candidates ?? 0}</strong></div>
             <div class="kv"><span>Compared</span><strong>${data.stats?.compared_candidates ?? 0}</strong></div>
+            <div class="kv"><span>Coverage</span><strong>${data.exact_ktp_match || data.exact_name_address_match ? "Exact verified" : data.stats?.coverage_complete ? "Complete" : "Partial / not PASS"}</strong></div>
             <div class="kv"><span>Elapsed</span><strong>${data.stats?.elapsed_ms ?? 0} ms</strong></div>
           </div>
           <p class="footer-note">Result only returns relevant match previews. Full protected Google Sheet data is not exposed to the browser.</p>

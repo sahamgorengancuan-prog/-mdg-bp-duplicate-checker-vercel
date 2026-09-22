@@ -1,0 +1,209 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
+import { handleCheck, handleHealth } from '../_lib/duplicate.js';
+
+const NAME = 'Wr Santi';
+const ADDRESS = 'Kp Cisaat Lebak RT 013 RW 003 Kel Bolang Kec Malingping Stlh Sdn 3 Bolang';
+const normalize = s => String(s || '').toLowerCase().normalize('NFKD').replace(/[\u0300-\u036f]/g, '').replace(/[^a-z0-9 ]+/g, ' ').replace(/\b(pt|cv|tbk|ud|toko|tk|jl|jalan|gg|gang|no|nomor)\b/g, ' ').replace(/\s+/g, ' ').trim();
+const hash = (n,a) => createHash('sha256').update(`${normalize(n)}\x1f${normalize(a)}`).digest('hex');
+const bucket = n => String(Math.floor(n / 5)).padStart(3,'0');
+const baseEnv = { GOOGLE_OAUTH_CLIENT_ID: 'fixture', GOOGLE_OAUTH_CLIENT_SECRET: 'fixture', GOOGLE_OAUTH_REFRESH_TOKEN: 'fixture', MAX_CANDIDATES: '5', MAX_BATCH_ROWS: '10', RANGE_CACHE_SECONDS: '0', RATE_LIMIT_PER_MIN: '0' };
+let counter = 0;
+const originalFetch = globalThis.fetch;
+
+function fixture(entries, opt={}) {
+  const sync = `fixture-sync-${++counter}`;
+  const indexed = [...entries].map(e=> ({...e, norm: normalize(`${e.name} ${e.address}`), hash: hash(e.name,e.address)}))
+    .sort((a,b) => bucket(a.norm.length).localeCompare(bucket(b.norm.length)) || a.norm.length - b.norm.length || a.id.localeCompare(b.id));
+  const data = new Map();
+  const bp = indexed.map((e,i) => [e.id,'ZB02',e.name,e.address,e.norm,'',String(e.norm.length),sync]);
+  const exact = indexed.map((e,i) => [e.hash,i+2,e.id,sync]).sort((a,b)=>a[0].localeCompare(b[0]) || a[1]-b[1]);
+  const ktp = indexed.filter(e=>e.ktp).map(e=>[e.ktp, indexed.indexOf(e)+2,e.id,sync]).sort((a,b)=>a[0].slice(-2).localeCompare(b[0].slice(-2)) || a[0].localeCompare(b[0]));
+  data.set('BP_DATABASE', bp);
+  data.set('EXACT_INDEX',exact);
+  data.set('KTP_INDEX',ktp);
+  function summarize(rows, grouping) {
+    const map = new Map();
+    rows.forEach((row,i)=>{
+      const key=grouping(row);
+      const val=map.get(key)||[key,i+2,i+2,0,sync];
+      val[2]=i+2; val[3]++;map.set(key,val);
+    });
+    return [...map.values()];
+  }
+  data.set('INDEX_LEN', summarize(bp,row=>bucket(Number(row[6]))));
+  data.set('INDEX_EXACT_SHARD',summarize(exact,row=>row[0].slice(0,2)));
+  data.set('INDEX_KTP_SHARD',summarize(ktp,row=>row[0].slice(-2)));
+  const meta = [
+    ['sync_id',sync],['total_bp_rows',String(bp.length)],
+    ['total_exact_index_rows',String(exact.length)],['total_ktp_index_rows',String(ktp.length)],
+    ['exact_index_version',opt.oldVersion ? '' : '1'],['sync_state', opt.inProgress ? 'IN_PROGRESS' : 'READY']
+  ];
+  data.set('META',meta);
+  const env={...baseEnv, SHEET_ID:`fixture-${sync}`,...opt.env};
+  const requests=[];
+  globalThis.fetch=async url=>{
+    const u=String(url);
+    if (u.includes('oauth2.googleapis.com/token')) return new Response(JSON.stringify({access_token:'fixture-token',expires_in:3600}),{status:200});
+    const range=decodeURIComponent(u.split('/values/')[1].split('?')[0]);
+    requests.push(range);
+    const m=/^([^!]+)!([A-Z]+)(\d+):([A-Z]+)(\d+)$/.exec(range);
+    if (!m) throw new Error(`Unexpected range ${range}`);
+    const [_,tab,col,start,other,end]=m;
+    const maxCols = x=> [...x].reduce((n,c)=>n*26+c.charCodeAt(0)-64,0);
+    let rows=(data.get(tab)||[]).slice(Number(start)-2,Number(end)-1).map(r=>r.slice(maxCols(col)-1,maxCols(other)));
+    if (opt.corrupt && range.includes(opt.corrupt)) rows = opt.corruptWith ?? [];
+    return new Response(JSON.stringify({values:rows}),{status:200});
+  };
+  return {env,requests,sync,data};
+}
+async function run(f, payload={name_1:NAME,address:ADDRESS}) {
+  const request = new Request('https://fixture.invalid/api/check',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(payload)});
+  const response = await handleCheck({request,env:f.env});
+  return { status:response.status, body:await response.json() };
+}
+const row = (id,name,address,ktp='') => ({id,name,address,ktp});
+
+test('Wr Santi exact text is found by SHA index regardless of fuzzy cap, without KTP', async()=>{
+  const f=fixture([
+    ...Array.from({length:9},(_,i)=>row(`unrelated-${i}`, `Unrelated ${i}`, 'Different random address of varying length')),
+    row('110035698',NAME,ADDRESS,'3602014801820006')
+  ],{env:{MAX_CANDIDATES:'1'}});
+  const r=await run(f);
+  assert.equal(r.status,200);
+  assert.equal(r.body.decision,'FAIL');
+  assert.equal(r.body.exact_name_address_match?.bp_id,'110035698');
+  assert.equal(r.body.exact_name_address_match?.score,100);
+  assert.equal(r.body.stats.scanned_candidates,0);
+  assert(!f.requests.some(x=>x.includes('BP_DATABASE!A2:H')));
+  console.log('WR SANTI:',r.body.decision,r.body.exact_name_address_match?.bp_id,r.body.exact_name_address_match?.score);
+});
+
+
+test('real audit geometry: BP row 295606 found despite 396459 source rows and 60000 fuzzy cap',async()=>{
+  const sync=`large-synthetic-${++counter}`;
+  const h=hash(NAME,ADDRESS);
+  const meta=[['sync_id',sync],['sync_state','READY'],['exact_index_version','1'],
+    ['total_bp_rows','396459'],['total_exact_index_rows','396459'],['total_ktp_index_rows','312896']];
+  const shardRows=[
+    ['00',2,295605,295604,sync],
+    [h.slice(0,2),295606,295606,1,sync],
+    ['ff',295607,396460,100854,sync]
+  ];
+  assert.notEqual(h.slice(0,2),'00');assert.notEqual(h.slice(0,2),'ff');
+  const reqs=[];
+  globalThis.fetch=async url=>{
+    const u=String(url);
+    if(u.includes('oauth2.googleapis.com/token')) return new Response(JSON.stringify({access_token:'fixture-token',expires_in:3600}),{status:200});
+    const range=decodeURIComponent(u.split('/values/')[1].split('?')[0]);
+    reqs.push(range);
+    const values=range==='META!A2:B50' ? meta
+      : range==='INDEX_EXACT_SHARD!A2:E10000' ? shardRows
+      : range==='EXACT_INDEX!A295606:D295606' ? [[h,295606,'110035698',sync]]
+      : range==='BP_DATABASE!A295606:H295606' ? [['110035698','ZB02',NAME,ADDRESS,normalize(`${NAME} ${ADDRESS}`),'0130033',82,sync]]
+      : [];
+    return new Response(JSON.stringify({values}),{status:200});
+  };
+  const env={...baseEnv,SHEET_ID:sync,MAX_CANDIDATES:'60000'};
+  const r=await run({env});
+  assert.equal(r.status,200);
+  assert.equal(r.body.decision,'FAIL');
+  assert.equal(r.body.exact_name_address_match.bp_id,'110035698');
+  assert.equal(r.body.exact_name_address_match.score,100);
+  assert(reqs.includes('BP_DATABASE!A295606:H295606'));
+  assert(!reqs.some(x=>x.startsWith('INDEX_LEN!')));
+});
+
+test('two BP records with exact same name/address both stay represented',async()=>{
+  const f=fixture([row('110035698',NAME,ADDRESS),row('BP-SECOND',NAME,ADDRESS)]);
+  const r=await run(f);
+  assert.equal(r.body.decision,'FAIL');
+  assert.equal(r.body.exact_match_count,2);
+  assert.equal(r.body.top_candidates.length,1);
+});
+
+test('exact KTP remains functional and pointer-safe',async()=>{
+  const f=fixture([row('110035698',NAME,ADDRESS,'3602014801820006')]);
+  const r=await run(f,{ktp_number:'3602014801820006'});
+  assert.equal(r.body.decision,'FAIL');
+  assert.equal(r.body.exact_ktp_match.bp_id,'110035698');
+});
+
+test('exact field boundary is respected, joined strings alone do not cause exact hit',async()=>{
+  const f=fixture([row('DIFFERENT', 'a b', 'c')]);
+  const r=await run(f,{name_1:'a',address:'b c'});
+  assert.equal(r.body.exact_match_count,0);
+});
+
+test('fuzzy scan limit without match returns INCONCLUSIVE, never PASS',async()=>{
+  const f=fixture([...Array.from({length:9},(_,i)=>row(`BP-${i}`,`Unrelated ${i}`, 'Completely different sample address and another remote place street'))],{env:{MAX_CANDIDATES:'2'}});
+  const r=await run(f);
+  assert.equal(r.body.decision,'INCONCLUSIVE');
+  assert.equal(r.body.stats.coverage_complete,false);
+  assert.equal(r.body.stats.scan_limit_reached,true);
+  assert.equal(r.body.stats.scanned_candidates,2);
+});
+
+test('fuzzy returns FAIL if match found, prioritizes best score over first row',async()=>{
+  const f=fixture([
+    row('A-WORSE',NAME, ADDRESS.replace('Bolang','Bolong').replace('Malingping','Malingpung')),
+    row('Z-BETTER',NAME, ADDRESS.replace('Bolang','Bolong'))
+  ],{env:{MAX_CANDIDATES:'10'}});
+  const r=await run(f);
+  assert.equal(r.body.decision,'FAIL');
+  assert.equal(r.body.similarity_match?.bp_id,'Z-BETTER');
+  assert.equal(r.body.stats.coverage_complete,true);
+});
+
+test('completed search with no match can PASS',async()=>{
+  const f=fixture([row('OTHER','Entirely Else', 'A short remote street')],{env:{MAX_CANDIDATES:'100'}});
+  const r=await run(f);
+  assert.equal(r.body.decision,'PASS');
+  assert.equal(r.body.stats.coverage_complete,true);
+});
+
+test('old snapshot without exact index blocks name+address search',async()=>{
+  const f=fixture([row('110035698',NAME,ADDRESS)],{oldVersion:true});
+  const r=await run(f);
+  assert.equal(r.status,503);
+  assert.match(r.body.error,/Exact name\/address index/);
+});
+
+test('sync in progress refuses requests rather than checking a half-written sheet',async()=>{
+  const f=fixture([row('110035698',NAME,ADDRESS)],{inProgress:true});
+  const r=await run(f);
+  assert.equal(r.status,503);
+  assert.match(r.body.error,/sync is in progress/);
+});
+
+test('incomplete exact shard cannot silently return PASS',async()=>{
+  const f=fixture([row('110035698',NAME,ADDRESS)],{corrupt:'EXACT_INDEX!A',corruptWith:[]});
+  const r=await run(f);
+  assert.equal(r.status,503);
+  assert.match(r.body.error,/EXACT_INDEX shard/);
+});
+
+test('incomplete INDEX_LEN cannot return PASS',async()=>{
+  const f=fixture([row('110035698','Something else', 'Unrelated address')],{corrupt:'INDEX_LEN!A',corruptWith:[]});
+  const r=await run(f);
+  assert.equal(r.status,503);
+});
+
+test('mixed BP row sync IDs cannot return an exact match',async()=>{
+  const f=fixture([row('110035698',NAME,ADDRESS)]);
+  f.data.get('BP_DATABASE')[0][7]='mismatched-sync';
+  const r=await run(f);
+  assert.equal(r.status,503);
+});
+
+test('health rejects old snapshots and accepts new prepared indexes',async()=>{
+  const good=fixture([row('110035698',NAME,ADDRESS)]);
+  const ok=await handleHealth({env:good.env});
+  assert.equal((await ok.json()).sheet_ok,true);
+  const old=fixture([row('OLD',NAME,ADDRESS)],{oldVersion:true});
+  const broken=await handleHealth({env:old.env});
+  assert.equal((await broken.json()).sheet_ok,false);
+});
+
+test.after(()=>{globalThis.fetch=originalFetch;});
