@@ -313,8 +313,8 @@ test('identity conflict beyond five duplicate source rows is detected and previe
 test('manual exhaustive search continues in chunks and finds later similar BP',async()=>{
   const input={name_1:'Tk Adit',address:'Kp Pasir Kalong RT 001 RW 004 Ds Batujajar Kec Cigudeg'};
   const f=fixture([
-    row('BP-X','Unrelated One','Other location unrelated completely'),
-    row('BP-Y','Unrelated Two','Other location unrelated completely'),
+    row('BP-X','Unrelated One','Completely different sample address and another remote place street'),
+    row('BP-Y','Unrelated Two','Completely different sample address and another remote place street'),
     row('BP-LATE',input.name_1,input.address+' extraextraextraextraextraextraextra')
   ],{env:{MAX_CANDIDATES:'1',FULL_SCOPE_CHUNK_ROWS:'1'}});
   const fast=await run(f,input);
@@ -332,9 +332,9 @@ test('manual exhaustive search continues in chunks and finds later similar BP',a
 test('manual exhaustive search cannot PASS until every row is checked',async()=>{
   const input={name_1:NAME,address:ADDRESS};
   const f=fixture([
-    row('BP-X','Unrelated X','Other location unrelated completely'),
-    row('BP-Y','Unrelated Y','Other location unrelated completely'),
-    row('BP-Z','Unrelated Z','Other location unrelated completely')
+    row('BP-X','Unrelated X','Completely different sample address and another remote place street'),
+    row('BP-Y','Unrelated Y','Completely different sample address and another remote place street'),
+    row('BP-Z','Unrelated Z','Completely different sample address and another remote place street')
   ],{env:{MAX_CANDIDATES:'1',FULL_SCOPE_CHUNK_ROWS:'1'}});
   let r=await run(f,input);
   assert.equal(r.body.decision,'INCONCLUSIVE');
@@ -351,8 +351,8 @@ test('manual exhaustive search cannot PASS until every row is checked',async()=>
 test('manual search cursor rejects changed input and changed snapshot',async()=>{
   const input={name_1:NAME,address:ADDRESS};
   const f=fixture([
-    row('BP-X','Unrelated X','Other location unrelated completely'),
-    row('BP-Y','Unrelated Y','Other location unrelated completely')
+    row('BP-X','Unrelated X','Completely different sample address and another remote place street'),
+    row('BP-Y','Unrelated Y','Completely different sample address and another remote place street')
   ],{env:{MAX_CANDIDATES:'1',FULL_SCOPE_CHUNK_ROWS:'1'}});
   const fast=await run(f,input);
   const token=fast.body.full_scope_cursor;

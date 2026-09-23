@@ -448,7 +448,7 @@ function readFullScopeCursor(token, env, meta, query) {
       !Number.isSafeInteger(state.scanned) || state.scanned !== state.nextRow - 2 ||
       !Number.isSafeInteger(state.compared) || state.compared < 0 || state.compared > state.scanned ||
       !Number.isSafeInteger(state.batches) || state.batches < 0 || state.batches > state.scanned ||
-      state.nextRow === total + 1) {
+      state.nextRow > total + 1) {
     throw httpError(400, 'Invalid or completed full-scope cursor.');
   }
   return state;
