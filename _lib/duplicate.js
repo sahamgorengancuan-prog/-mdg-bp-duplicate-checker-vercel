@@ -1,4 +1,6 @@
 import { createHash, createHmac, timingSafeEqual } from 'node:crypto';
+import { readFileSync } from 'node:fs';
+const SNAPSHOT_WORKBOOKS=JSON.parse(readFileSync(new URL('../config/gsheet_snapshots.json',import.meta.url),'utf8'));
 
 /*
   MDG BP Duplicate Checker - shared duplicate-check engine (Vercel Functions, Node.js runtime)
@@ -14,7 +16,7 @@ export const ENGINE_VERSION = '2026-09-23-gsheet-dual-v12';
 const GOOGLE_TOKEN_URL = 'https://oauth2.googleapis.com/token';
 const TOKEN_TTL_SAFETY_SECONDS = 90;
 
-const DEFAULT_SHEET_ID = '1ZtNDikRHklwQMYxWQ6hkL1clvdH6g_Xfd3ojr5APDjo';
+const DEFAULT_SHEET_ID = ''; // Legacy SHEET_ID must come explicitly from Render env.
 const DEFAULT_SIMILARITY_THRESHOLD = 92;
 const DEFAULT_SIMILARITY_DIRECT_REJECT_THRESHOLD = 80;
 const DEFAULT_MAX_CANDIDATES = 60000;
@@ -76,15 +78,14 @@ const rateBucket = new Map();
 let tokenCache = { token: null, exp: 0 };
 
 function dualIds(env) {
-  const a=String(env.SHEET_A_ID||'').trim();
-  const b=String(env.SHEET_B_ID||'').trim();
-  const c=String(env.SHEET_CONTROL_ID||'').trim();
-  const legacy=getSheetId(env);
-  // Existing authorized legacy workbook can be A. During first cutover,
-  // Windows must initialize B while the legacy site continues to read A.
-  if(!a||!b||!c||new Set([a,b,c]).size!==3||
-     legacy===b||legacy===c)
-    throw httpError(503,'Configure distinct A/B/control IDs; legacy SHEET_ID may equal A only, never B or CONTROL.');
+  const a=String(env.SHEET_A_ID||SNAPSHOT_WORKBOOKS.sheet_a_id||'').trim();
+  const b=String(env.SHEET_B_ID||SNAPSHOT_WORKBOOKS.sheet_b_id||'').trim();
+  const c=String(env.SHEET_CONTROL_ID||SNAPSHOT_WORKBOOKS.sheet_control_id||'').trim();
+  // Never accept the old hardcoded DEFAULT_SHEET_ID as evidence of the
+  // user's distinct initial workbook. SHEET_ID must be explicit on Render.
+  const legacy=String(env.SHEET_ID||'').trim();
+  if(!a||!b||!c||!legacy||new Set([a,b,c,legacy]).size!==4)
+    throw httpError(503,'Set explicit legacy SHEET_ID and three DISTINCT A/B/CONTROL workbook IDs.');
   return {a,b,c};
 }
 async function readDualControl(env) {
@@ -230,9 +231,10 @@ export function configStatus(env) {
     sheet_id_configured: Boolean(getSheetId(env)),
     oauth_configured: Boolean(env.GOOGLE_OAUTH_CLIENT_ID && env.GOOGLE_OAUTH_CLIENT_SECRET && env.GOOGLE_OAUTH_REFRESH_TOKEN),
     auth_mode: 'oauth_user_refresh_token',
-    using_default_sheet_id: !Boolean(env.SHEET_ID),
+    using_default_sheet_id: false,
+    snapshot_ids_from_repo: true,
     snapshot_mode: String(env.GSHEET_SNAPSHOT_MODE || 'legacy').toLowerCase(),
-    dual_snapshot_configured: Boolean(env.SHEET_A_ID && env.SHEET_B_ID && env.SHEET_CONTROL_ID),
+    dual_snapshot_configured: Boolean(SNAPSHOT_WORKBOOKS.sheet_a_id && SNAPSHOT_WORKBOOKS.sheet_b_id && SNAPSHOT_WORKBOOKS.sheet_control_id),
     similarity_threshold: Number(env.SIMILARITY_THRESHOLD || DEFAULT_SIMILARITY_THRESHOLD),
     similarity_direct_reject_threshold: getSimilarityDirectRejectThreshold(env),
     max_candidates: Number(env.MAX_CANDIDATES || DEFAULT_MAX_CANDIDATES),

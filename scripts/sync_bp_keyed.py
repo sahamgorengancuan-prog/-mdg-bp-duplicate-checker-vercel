@@ -11,11 +11,12 @@ app. READY and control-pointer publication follow keyed/index verification.
 """
 from __future__ import annotations
 import hashlib, json, os, sys, time, uuid
+from pathlib import Path
 from datetime import datetime
 from typing import Dict
 import pandas as pd
 from sync_gsheet_indexed import (
-    DEFAULT_SHEET_ID, logging, normalize_text, normalize_digits,
+    logging, normalize_text, normalize_digits,
     fetch_pg_dataframe, gsheet_client, read_env, single_sync_lock,
 )
 COLUMNS=["bp_id","bp_type_id","name_1","address",
@@ -239,21 +240,30 @@ def read_sheet_index(ws, legacy):
     return existing
 
 
+SNAPSHOT_CONFIG_PATH=Path(__file__).resolve().parents[1]/"config"/"gsheet_snapshots.json"
+
 def snapshot_ids():
-    mode=os.getenv("GSHEET_SNAPSHOT_MODE","").strip().lower()
+    """Shared Git config, optional environment overrides; legacy ID is explicit.
+
+    Never guess SHEET_ID from old code: the previous default points to A,
+    although the user's actual legacy/initial workbook is distinct.
+    """
+    with SNAPSHOT_CONFIG_PATH.open("r",encoding="utf-8") as f:
+        config=json.load(f)
+    mode=os.getenv("GSHEET_SNAPSHOT_MODE",config.get("mode","")).strip().lower()
     if mode!="dual":
+        raise ValueError("GSHEET_SNAPSHOT_MODE=dual is required for keyed A/B sync.")
+    names={"SHEET_A_ID":"sheet_a_id","SHEET_B_ID":"sheet_b_id",
+           "SHEET_CONTROL_ID":"sheet_control_id"}
+    ids={key:os.getenv(key,config.get(field,"")).strip()
+         for key,field in names.items()}
+    legacy=os.getenv("SHEET_ID","").strip()
+    if not legacy:
+        raise ValueError("SHEET_ID must explicitly identify the DIFFERENT legacy/initial sheet in .env. No writes.")
+    if (not all(ids.values()) or len(set(ids.values()))!=3 or
+        legacy in ids.values()):
         raise ValueError(
-            "Google-Sheets-only online sync requires GSHEET_SNAPSHOT_MODE=dual "
-            "and separate SHEET_A_ID, SHEET_B_ID, SHEET_CONTROL_ID. No writes."
-        )
-    ids={name:os.getenv(name,"").strip()
-         for name in ("SHEET_A_ID","SHEET_B_ID","SHEET_CONTROL_ID")}
-    legacy=os.getenv("SHEET_ID",DEFAULT_SHEET_ID).strip()
-    if (not all(ids.values()) or len(set(ids.values()))!=3
-        or legacy in (ids["SHEET_B_ID"],ids["SHEET_CONTROL_ID"])):
-        raise ValueError(
-            "A/B/control must be nonempty and distinct; legacy SHEET_ID may "
-            "equal A ONLY, never B or CONTROL. No Sheets modified."
+            "A, B, CONTROL and legacy SHEET_ID must be FOUR DISTINCT workbooks. No writes."
         )
     if os.getenv("PRIVATE_INDEX_MODE","off").lower()=="required":
         raise ValueError("PRIVATE_INDEX_MODE=required is incompatible with Sheets-only dual mode.")
@@ -313,24 +323,10 @@ def sync_sheet(records,sync_id):
                          active["sync_id"])
             return {"updated":0,"appended":0,"tombstoned":0,
                     "unchanged":len(records),"sync_id":active["sync_id"]}
-    legacy_is_a=(os.getenv("SHEET_ID",DEFAULT_SHEET_ID).strip()
-                 ==ids["SHEET_A_ID"])
-    if not active_id and legacy_is_a:
-        # First build must leave the original live Google Sheet untouched.
-        # The legacy Render API is still serving A until cutover to dual.
-        stage_id=ids["SHEET_B_ID"]
-        logging.info("INITIAL BUILD: legacy A preserved; writing new B only.")
-    else:
-        stage_id=(ids["SHEET_B_ID"] if active_id==ids["SHEET_A_ID"]
-                  else ids["SHEET_A_ID"])
-    if (legacy_is_a and active_id==ids["SHEET_B_ID"]
-        and stage_id==ids["SHEET_A_ID"]
-        and os.getenv("ALLOW_LEGACY_A_STAGING","")!="1"):
-        raise ValueError(
-            "Refusing to modify original legacy A. First verify Render is "
-            "serving dual snapshot B, then explicitly set "
-            "ALLOW_LEGACY_A_STAGING=1 for the next sync."
-        )
+    # All three A/B/CONTROL workbooks are distinct from the legacy sheet.
+    # The first build is always A; legacy remains untouched until cutover.
+    stage_id=(ids["SHEET_B_ID"] if active_id==ids["SHEET_A_ID"]
+              else ids["SHEET_A_ID"])
     logging.info("Dual snapshot: ACTIVE=%s STAGING=%s (OAuth-controlled IDs)",
                  "A" if active_id==ids["SHEET_A_ID"] else
                  "B" if active_id else "LEGACY",

@@ -55,7 +55,7 @@ logging.basicConfig(
     ],
 )
 
-DEFAULT_SHEET_ID = "1ZtNDikRHklwQMYxWQ6hkL1clvdH6g_Xfd3ojr5APDjo"
+DEFAULT_SHEET_ID = ""  # Legacy workbook must be specified explicitly in .env.
 
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",

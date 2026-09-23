@@ -115,14 +115,14 @@ def test_source_keys_and_change_hash():
             ['BP-1','ZB02','Beta','Address B','2222']]))
 
 def test_dual_ids_fails_before_writing(monkeypatch):
-    monkeypatch.delenv("GSHEET_SNAPSHOT_MODE",raising=False)
+    monkeypatch.setenv("GSHEET_SNAPSHOT_MODE","legacy")
     with pytest.raises(ValueError,match='GSHEET_SNAPSHOT_MODE=dual'):
         keyed.snapshot_ids()
     monkeypatch.setenv("GSHEET_SNAPSHOT_MODE","dual")
     monkeypatch.setenv("SHEET_A_ID","A")
     monkeypatch.setenv("SHEET_B_ID","A")
     monkeypatch.setenv("SHEET_CONTROL_ID","C")
-    with pytest.raises(ValueError,match='distinct'):
+    with pytest.raises(ValueError,match='FOUR DISTINCT'):
         keyed.snapshot_ids()
 
 def test_index_postings_use_stable_bp_key_and_source_hash():
@@ -202,44 +202,46 @@ def test_proven_oauth_bat_and_no_private_database():
     assert 'del_worksheet' not in code
     assert 'append_rows(' not in code
 
-def test_legacy_A_is_preserved_during_first_B_build_and_second_run_is_gated(monkeypatch):
+def test_new_A_B_CONTROL_are_distinct_from_legacy_and_first_build_is_A(monkeypatch):
     gc=configured(monkeypatch)
-    monkeypatch.setenv("SHEET_ID","A")
-    # Existing live workbook is *also* A, served by legacy Render.
-    old=gc.books["A"].add_worksheet("BP_DATABASE",rows=100,cols=8)
-    old.rows=[
-        keyed.LEGACY_COLUMNS[:],
-        ['BP-OLD','ZB02','Legacy Name','Legacy Address',
-         'legacy name legacy address','',str(len('legacy name legacy address')),
-         'old-sync-id']]
-    old_meta=gc.books["A"].add_worksheet("META",rows=100,cols=2)
-    old_meta.rows=[["key","value"],["sync_state","READY"]]
-    original_bp=[row[:] for row in old.rows]
-    original_meta=[row[:] for row in old_meta.rows]
-    first=keyed.make_records(data([
+    legacy=keyed.snapshot_ids()
+    assert (legacy["SHEET_A_ID"],legacy["SHEET_B_ID"],
+            legacy["SHEET_CONTROL_ID"])==("A","B","CONTROL")
+    source=keyed.make_records(data([
         ['BP-X','ZB02','New Person','Street 22','1234']]))
-    assert keyed.snapshot_ids()["SHEET_A_ID"]=="A"
-    published=keyed.sync_sheet(first,"first-B")
-    assert published["sync_id"]=="first-B"
-    assert old.rows==original_bp
-    assert old_meta.rows==original_meta
+    first=keyed.sync_sheet(source,"first-A")
+    assert first["sync_id"]=="first-A"
+    assert gc.books["B"].sheets=={}
     control=dict(gc.books["CONTROL"].worksheet("ACTIVE").get("A1:B20")[1:])
-    assert control["active_sheet_id"]=="B"
-    changed=keyed.make_records(data([
+    assert control["active_sheet_id"]=="A"
+    assert keyed.sync_sheet(source,"no-changes")["sync_id"]=="first-A"
+    updated=keyed.make_records(data([
         ['BP-X','ZB02','New Person Changed','Street 22','1234']]))
-    with pytest.raises(ValueError,match="Refusing to modify original legacy A"):
-        keyed.sync_sheet(changed,"second-A")
-    assert old.rows==original_bp
-    assert old_meta.rows==original_meta
-    assert dict(gc.books["CONTROL"].worksheet("ACTIVE").get("A1:B20")[1:])==control
-    monkeypatch.setenv("ALLOW_LEGACY_A_STAGING","1")
-    second=keyed.sync_sheet(changed,"second-A")
-    assert second["sync_id"]=="second-A"
-    assert dict(gc.books["CONTROL"].worksheet("ACTIVE").get("A1:B20")[1:])["active_sheet_id"]=="A"
+    second=keyed.sync_sheet(updated,"second-B")
+    assert second["sync_id"]=="second-B"
+    assert dict(gc.books["CONTROL"].worksheet("ACTIVE").get("A1:B20")[1:])["active_sheet_id"]=="B"
+    assert gc.books["A"].worksheet("BP_DATABASE").row_values(2)[2]=="New Person"
 
-def test_legacy_B_or_control_must_be_rejected(monkeypatch):
+
+def test_legacy_cannot_equal_any_snapshot_workbook(monkeypatch):
     configured(monkeypatch)
-    for legacy in ("B","CONTROL"):
+    for legacy in ("A","B","CONTROL"):
         monkeypatch.setenv("SHEET_ID",legacy)
-        with pytest.raises(ValueError,match="never B or CONTROL"):
+        with pytest.raises(ValueError,match="FOUR DISTINCT"):
             keyed.snapshot_ids()
+    monkeypatch.delenv("SHEET_ID")
+    with pytest.raises(ValueError,match="explicitly identify"):
+        keyed.snapshot_ids()
+
+
+def test_git_snapshot_ids_are_loaded_when_env_does_not_override(monkeypatch):
+    for key in ("SHEET_A_ID","SHEET_B_ID","SHEET_CONTROL_ID"):
+        monkeypatch.delenv(key,raising=False)
+    monkeypatch.setenv("SHEET_ID","different-legacy-workbook")
+    monkeypatch.setenv("GSHEET_SNAPSHOT_MODE","dual")
+    ids=keyed.snapshot_ids()
+    assert ids=={
+        "SHEET_A_ID":"1ZtNDikRHklwQMYxWQ6hkL1clvdH6g_Xfd3ojr5APDjo",
+        "SHEET_B_ID":"13yMsb_Vsi6eXDkau1zouaRi2viOefDkVHmIuK9SHLqk",
+        "SHEET_CONTROL_ID":"1wnRHX84FXNG3zwoxDofr1dzj1vu6UsN3uo907xt3KJ4",
+    }
