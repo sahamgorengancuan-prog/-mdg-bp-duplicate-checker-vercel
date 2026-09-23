@@ -1,0 +1,22 @@
+# Optional Render Blueprint. Existing Render services do not automatically adopt
+# this file; verify their connected repository, branch and Root Directory in Render.
+services:
+  - type: web
+    name: bp-duplicate-check-koyeb
+    runtime: node
+    repo: https://github.com/sahamgorengancuan-prog/-mdg-bp-duplicate-checker-vercel
+    branch: main
+    buildCommand: yarn install
+    startCommand: yarn start
+    healthCheckPath: /api/health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: GOOGLE_OAUTH_CLIENT_ID
+        sync: false
+      - key: GOOGLE_OAUTH_CLIENT_SECRET
+        sync: false
+      - key: GOOGLE_OAUTH_REFRESH_TOKEN
+        sync: false
+      - key: SHEET_ID
+        sync: false
