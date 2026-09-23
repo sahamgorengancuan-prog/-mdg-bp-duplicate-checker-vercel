@@ -254,11 +254,49 @@
       border-top: 1px solid var(--line);
       padding-top: 14px;
     }
+    /* Activity log (top-right) */
+    .header-tools { display: flex; gap: 10px; align-items: center; position: relative; }
+    .log-btn {
+      width: auto; display: inline-flex; gap: 8px; align-items: center;
+      border: 1px solid var(--line); background: rgba(255,255,255,.07); color: var(--text);
+      border-radius: 999px; padding: 9px 14px; font-size: 13px; font-weight: 800;
+      box-shadow: none; backdrop-filter: blur(16px);
+    }
+    .log-count { color: var(--muted); font-weight: 700; }
+    .log-errors { background: var(--bad); color: #fff; border-radius: 999px; padding: 1px 7px; font-size: 11px; }
+    .log-errors[hidden] { display: none; }
+    .log-panel {
+      position: absolute; right: 0; top: calc(100% + 10px); z-index: 30;
+      width: min(620px, calc(100vw - 32px)); max-height: min(70vh, 640px);
+      display: flex; flex-direction: column;
+      border: 1px solid var(--line); border-radius: 18px; background: #0b1729;
+      box-shadow: var(--shadow);
+    }
+    .log-panel[hidden] { display: none; }
+    .log-head { display: flex; justify-content: space-between; gap: 10px; align-items: center; padding: 12px 14px; border-bottom: 1px solid var(--line); }
+    .log-head strong { font-size: 13px; }
+    .log-actions { display: flex; gap: 6px; flex-wrap: wrap; justify-content: flex-end; }
+    .log-actions button {
+      width: auto; padding: 7px 10px; border-radius: 10px; font-size: 12px; font-weight: 800;
+      box-shadow: none; background: rgba(255,255,255,.10); color: var(--text); border: 1px solid var(--line);
+    }
+    .log-actions button.primary { background: linear-gradient(135deg, var(--brand-2), var(--brand)); color: #061327; border: 0; }
+    .log-list { overflow: auto; padding: 8px 14px 12px; font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+    .log-entry { padding: 6px 0; border-bottom: 1px solid rgba(255,255,255,.06); word-break: break-word; }
+    .log-entry .when { color: var(--muted); }
+    .log-entry .lvl { font-weight: 800; }
+    .log-entry.info .lvl { color: var(--brand-2); }
+    .log-entry.warn .lvl { color: var(--warn); }
+    .log-entry.error .lvl { color: var(--bad); }
+    .log-entry .det { color: #c9d6e3; display: block; margin-top: 2px; }
+    .log-empty { color: var(--muted); padding: 10px 0; }
     @media (max-width: 920px) {
       .hero { grid-template-columns: 1fr; }
       .metrics, .match-grid { grid-template-columns: 1fr; }
       .row { grid-template-columns: 1fr; }
       header { align-items: flex-start; flex-direction: column; }
+      .header-tools { flex-wrap: wrap; }
+      .log-panel { left: 0; right: auto; }
     }
   </style>
 </head>
@@ -273,7 +311,24 @@
           <p>Protected Google Sheet database · Same-domain Vercel API</p>
         </div>
       </div>
-      <div class="pill"><span id="healthDot" class="dot"></span><span id="healthText">Checking API health...</span></div>
+      <div class="header-tools">
+        <div class="pill"><span id="healthDot" class="dot"></span><span id="healthText">Checking API health...</span></div>
+        <button id="logButton" class="log-btn" type="button" aria-expanded="false" aria-controls="logPanel" title="Activity log: steps, timings and errors">
+          Log <span id="logCount" class="log-count">0</span><span id="logErrors" class="log-errors" hidden>0</span>
+        </button>
+        <div id="logPanel" class="log-panel" hidden>
+          <div class="log-head">
+            <strong>Activity log (this browser)</strong>
+            <div class="log-actions">
+              <button id="logDownloadTxt" class="primary" type="button">Download .txt</button>
+              <button id="logDownloadJson" type="button">.json</button>
+              <button id="logCopy" type="button">Copy</button>
+              <button id="logClear" type="button">Clear</button>
+            </div>
+          </div>
+          <div id="logList" class="log-list"></div>
+        </div>
+      </div>
     </header>
 
     <section class="hero">
@@ -339,24 +394,201 @@
     let fullScopeRunning = false;
     let fullScopeCancelled = false;
 
+    // ---- Activity log: every step, timing and error, kept in this browser
+    // (last 1,000 entries survive reloads) and downloadable for support.
+    // KTP numbers are always masked; no raw database rows are logged.
+    const LOG_KEY = 'bp-checker-log-v1';
+    const LOG_MAX = 1000;
+    let logEntries = [];
+    try {
+      logEntries = JSON.parse(localStorage.getItem(LOG_KEY) || '[]');
+      if (!Array.isArray(logEntries)) logEntries = [];
+    } catch (_) { logEntries = []; }
+    function maskKtp(value) {
+      const d = String(value || '').replace(/\D+/g, '');
+      if (!d) return '';
+      return d.length <= 8 ? '*'.repeat(d.length) : d.slice(0, 4) + '*'.repeat(d.length - 8) + d.slice(-4);
+    }
+    function logEvent(level, step, details) {
+      const entry = { t: new Date().toISOString(), level, step };
+      if (details !== undefined) entry.details = details;
+      logEntries.push(entry);
+      if (logEntries.length > LOG_MAX) logEntries.splice(0, logEntries.length - LOG_MAX);
+      try { localStorage.setItem(LOG_KEY, JSON.stringify(logEntries)); } catch (_) { /* storage full or blocked */ }
+      renderLogPanel();
+    }
+    function summarizeApi(res, json, ms) {
+      const stats = json?.stats || {};
+      const match = json?.similarity_match || json?.exact_name_address_match || json?.exact_ktp_match;
+      const out = {
+        http: res?.status, client_ms: ms, engine: json?.engine_version,
+        backend: json?.search_backend, memory_source: json?.memory_source || json?.memory?.source,
+        fallback_reason: json?.memory_fallback_reason || json?.memory?.fallback_reason,
+        decision: json?.decision, reason: json?.reason, error: json?.error || json?.sheet_error,
+        request_id: json?.requestId, warming: json?.warming, retry_after_s: json?.retry_after_seconds,
+        sync_id: json?.meta?.sync_id, last_sync_at: json?.meta?.last_sync_at,
+        scanned: stats.scanned_candidates, compared: stats.compared_candidates,
+        candidate_space: stats.candidate_space, coverage_complete: stats.coverage_complete,
+        server_ms: stats.elapsed_ms,
+        match: match ? { bp_id: match.bp_id, score: match.score, rule: match.decision_rule || match.reason } : undefined,
+        trace: json?.trace,
+        memory: json?.memory ? {
+          loaded: json.memory.loaded, records: json.memory.records, load_ms: json.memory.load_ms,
+          loading: json.memory.loading, packed_error: json.memory.packed_error,
+          last_error: json.memory.last_error, rss_mb: json.memory.rss_mb
+        } : undefined,
+        quota_pause_s: json?.quota?.recommended_pause_seconds || undefined
+      };
+      Object.keys(out).forEach(k => (out[k] === undefined || out[k] === null || out[k] === '') && delete out[k]);
+      return out;
+    }
+    // fetch + JSON with timing; every call is logged (network errors too).
+    async function apiFetch(step, url, options = {}) {
+      const started = performance.now();
+      let res;
+      try {
+        res = await fetch(url, options);
+      } catch (error) {
+        logEvent('error', step + '.network', { url: new URL(url).pathname, message: error.message, client_ms: Math.round(performance.now() - started) });
+        throw new Error('Network error calling ' + new URL(url).pathname + ': ' + error.message);
+      }
+      let json;
+      try { json = await res.json(); } catch (_) { json = { ok: false, error: 'Non-JSON response (HTTP ' + res.status + ')' }; }
+      const ms = Math.round(performance.now() - started);
+      const level = res.ok && json.ok !== false ? 'info' : (res.status === 429 || json.warming ? 'warn' : 'error');
+      logEvent(level, step, summarizeApi(res, json, ms));
+      return { res, json, ms };
+    }
+    function logText() {
+      const lines = [
+        'MDG BP Duplicate Checker - activity log',
+        'Generated: ' + new Date().toISOString(),
+        'Page engine: ' + EXPECTED_ENGINE_VERSION,
+        'Origin: ' + location.origin,
+        'User agent: ' + navigator.userAgent,
+        'Entries: ' + logEntries.length,
+        '-'.repeat(72)
+      ];
+      for (const e of logEntries) {
+        lines.push(e.t + '  ' + e.level.toUpperCase().padEnd(5) + '  ' + e.step + (e.details !== undefined ? '  ' + JSON.stringify(e.details) : ''));
+      }
+      return lines.join('\n') + '\n';
+    }
+    function downloadFile(name, type, text) {
+      const url = URL.createObjectURL(new Blob([text], { type }));
+      const a = document.createElement('a');
+      a.href = url; a.download = name;
+      document.body.appendChild(a); a.click(); a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+    }
+    function logFileName(ext) {
+      const d = new Date(), p = n => String(n).padStart(2, '0');
+      return 'bp-checker-log-' + d.getFullYear() + p(d.getMonth() + 1) + p(d.getDate()) + '-' + p(d.getHours()) + p(d.getMinutes()) + p(d.getSeconds()) + '.' + ext;
+    }
+    // Capture the server's current state in the file too (engine, memory, sync).
+    async function logServerHealthForDownload() {
+      try {
+        await apiFetch('download.health_snapshot', API_BASE + '/api/health', { cache: 'no-store', signal: AbortSignal.timeout(8000) });
+      } catch (error) { logEvent('warn', 'download.health_snapshot', { message: error.message }); }
+    }
+    function renderLogPanel() {
+      const count = $('logCount'), errors = $('logErrors'), list = $('logList');
+      if (!count || !errors || !list) return;
+      const errorCount = logEntries.filter(e => e.level === 'error').length;
+      count.textContent = String(logEntries.length);
+      errors.textContent = String(errorCount);
+      errors.hidden = errorCount === 0;
+      if ($('logPanel').hidden) return;
+      const recent = logEntries.slice(-80).reverse();
+      list.innerHTML = recent.length ? recent.map(e => {
+        const det = e.details === undefined ? '' : JSON.stringify(e.details);
+        return '<div class="log-entry ' + escapeHtml(e.level) + '"><span class="when">' + escapeHtml(e.t.slice(11, 23)) + '</span> <span class="lvl">' +
+          escapeHtml(e.level.toUpperCase()) + '</span> ' + escapeHtml(e.step) +
+          (det ? '<span class="det">' + escapeHtml(det.length > 600 ? det.slice(0, 600) + '…' : det) + '</span>' : '') + '</div>';
+      }).join('') : '<div class="log-empty">No activity yet.</div>';
+    }
+    $('logButton').addEventListener('click', () => {
+      const panel = $('logPanel');
+      panel.hidden = !panel.hidden;
+      $('logButton').setAttribute('aria-expanded', String(!panel.hidden));
+      renderLogPanel();
+    });
+    document.addEventListener('click', e => {
+      if (!$('logPanel').hidden && !e.target.closest('.header-tools')) {
+        $('logPanel').hidden = true;
+        $('logButton').setAttribute('aria-expanded', 'false');
+      }
+    });
+    $('logDownloadTxt').addEventListener('click', async () => {
+      await logServerHealthForDownload();
+      downloadFile(logFileName('txt'), 'text/plain;charset=utf-8', logText());
+    });
+    $('logDownloadJson').addEventListener('click', async () => {
+      await logServerHealthForDownload();
+      downloadFile(logFileName('json'), 'application/json', JSON.stringify({
+        generated: new Date().toISOString(), page_engine: EXPECTED_ENGINE_VERSION,
+        origin: location.origin, user_agent: navigator.userAgent, entries: logEntries
+      }, null, 2));
+    });
+    $('logCopy').addEventListener('click', async () => {
+      try { await navigator.clipboard.writeText(logText()); $('logCopy').textContent = 'Copied'; }
+      catch (_) { $('logCopy').textContent = 'Copy blocked'; }
+      setTimeout(() => { $('logCopy').textContent = 'Copy'; }, 1500);
+    });
+    $('logClear').addEventListener('click', () => {
+      logEntries = [];
+      try { localStorage.removeItem(LOG_KEY); } catch (_) {}
+      logEvent('info', 'log.cleared');
+    });
+    window.addEventListener('error', e => logEvent('error', 'js.error', { message: e.message, source: e.filename, line: e.lineno }));
+    window.addEventListener('unhandledrejection', e => logEvent('error', 'js.unhandled_rejection', { message: String(e.reason?.message || e.reason) }));
+
+    // A deploy while this tab stayed open changes the server engine. Reload the
+    // matching page ONCE (per server version) and re-run the same input, instead
+    // of refusing every result. A mismatched page never issues PASS either way.
+    const PENDING_CHECK_KEY = 'bp-pending-check';
+    function reloadForNewEngine(serverVersion, pendingInput) {
+      if (!serverVersion || serverVersion === EXPECTED_ENGINE_VERSION) return false;
+      try {
+        const key = 'bp-engine-reload:' + serverVersion;
+        if (sessionStorage.getItem(key)) return false;
+        sessionStorage.setItem(key, '1');
+        if (pendingInput) sessionStorage.setItem(PENDING_CHECK_KEY, JSON.stringify(pendingInput));
+      } catch (_) { return false; }
+      location.reload();
+      return true;
+    }
+    function versionMismatchError(serverVersion) {
+      return new Error('This page (' + EXPECTED_ENGINE_VERSION + ') does not match the server (' + (serverVersion || 'unknown') + '). Reload the page with Ctrl+F5. No PASS issued.');
+    }
+
     async function checkHealth() {
       const dot = $('healthDot');
       const txt = $('healthText');
       try {
-        const res = await fetch(API_BASE + '/api/health', { cache: 'no-store' });
-        const json = await res.json();
+        const { json } = await apiFetch('health', API_BASE + '/api/health', { cache: 'no-store' });
+        if (json.engine_version !== EXPECTED_ENGINE_VERSION) {
+          logEvent('warn', 'engine.version_mismatch', { page: EXPECTED_ENGINE_VERSION, server: json.engine_version });
+          if (reloadForNewEngine(json.engine_version)) return;
+          throw versionMismatchError(json.engine_version);
+        }
         if (!json.ok) throw new Error(json.sheet_error || json.error || 'API unhealthy');
-        if (json.engine_version !== EXPECTED_ENGINE_VERSION || json.meta?.exact_index_version !== '1' || json.meta?.sync_state !== 'READY' || !json.exact_index_ready) {
-          throw new Error('API/snapshot mismatch: deploy exact-index API and run patched full sync.');
+        if (json.meta?.exact_index_version !== '1' || json.meta?.sync_state !== 'READY' || !json.exact_index_ready) {
+          throw new Error('Google Sheets snapshot is not READY (exact index / sync state). Run the sync BAT.');
         }
         dot.classList.add('ok');
         const backend = json.search_backend === 'MEMORY_FULL_SCAN'
           ? `Full scan ${Number(json.memory?.records || 0).toLocaleString('en-US')} BP in memory`
           : `Exact index v${json.meta.exact_index_version}`;
         txt.textContent = `Ready · ${backend} · Sync ${json.meta?.last_sync_at || 'unknown'}`;
+        if (json.search_backend !== 'MEMORY_FULL_SCAN') {
+          logEvent('warn', 'health.memory_engine_inactive', { backend: json.search_backend, reason: json.memory?.fallback_reason || json.memory?.last_error || 'unknown' });
+          txt.textContent += ' · Full-scan engine inactive: ' + (json.memory?.fallback_reason || 'see log');
+        }
       } catch (e) {
         dot.classList.remove('ok');
         txt.textContent = e.message || 'API not connected';
+        logEvent('error', 'health.failed', { message: e.message });
       }
     }
 
@@ -375,18 +607,21 @@
           address: $('address').value,
           ktp_number: $('ktp').value
         };
+        logEvent('info', 'check.submit', { name_1: submittedInput.name_1, address: submittedInput.address, ktp: maskKtp(submittedInput.ktp_number) });
         let json;
         let quotaRetries = 0;
         let warmingRetries = 0;
         for (;;) {
-          const res = await fetch(API_BASE + '/api/check', {
+          const call = await apiFetch('check.request', API_BASE + '/api/check', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(submittedInput)
           });
-          json = await res.json();
+          const res = call.res;
+          json = call.json;
           if (res.status === 503 && json.warming && ++warmingRetries <= MAX_WARMING_RETRIES) {
             const wait = Math.max(2, Math.min(15, Number(json.retry_after_seconds) || 5));
+            logEvent('warn', 'check.warming_retry', { attempt: warmingRetries, wait_s: wait });
             for (let left = wait; left > 0; left--) {
               result.innerHTML = '<p class="reason" role="status">Loading the latest BP database into memory. Retrying the same input in ' + left + 's. No PASS issued yet.</p>';
               await sleep(1000);
@@ -401,17 +636,32 @@
             throw new Error('Google Sheets read quota remains exhausted. No PASS issued. Please retry later when quota and sync traffic recover.');
           }
           const retrySeconds = Math.max(2, Math.min(120, Number(json.retry_after_seconds) || 70));
+          logEvent('warn', 'check.quota_wait', { attempt: quotaRetries, wait_s: retrySeconds });
           for (let left = retrySeconds; left > 0; left--) {
             result.innerHTML = '<p class="reason" role="status">Google Sheets read quota reached. Normal check not completed. Retrying the same input in ' + left + 's. No PASS issued.</p>';
             await sleep(1000);
           }
         }
-        if (json.engine_version !== EXPECTED_ENGINE_VERSION || json.meta?.exact_index_version !== '1' || json.meta?.sync_state !== 'READY') {
-          throw new Error('Backend version or exact index is outdated; result cannot be treated as PASS.');
+        if (json.engine_version !== EXPECTED_ENGINE_VERSION) {
+          logEvent('warn', 'engine.version_mismatch', { page: EXPECTED_ENGINE_VERSION, server: json.engine_version });
+          if (reloadForNewEngine(json.engine_version, submittedInput)) {
+            logEvent('info', 'engine.reload_page', { server: json.engine_version });
+            result.innerHTML = '<p class="reason" role="status">The checker was just updated. Reloading this page and re-running the same input. No PASS issued yet.</p>';
+            return;
+          }
+          throw versionMismatchError(json.engine_version);
+        }
+        if (json.meta?.exact_index_version !== '1' || json.meta?.sync_state !== 'READY') {
+          throw new Error('Google Sheets snapshot is not READY (exact index / sync state); result cannot be treated as PASS. Run the sync BAT.');
         }
         lastCheckInput = submittedInput;
+        logEvent(json.decision === 'FAIL' || json.decision === 'PASS' ? 'info' : 'warn', 'check.result', {
+          decision: json.decision, backend: json.search_backend, memory_source: json.memory_source,
+          fallback_reason: json.memory_fallback_reason, scanned: json.stats?.scanned_candidates,
+          coverage_complete: json.stats?.coverage_complete, server_ms: json.stats?.elapsed_ms });
         renderResult(json);
       } catch (err) {
+        logEvent('error', 'check.error', { message: err.message });
         result.innerHTML = errorHtml(err.message || 'Unexpected error');
       } finally {
         btn.disabled = false;
@@ -432,17 +682,20 @@
       const sessionStarted = Date.now();
       let paused = false;
       let lastKnown = lastRenderedResult;
+      logEvent('info', 'fullscope.start', { scanned: lastKnown?.stats?.scanned_candidates, candidate_space: lastKnown?.stats?.candidate_space });
       try {
         while (nextCursor && !fullScopeCancelled) {
           if (Date.now() - sessionStarted >= FULL_SCOPE_SESSION_MS) { paused = true; break; }
-          const response = await fetch(API_BASE + '/api/check', {
+          const call = await apiFetch('fullscope.chunk', API_BASE + '/api/check', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ ...snapshot, full_scope_cursor: nextCursor })
           });
-          const data = await response.json();
+          const response = call.res;
+          const data = call.json;
           if (response.status === 429) {
             quotaRetries++;
+            logEvent('warn', 'fullscope.quota_wait', { attempt: quotaRetries, wait_s: Math.max(15, Math.min(120, Number(data.retry_after_seconds) || 70)) });
             if (quotaRetries > MAX_QUOTA_RETRIES) { paused = true; break; }
             // Same cursor, same inputs: a failed HTTP request cannot advance
             // the search or produce PASS. Let the quota minute refill.
@@ -473,6 +726,7 @@
           if (!nextCursor) throw new Error('Full-scope continuation missing; refusing PASS.');
           const pause = Number(data.quota?.recommended_pause_seconds) || 0;
           if (pause > 0) {
+            logEvent('warn', 'fullscope.quota_pause', { wait_s: pause, scanned: data.stats?.scanned_candidates, candidate_space: data.stats?.candidate_space });
             let waitBox = $('quotaWait');
             if (!waitBox) {
               result.insertAdjacentHTML('beforeend', '<p id="quotaWait" class="reason" role="status"></p>');
@@ -486,12 +740,14 @@
             await sleep(FULL_SCOPE_WAIT_MS);
           }
         }
+        logEvent('info', 'fullscope.end', { decision: lastKnown?.decision, paused, cancelled: fullScopeCancelled, scanned: lastKnown?.stats?.scanned_candidates, candidate_space: lastKnown?.stats?.candidate_space, minutes: Math.round((Date.now() - sessionStarted) / 6000) / 10 });
         if (paused && !fullScopeCancelled && lastKnown?.full_scope_cursor) {
           fullScopeRunning = false;
           renderResult(lastKnown);
           result.insertAdjacentHTML('beforeend', '<p class="reason" role="status">Scan paused at the 45-minute safety limit. Your signed cursor preserves the completed rows; use Full Scope to resume before its 2-hour expiry. No PASS issued.</p>');
         }
       } catch (error) {
+        logEvent('error', 'fullscope.error', { message: error.message });
         if (!fullScopeCancelled) result.innerHTML = errorHtml(error.message || 'Full-scope search interrupted; no PASS issued.');
       } finally {
         fullScopeRunning = false;
@@ -582,7 +838,18 @@
       return String(v ?? '').replace(/[&<>'"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]));
     }
 
+    logEvent('info', 'page.load', { page_engine: EXPECTED_ENGINE_VERSION, viewport: innerWidth + 'x' + innerHeight });
     checkHealth();
+    try {
+      const pending = JSON.parse(sessionStorage.getItem(PENDING_CHECK_KEY) || 'null');
+      sessionStorage.removeItem(PENDING_CHECK_KEY);
+      if (pending) {
+        $('name1').value = pending.name_1 || '';
+        $('address').value = pending.address || '';
+        $('ktp').value = pending.ktp_number || '';
+        $('checkForm').requestSubmit();
+      }
+    } catch (_) { /* storage unavailable: the user simply re-runs the check */ }
   </script>
 </body>
 </html>

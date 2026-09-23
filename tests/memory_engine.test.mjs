@@ -162,6 +162,11 @@ test('memory engine: health, exact KTP, exact name, fuzzy FAIL and full-scan PAS
     assert.equal(pass.body.stats.snapshot_records,3);
     assert.equal(pass.body.full_scope_cursor,null);
     assert.equal(pass.body.search_backend,'MEMORY_FULL_SCAN');
+    assert.equal(pass.body.memory_source,'packed');
+    assert.deepEqual(pass.body.trace.map(t=>t.step),
+      ['acquire_snapshot','exact_ktp','exact_name_address','full_scan']);
+    assert.equal(pass.body.trace.find(t=>t.step==='full_scan').records,3);
+    assert(fuzzy.body.trace.some(t=>t.step==='match_rows'));
     assert.equal(f.reads.length,readsAfterLoad,'checks must not read Google Sheets');
     assert(!f.reads.some(r=>r.book==='TB'||r.book==='TB2'),'standby pair never read');
     const conflict=await f.check({name_1:'Warung Beta',
@@ -182,19 +187,56 @@ test('memory engine: follows CONTROL to the new generation',async()=>{
   },{gens:{b},env:{SNAPSHOT_VERIFY_MAX_AGE_SECONDS:'0'}});
 });
 
-test('memory engine: missing PACKED_SNAPSHOT falls back to the keyed v14 engine',async()=>{
+test('memory engine: without PACKED_SNAPSHOT it full-scans from the v14 tabs',async()=>{
   const a=generation(RECORDS,{packed:false});
   await withSheets(async f=>{
     const health=await handleHealth({env:f.env});
     const body=await health.json();
-    assert.equal(body.memory.fallback_reason,'PACKED_SNAPSHOT_MISSING');
-    assert.equal(body.search_backend,'KEYED_GOOGLE_SHEETS_DUAL');
     assert.equal(health.status,200,JSON.stringify(body));
+    assert.equal(body.search_backend,'MEMORY_FULL_SCAN');
+    assert.equal(body.memory.source,'v14_tabs');
+    assert.equal(body.memory.packed_error,'PACKED_SNAPSHOT_MISSING');
+    assert.equal(body.memory.records,3);
+    const loadReads=f.reads.length;
+    const pass=await f.check({name_1:'Apotek Sehat Selalu',address:'Jl Veteran 400 Kota Medan Sumatera'});
+    assert.equal(pass.body.decision,'PASS',JSON.stringify(pass.body));
+    assert.equal(pass.body.memory_source,'v14_tabs');
+    assert.equal(f.reads.length,loadReads,'a PASS needs zero Google reads');
+    const ktp=await f.check({ktp_number:'3671000000000077'});
+    assert.equal(ktp.body.decision,'FAIL',JSON.stringify(ktp.body));
+    assert.equal(ktp.body.exact_ktp_match.bp_id,'BP-C');
+    assert.equal(ktp.body.exact_ktp_match.name_1,'CV Gamma Sentosa');
+    const exact=await f.check({name_1:'WARUNG BETA',address:'jl. rindu 8 rt 003 rw 004 kel cibubur'});
+    assert.equal(exact.body.exact_name_address_match.bp_id,'BP-B');
+    const fuzzy=await f.check({name_1:'Toko Alfa Jaya',address:'Jl Mawar No 10 RT 001 RW 002 Kel Sukamaju'});
+    assert.equal(fuzzy.body.decision,'FAIL');
+    assert.equal(fuzzy.body.similarity_match.bp_id,'BP-A');
+    assert.equal(fuzzy.body.similarity_match.address_preview,'Jl Mawar No 10 RT 001 RW 002 Kel Sukamaju');
+    assert(f.reads.slice(loadReads).every(r=>r.book==='TA'&&r.range.startsWith('BP_DATABASE!')),
+      'hits only read the matched BP_DATABASE rows');
+  },{gens:{a}});
+});
+
+test('memory engine: SNAPSHOT_V14_TABS=off keeps the keyed v14 fallback',async()=>{
+  const a=generation(RECORDS,{packed:false});
+  await withSheets(async f=>{
     const got=await f.check({ktp_number:'3671000000000077'});
     assert.equal(got.body.decision,'FAIL',JSON.stringify(got.body));
-    assert.equal(got.body.exact_ktp_match.bp_id,'BP-C');
     assert.equal(got.body.search_backend,'KEYED_GOOGLE_SHEETS_DUAL');
     assert.equal(got.body.memory_fallback_reason,'PACKED_SNAPSHOT_MISSING');
+  },{gens:{a},env:{SNAPSHOT_V14_TABS:'off'}});
+});
+
+test('memory engine: corrupt v14 posting never yields a decision from memory',async()=>{
+  const a=generation(RECORDS,{packed:false});
+  const posting=a.index.get('INDEX_LEN_TOKEN')[1];
+  const parsed=JSON.parse(posting[1]);parsed[2]='WRONG';posting[1]=JSON.stringify(parsed);
+  a.index.get('KTP_INDEX').forEach((r,n)=>{if(n)r[1]=JSON.stringify([2,'OTHER']);});
+  await withSheets(async f=>{
+    const got=await f.check({name_1:'Apotek Sehat Selalu',address:'Jl Veteran 400 Kota Medan'});
+    // Memory refuses the inconsistent tabs; the keyed engine verifies each read itself.
+    assert.equal(got.body.search_backend,'KEYED_GOOGLE_SHEETS_DUAL');
+    assert.match(got.body.memory_fallback_reason,/^MEMORY_SNAPSHOT_UNAVAILABLE: .*No PASS\./);
   },{gens:{a}});
 });
 
@@ -211,8 +253,12 @@ for(const [label,corrupt] of [
     await withSheets(async f=>{
       const got=await f.check({name_1:'Apotek Sehat Selalu',address:'Jl Veteran 400 Kota Medan'});
       assert.equal(got.status,200,JSON.stringify(got.body));
-      assert.equal(got.body.search_backend,'KEYED_GOOGLE_SHEETS_DUAL');
-      assert.match(got.body.memory_fallback_reason||'',/PACKED_SNAPSHOT_UNAVAILABLE/);
+      // The broken packed tab is rejected; the verified v14 tabs serve instead.
+      assert.equal(got.body.search_backend,'MEMORY_FULL_SCAN');
+      assert.equal(got.body.memory_source,'v14_tabs');
+      assert.equal(got.body.decision,'PASS');
+      const health=await (await handleHealth({env:f.env})).json();
+      assert.match(health.memory.packed_error,/PACKED_SNAPSHOT_UNAVAILABLE/);
     },{gens:{a}});
   });
 }
@@ -268,8 +314,8 @@ test('packed loader rejects malformed rows and wrong record counts',async()=>{
   await assert.rejects(buildSnapshotIndex(Buffer.from(HEADER+'\nBP-1\tZB02\tA\tB\t'),
     {expectedRecords:2}),/expects 2/);
   const one=await buildSnapshotIndex(Buffer.from(HEADER+'\nBP-1\tZB02\tA\tB\t12'));
-  assert.equal(one.findKtp('12')[0].bp_id,'BP-1');
-  assert.deepEqual(one.findKtp('13'),[]);
+  assert.equal((await one.findKtp('12'))[0].bp_id,'BP-1');
+  assert.deepEqual(await one.findKtp('13'),[]);
 });
 
 test('index normalization and exact keys equal the query-side functions for every BP',async()=>{
@@ -281,11 +327,11 @@ test('index normalization and exact keys equal the query-side functions for ever
   const all=[...records.map(r=>[r.bp_id,r.name_1,r.address]),...tricky.map(r=>[r[0],r[2],r[3]])];
   assert.equal(snap.count,all.length);
   for(let i=0;i<snap.count;i++){
-    const r=snap.record(i);
+    const r=snap.packedRecord(i);
     assert.equal(r.norm_text,normalizeText(r.name_1+' '+r.address),r.bp_id);
     assert.deepEqual([...new Set(r.norm_text.split(' ').filter(t=>t.length>=2))],
       [...snap.tokIds.subarray(snap.tokStart[i],snap.tokStart[i+1])].map(id=>snap.dict[id]));
-    assert(snap.findExact(r.name_1,r.address).some(x=>x.bp_id===r.bp_id),r.bp_id);
+    assert((await snap.findExact(r.name_1,r.address)).some(x=>x.bp_id===r.bp_id),r.bp_id);
   }
 });
 

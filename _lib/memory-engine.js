@@ -35,11 +35,13 @@ const BUILD_YIELD_EVERY=4000;     // keep the event loop responsive while indexi
 const EPS=0.01;                   // round2() can raise a score by <= 0.005
 const NEAR_TOKEN_SIM=75;          // jaccardSimilarity() fuzzy pair threshold
 const NEAR_CACHE_LIMIT=20000;
+const KEYED_READ_ROWS=20000;      // v14 tab fallback: ~2.6 MB per range
 
 const fail=(status,message,extra={})=>Object.assign(new Error(message),{status},extra);
 const sha256=buf=>createHash('sha256').update(buf).digest('hex');
 const key52=hex=>parseInt(hex.slice(0,13),16);
 const ktpKey=digits=>key52(createHash('sha1').update(digits).digest('hex'));
+const normKey=text=>key52(createHash('sha1').update(text).digest('hex'));
 const yieldLoop=()=>new Promise(resolve=>setImmediate(resolve));
 const envNumber=(env,name,fallback,min=0)=>{
   const value=Number(env?.[name]);
@@ -131,23 +133,57 @@ function sortByKey(keys,count){
 }
 
 export class SnapshotIndex {
-  record(i){
+  normText(i){return this.norm.toString('latin1',this.normStart[i],this.normStart[i+1]);}
+  packedRecord(i){
     const f=this.raw.toString('utf8',this.lineStart[i],this.lineEnd[i]).split('\t');
     return {bp_id:f[0],bp_type_id:f[1],name_1:f[2],address:f[3],ktp:f[4],
       norm_text:this.normText(i)};
   }
-  normText(i){return this.norm.toString('latin1',this.normStart[i],this.normStart[i+1]);}
-
-  findKtp(ktp){
-    if(!ktp)return [];
-    return sortedLookup(this.ktpKeys,this.ktpIdx,ktpKey(ktp))
-      .map(i=>this.record(i)).filter(r=>r.ktp===ktp);
+  // Packed snapshots hold every source field. v14-tab snapshots hold only the
+  // normalized text, so the few rows a FAIL needs are read from BP_DATABASE in
+  // one batch and verified exactly like the v14 engine (key, hash, text).
+  async records(indices,fetchRows){
+    if(this.kind==='packed')return indices.map(i=>this.packedRecord(i));
+    if(!indices.length)return [];
+    const rows=await fetchRows(indices.map(i=>this.bpRows[i]));
+    return indices.map((i,n)=>{
+      const row=rows[n]||[];
+      const rec={bp_id:String(row[0]??''),bp_type_id:String(row[1]??''),
+        name_1:String(row[2]??''),address:String(row[3]??''),
+        norm_text:this.normText(i),row_hash:String(row[7]??'')};
+      if(rec.bp_id!==this.bpIds[i]||!/^[a-f0-9]{64}$/.test(rec.row_hash)||
+         normalizeText(rec.name_1+' '+rec.address)!==rec.norm_text)
+        throw fail(503,'Keyed pointer does not match source BP key/hash/text. No PASS.');
+      return rec;
+    });
   }
-  findExact(name,address){
+  async findKtp(ktp,fetchRows){
+    if(!ktp)return [];
+    const found=sortedLookup(this.ktpKeys,this.ktpIdx,ktpKey(ktp));
+    if(this.kind==='packed')
+      return found.map(i=>this.packedRecord(i)).filter(r=>r.ktp===ktp);
+    const recs=await this.records(found,fetchRows);
+    for(const r of recs){
+      if(r.row_hash!==sha256(JSON.stringify([r.bp_id,r.bp_type_id,r.name_1,r.address,ktp])))
+        throw fail(503,'KTP posting not bound to authoritative BP row/hash. NO PASS.');
+    }
+    return recs;
+  }
+  async findExact(name,address,fetchRows){
     const hash=exactNameAddressHash(name,address);
-    return sortedLookup(this.exactKeys,this.exactIdx,key52(hash))
-      .map(i=>this.record(i))
-      .filter(r=>exactNameAddressHash(r.name_1,r.address)===hash);
+    if(this.kind==='packed'){
+      return sortedLookup(this.exactKeys,this.exactIdx,key52(hash))
+        .map(i=>this.packedRecord(i))
+        .filter(r=>exactNameAddressHash(r.name_1,r.address)===hash);
+    }
+    // An exact Name 1 + Address match always has the identical normalized
+    // text (normalize(name+' '+address) is the join of both normalized
+    // fields), so candidates are the records sharing that text.
+    const qnorm=normalizeText(name+' '+address);
+    const found=sortedLookup(this.normKeys,this.normIdx,normKey(qnorm))
+      .filter(i=>this.normText(i)===qnorm);
+    const recs=await this.records(found,fetchRows);
+    return recs.filter(r=>exactNameAddressHash(r.name_1,r.address)===hash);
   }
 
   nearTokenIds(token){
@@ -279,20 +315,98 @@ export class SnapshotIndex {
   }
 }
 
-// Parse + index the decompressed TSV. Async only to yield between batches.
+// Incremental index shared by both snapshot sources.
+class IndexBuilder {
+  constructor(estimatedChars,{exactByNorm=false}={}){
+    this.normStart=new GrowU32();this.tokStart=new GrowU32();this.tokIds=new GrowU32(1<<20);
+    this.norm=Buffer.allocUnsafe(Math.max(1024,estimatedChars));
+    this.normLen=0;this.maxLen=0;this.count=0;
+    this.dictIndex=new Map();this.dict=[];
+    this.hist=new Uint8Array(ALPHABET*65536);
+    this.lengths=[];this.keys=[];this.ktpKeys=[];this.ktpOwners=[];
+    this.exactByNorm=exactByNorm;
+  }
+  // text: normalizeText() output. exactKey: 52-bit exact Name+Address hash key
+  // (packed) or null to key records by their normalized text (v14 tabs).
+  add(text,exactKey=null){
+    const i=this.count;
+    if(this.normLen+text.length>this.norm.length){
+      const grown=Buffer.allocUnsafe(Math.max(this.norm.length*2,this.normLen+text.length));
+      this.norm.copy(grown,0,0,this.normLen);this.norm=grown;
+    }
+    this.normStart.push(this.normLen);
+    this.normLen+=this.norm.write(text,this.normLen,'latin1');
+    this.lengths.push(text.length);
+    if(text.length>this.maxLen)this.maxLen=text.length;
+    if((i+1)*ALPHABET>this.hist.length){
+      const grown=new Uint8Array(this.hist.length*2);grown.set(this.hist);this.hist=grown;
+    }
+    for(let x=0,h=i*ALPHABET;x<text.length;x++){
+      const c=CODE[text.charCodeAt(x)];
+      if(c>=0&&this.hist[h+c]<255)this.hist[h+c]++;
+    }
+    // Same token rule as tokens(): unique space-separated words of length >= 2.
+    const tokIds=this.tokIds,first=tokIds.n;
+    this.tokStart.push(first);
+    for(const t of text.split(' ')){
+      if(t.length<2)continue;
+      let id=this.dictIndex.get(t);
+      if(id===undefined){id=this.dict.length;this.dict.push(t);this.dictIndex.set(t,id);}
+      let seen=false;
+      for(let x=first;x<tokIds.n;x++)if(tokIds.a[x]===id){seen=true;break;}
+      if(!seen)tokIds.push(id);
+    }
+    this.keys.push(this.exactByNorm?normKey(text):exactKey);
+    this.count++;
+    return i;
+  }
+  addKtp(ktp,owner){this.ktpKeys.push(ktpKey(ktp));this.ktpOwners.push(owner);}
+  async finish(snap){
+    const count=this.count,maxLen=this.maxLen,dict=this.dict;
+    this.normStart.push(this.normLen);this.tokStart.push(this.tokIds.n);
+    snap.count=count;
+    snap.norm=Buffer.from(this.norm.subarray(0,this.normLen));this.norm=null;  // exact size
+    snap.normStart=this.normStart.done();
+    snap.tokStart=this.tokStart.done();snap.tokIds=this.tokIds.done();
+    snap.hist=this.hist.slice(0,count*ALPHABET);this.hist=null;
+    snap.dict=dict;snap.dictIndex=this.dictIndex;
+    const byLen=[];
+    for(let id=0;id<dict.length;id++)(byLen[dict[id].length]??=[]).push(id);
+    snap.dictByLen=Array.from(byLen,ids=>ids?Uint32Array.from(ids):null);
+    snap.nearFlags=new Uint8Array(dict.length);
+    snap.nearCache=new Map();
+    // Records grouped by normalized length (counting sort) for the tolerance window.
+    snap.maxLen=maxLen;
+    const lenStart=new Uint32Array(maxLen+2);
+    for(const n of this.lengths)lenStart[n+1]++;
+    for(let n=1;n<lenStart.length;n++)lenStart[n]+=lenStart[n-1];
+    const fill=lenStart.slice(),order=new Uint32Array(count);
+    for(let i=0;i<count;i++)order[fill[this.lengths[i]]++]=i;
+    snap.order=order;snap.lenStart=lenStart;
+    await yieldLoop();
+    const keyed=sortByKey(Float64Array.from(this.keys),count);
+    if(this.exactByNorm){snap.normKeys=keyed.keys;snap.normIdx=keyed.idx;}
+    else{snap.exactKeys=keyed.keys;snap.exactIdx=keyed.idx;}
+    const kKeys=Float64Array.from(this.ktpKeys),kSort=sortByKey(kKeys,kKeys.length);
+    const owners=this.ktpOwners;
+    snap.ktpKeys=kSort.keys;
+    snap.ktpIdx=Uint32Array.from(kSort.idx,p=>owners[p]);
+    snap.ktpCount=kKeys.length;
+    snap.bandA=new Int32Array(maxLen+2);snap.bandB=new Int32Array(maxLen+2);
+    const longestToken=dict.reduce((n,t)=>t.length>n?t.length:n,0);
+    snap.rowA=new Int32Array(longestToken+2);snap.rowB=new Int32Array(longestToken+2);
+    return snap;
+  }
+}
+
+// Parse + index the decompressed PACKED_SNAPSHOT TSV.
 export async function buildSnapshotIndex(raw,{expectedRecords=null}={}){
   if(!Buffer.isBuffer(raw))raw=Buffer.from(raw);
   let pos=raw.indexOf(10);
   const header=raw.toString('utf8',0,pos<0?raw.length:pos).replace(/\r$/,'');
   if(header!==PACKED_HEADER)throw fail(503,'PACKED_SNAPSHOT header/schema mismatch. No PASS.');
+  const builder=new IndexBuilder(Math.floor(raw.length*0.8));
   const lineStart=new GrowU32(),lineEnd=new GrowU32();
-  const normStart=new GrowU32(),tokStart=new GrowU32(),tokIds=new GrowU32(1<<20);
-  let norm=Buffer.allocUnsafe(Math.max(1024,Math.floor(raw.length*0.8)));
-  let normLen=0,maxLen=0;
-  const dictIndex=new Map(),dict=[];
-  let hist=new Uint8Array(ALPHABET*65536);
-  const exactKeys=[],ktpKeys=[],ktpOwners=[],lengths=[];
-  let count=0;
   while(pos>=0&&pos<raw.length){
     const start=pos+1;
     let end=raw.indexOf(10,start);
@@ -301,88 +415,82 @@ export async function buildSnapshotIndex(raw,{expectedRecords=null}={}){
     if(end===start)continue;
     const fields=raw.toString('utf8',start,end).split('\t');
     if(fields.length!==5||!fields[0])
-      throw fail(503,'PACKED_SNAPSHOT row '+(count+1)+' is malformed. No PASS.');
+      throw fail(503,'PACKED_SNAPSHOT row '+(builder.count+1)+' is malformed. No PASS.');
     const [,,name,address,ktp]=fields;
     // normalizeText() is local per character/word and the joining space breaks
     // every context, so normalize(name+' '+address) equals the join below
     // (fuzz-verified; tests re-check it). Saves one normalization per BP.
     const nName=normalizeText(name),nAddress=normalizeText(address);
     const text=nName&&nAddress?nName+' '+nAddress:nName||nAddress;
-    if(normLen+text.length>norm.length){
-      const grown=Buffer.allocUnsafe(Math.max(norm.length*2,normLen+text.length));
-      norm.copy(grown,0,0,normLen);norm=grown;
-    }
-    lineStart.push(start);lineEnd.push(end);normStart.push(normLen);
-    normLen+=norm.write(text,normLen,'latin1');
-    lengths.push(text.length);
-    if((count+1)*ALPHABET>hist.length){const grown=new Uint8Array(hist.length*2);grown.set(hist);hist=grown;}
-    for(let x=0,h=count*ALPHABET;x<text.length;x++){
-      const c=CODE[text.charCodeAt(x)];
-      if(c>=0&&hist[h+c]<255)hist[h+c]++;
-    }
-    if(text.length>maxLen)maxLen=text.length;
-    tokStart.push(tokIds.n);
-    // Same token rule as tokens(): unique space-separated words of length >= 2.
-    const recordTokens=tokIds.n;
-    for(const t of text.split(' ')){
-      if(t.length<2)continue;
-      let id=dictIndex.get(t);
-      if(id===undefined){id=dict.length;dict.push(t);dictIndex.set(t,id);}
-      let seen=false;
-      for(let x=recordTokens;x<tokIds.n;x++)if(tokIds.a[x]===id){seen=true;break;}
-      if(!seen)tokIds.push(id);
-    }
+    lineStart.push(start);lineEnd.push(end);
     // Identical to exactNameAddressHash(name,address), without re-normalizing.
-    exactKeys.push(key52(createHash('sha256').update(nName+'\x1f'+nAddress,'utf8').digest('hex')));
+    const i=builder.add(text,key52(createHash('sha256')
+      .update(nName+'\x1f'+nAddress,'utf8').digest('hex')));
     if(ktp){
       if(normalizeDigits(ktp)!==ktp)throw fail(503,'PACKED_SNAPSHOT KTP is not normalized. No PASS.');
-      ktpKeys.push(ktpKey(ktp));ktpOwners.push(count);
+      builder.addKtp(ktp,i);
     }
-    count++;
-    if(count%BUILD_YIELD_EVERY===0)await yieldLoop();
+    if(builder.count%BUILD_YIELD_EVERY===0)await yieldLoop();
   }
-  if(!count)throw fail(503,'PACKED_SNAPSHOT is empty. No PASS.');
-  if(expectedRecords!==null&&count!==expectedRecords)
-    throw fail(503,`PACKED_SNAPSHOT has ${count} BP rows, META expects ${expectedRecords}. No PASS.`);
-  normStart.push(normLen);tokStart.push(tokIds.n);
+  if(!builder.count)throw fail(503,'PACKED_SNAPSHOT is empty. No PASS.');
+  if(expectedRecords!==null&&builder.count!==expectedRecords)
+    throw fail(503,`PACKED_SNAPSHOT has ${builder.count} BP rows, META expects ${expectedRecords}. No PASS.`);
   const snap=new SnapshotIndex();
-  snap.count=count;snap.raw=raw;
+  snap.kind='packed';snap.raw=raw;
   snap.lineStart=lineStart.done();snap.lineEnd=lineEnd.done();
-  snap.norm=Buffer.from(norm.subarray(0,normLen));norm=null;  // exact-size copy
-  snap.normStart=normStart.done();
-  snap.tokStart=tokStart.done();snap.tokIds=tokIds.done();
-  snap.hist=hist.slice(0,count*ALPHABET);
-  snap.dict=dict;snap.dictIndex=dictIndex;
-  snap.dictByLen=[];
-  for(let id=0;id<dict.length;id++)(snap.dictByLen[dict[id].length]??=[]).push(id);
-  snap.dictByLen=Array.from(snap.dictByLen,ids=>ids?Uint32Array.from(ids):null);
-  snap.nearFlags=new Uint8Array(dict.length);
-  snap.nearCache=new Map();
-  // Records grouped by normalized length (counting sort) for the tolerance window.
-  snap.maxLen=maxLen;
-  const lenStart=new Uint32Array(maxLen+2);
-  for(const n of lengths)lenStart[n+1]++;
-  for(let n=1;n<lenStart.length;n++)lenStart[n]+=lenStart[n-1];
-  const fill=lenStart.slice(),order=new Uint32Array(count);
-  for(let i=0;i<count;i++)order[fill[lengths[i]]++]=i;
-  snap.order=order;snap.lenStart=lenStart;
-  await yieldLoop();
-  const exact=sortByKey(Float64Array.from(exactKeys),count);
-  snap.exactKeys=exact.keys;snap.exactIdx=exact.idx;
-  const kKeys=Float64Array.from(ktpKeys),kSort=sortByKey(kKeys,kKeys.length);
-  snap.ktpKeys=kSort.keys;
-  snap.ktpIdx=Uint32Array.from(kSort.idx,p=>ktpOwners[p]);
-  const width=maxLen+2;
-  snap.bandA=new Int32Array(width);snap.bandB=new Int32Array(width);
-  const longestToken=dict.reduce((n,t)=>t.length>n?t.length:n,0);
-  snap.rowA=new Int32Array(longestToken+2);snap.rowB=new Int32Array(longestToken+2);
-  snap.ktpCount=ktpKeys.length;
-  return snap;
+  return builder.finish(snap);
+}
+
+// Build the same index from the v14 tabs every published pair already has:
+// INDEX_LEN_TOKEN postings [norm, BP_DATABASE row, BP ID] and KTP_INDEX
+// [KTP digits, [row, BP ID]]. Used when PACKED_SNAPSHOT is absent/unusable.
+export async function buildKeyedTabsIndex(postingBlocks,ktpBlocks,{bpRows,ktpRows}){
+  const builder=new IndexBuilder(bpRows*96,{exactByNorm:true});
+  const bpIds=[],rows=new GrowU32(),rowToIdx=new Map();
+  for await(const block of postingBlocks){
+    for(const row of block){
+      if(!Array.isArray(row)||row.length!==2)
+        throw fail(503,'Incomplete INDEX_LEN_TOKEN row. No PASS.');
+      let posting;
+      try{posting=JSON.parse(String(row[1]));}catch{posting=null;}
+      const [norm,rowNo,bp]=Array.isArray(posting)?posting:[];
+      const [bucket,tokenCount]=String(row[0]).split(':');
+      if(typeof norm!=='string'||typeof bp!=='string'||!bp||
+         !Number.isSafeInteger(rowNo)||rowNo<2||rowToIdx.has(rowNo)||
+         String(Math.floor(norm.length/5)).padStart(3,'0')!==bucket||
+         tokens(norm).size!==Number(tokenCount)||/[^a-z0-9 ]/.test(norm))
+        throw fail(503,'INDEX_LEN_TOKEN posting integrity mismatch. No PASS.');
+      const i=builder.add(norm);
+      bpIds.push(bp);rows.push(rowNo);rowToIdx.set(rowNo,i);
+      if(builder.count%BUILD_YIELD_EVERY===0)await yieldLoop();
+    }
+  }
+  if(builder.count!==bpRows)
+    throw fail(503,`INDEX_LEN_TOKEN has ${builder.count} postings, META expects ${bpRows}. No PASS.`);
+  let ktpSeen=0;
+  for await(const block of ktpBlocks){
+    for(const row of block){
+      let posting;
+      try{posting=JSON.parse(String(row?.[1]));}catch{posting=null;}
+      const [rowNo,bp]=Array.isArray(posting)?posting:[];
+      const digits=normalizeDigits(row?.[0]);
+      const i=rowToIdx.get(rowNo);
+      if(!digits||i===undefined||bpIds[i]!==bp)
+        throw fail(503,'KTP_INDEX posting does not match INDEX_LEN_TOKEN. No PASS.');
+      builder.addKtp(digits,i);
+      ktpSeen++;
+    }
+  }
+  if(ktpSeen!==ktpRows)
+    throw fail(503,`KTP_INDEX has ${ktpSeen} rows, META expects ${ktpRows}. No PASS.`);
+  const snap=new SnapshotIndex();
+  snap.kind='v14_tabs';snap.bpIds=bpIds;snap.bpRows=rows.done();
+  return builder.finish(snap);
 }
 
 // ---------------------------------------------------------------- loading ---
 
-async function sheetsBatchGet(env,sheetId,ranges){
+async function sheetsBatchGet(env,sheetId,ranges,{attempts=5}={}){
   for(let attempt=0;;attempt++){
     const token=await getGoogleAccessToken(env);
     const query=new URLSearchParams({majorDimension:'ROWS'});
@@ -390,7 +498,7 @@ async function sheetsBatchGet(env,sheetId,ranges){
     const res=await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${
       encodeURIComponent(sheetId)}/values:batchGet?${query}`,
       {headers:{Authorization:`Bearer ${token}`}});
-    if((res.status===429||res.status>=500)&&attempt<4){
+    if((res.status===429||res.status>=500)&&attempt<attempts-1){
       const retry=Number(res.headers.get('retry-after'));
       await new Promise(r=>setTimeout(r,
         (Number.isFinite(retry)&&retry>0?retry:5*2**attempt)*1000));
@@ -400,7 +508,7 @@ async function sheetsBatchGet(env,sheetId,ranges){
       `Google Sheets snapshot read failed (HTTP ${res.status}). No PASS.`);
     const body=await res.json();
     if(!Array.isArray(body.valueRanges)||body.valueRanges.length!==ranges.length)
-      throw fail(503,'Incomplete PACKED_SNAPSHOT batch response. No PASS.');
+      throw fail(503,'Incomplete Google Sheets batch response. No PASS.');
     return body.valueRanges.map(x=>x.values||[]);
   }
 }
@@ -417,11 +525,7 @@ export function packedInfo(indexMeta,primaryMeta,control){
   return {parts,records,hash};
 }
 
-async function loadGeneration(env){
-  const t0=Date.now();
-  const {control,scopedEnv,meta:primaryMeta,indexMeta:meta}=await readDualSnapshot(env);
-  const info=packedInfo(meta,primaryMeta,control);
-  if(!info)return {packed:false,control,meta,scopedEnv};
+async function loadPacked(env,control,info){
   const ranges=[];
   for(let a=2;a<=info.parts+1;a+=PART_READ_ROWS)
     ranges.push(`${PACKED_TAB}!A${a}:D${Math.min(info.parts+1,a+PART_READ_ROWS-1)}`);
@@ -450,11 +554,62 @@ async function loadGeneration(env){
   for(const row of rows){used+=gz.write(row[3],used,'base64');row[3]='';}
   const raw=await gunzipAsync(gz.subarray(0,used));
   if(sha256(raw)!==info.hash)throw fail(503,'PACKED_SNAPSHOT SHA-256 mismatch. No PASS.');
-  const fetchedMs=Date.now()-t0;
-  const index=await buildSnapshotIndex(raw,{expectedRecords:info.records});
-  return {packed:true,control,meta,scopedEnv,index,
-    timings:{fetch_ms:fetchedMs,build_ms:Date.now()-t0-fetchedMs},
-    packedBytes:raw.length};
+  return {raw,index:await buildSnapshotIndex(raw,{expectedRecords:info.records})};
+}
+
+// Stream a big two-column tab in ordered blocks (two ranges per request).
+async function* tabBlocks(env,sheetId,tab,count){
+  const ranges=[];
+  for(let a=2;a<=count+1;a+=KEYED_READ_ROWS)
+    ranges.push(`${tab}!A${a}:B${Math.min(count+1,a+KEYED_READ_ROWS-1)}`);
+  for(let r=0;r<ranges.length;r+=2){
+    const got=await sheetsBatchGet(env,sheetId,ranges.slice(r,r+2));
+    for(let g=0;g<got.length;g++){
+      const [,lo,hi]=/!A(\d+):B(\d+)$/.exec(ranges[r+g]).map(Number);
+      if(got[g].length!==hi-lo+1)throw fail(503,`${tab} range ${lo}:${hi} is incomplete. No PASS.`);
+      yield got[g];
+    }
+  }
+}
+
+async function loadKeyedTabs(env,control,meta){
+  const bpRows=Number(meta.total_bp_rows),ktpRows=Number(meta.total_ktp_index_rows);
+  if(!Number.isSafeInteger(bpRows)||bpRows<1||!Number.isSafeInteger(ktpRows)||ktpRows<0)
+    throw fail(503,'v14 META row counts are invalid. No PASS.');
+  const book=control.active_index_sheet_id;
+  const index=await buildKeyedTabsIndex(
+    tabBlocks(env,book,'INDEX_LEN_TOKEN',bpRows),
+    tabBlocks(env,book,'KTP_INDEX',ktpRows),{bpRows,ktpRows});
+  // The tabs carry no per-row sync_id: the pair must still be the committed
+  // generation after reading them (a sync only ever rewrites the STANDBY pair).
+  const after=await readDualControl(env);
+  if(after.sync_id!==control.sync_id||after.active_index_sheet_id!==book)
+    throw fail(503,'CONTROL changed while loading the v14 tabs; reloading the new generation.');
+  return index;
+}
+
+async function loadGeneration(env){
+  const t0=Date.now();
+  const {control,scopedEnv,meta:primaryMeta,indexMeta:meta}=await readDualSnapshot(env);
+  let packedError='';
+  try{
+    const info=packedInfo(meta,primaryMeta,control);
+    if(info){
+      const {raw,index}=await loadPacked(env,control,info);
+      return {loaded:true,source:'packed',control,meta,scopedEnv,index,
+        packedBytes:raw.length,timings:{load_ms:Date.now()-t0}};
+    }
+    packedError='PACKED_SNAPSHOT_MISSING';
+  }catch(error){
+    if(error?.status===429)throw error;
+    packedError='PACKED_SNAPSHOT_UNAVAILABLE: '+(error?.message||error);
+  }
+  if(String(env.SNAPSHOT_V14_TABS||'on').toLowerCase()==='off')
+    return {loaded:false,reason:packedError,control,meta,scopedEnv};
+  console.log(`[memory-engine] ${packedError}; loading v14 tabs of ${control.sync_id} instead`);
+  const index=await loadKeyedTabs(env,control,meta);
+  return {loaded:true,source:'v14_tabs',packedError,control,meta,scopedEnv,index,
+    packedBytes:null,timings:{load_ms:Date.now()-t0}};
 }
 
 // ------------------------------------------------------ generation state ---
@@ -485,8 +640,8 @@ function startLoad(env,syncId){
   const superseded=()=>epoch!==state.epoch||state.wantedSync!==syncId;
   const job=loadGeneration(env).then(result=>{
     if(superseded())return {...result,superseded:true};
-    if(!result.packed){
-      state.noPacked={sync_id:result.control.sync_id,at:Date.now()};
+    if(!result.loaded){
+      state.noPacked={sync_id:result.control.sync_id,at:Date.now(),reason:result.reason};
       state.controlSync=result.control.sync_id;
       state.verifiedAt=Date.now();
       return result;
@@ -498,8 +653,8 @@ function startLoad(env,syncId){
     state.noPacked=null;state.failed=null;state.lastError='';
     state.controlSync=result.control.sync_id;
     state.verifiedAt=Date.now();
-    console.log(`[memory-engine] loaded ${result.control.sync_id}: ${result.index.count} BP, `+
-      `fetch ${result.timings.fetch_ms}ms, build ${result.timings.build_ms}ms, rss ${state.current.rss_mb}MB`);
+    console.log(`[memory-engine] loaded ${result.control.sync_id} from ${result.source}: `+
+      `${result.index.count} BP in ${result.timings.load_ms}ms, rss ${state.current.rss_mb}MB`);
     return result;
   },error=>{
     if(superseded())throw error;
@@ -528,20 +683,22 @@ async function verifyControl(env){
 
 // Resolve what a check should use RIGHT NOW:
 //   {index,...}        in-memory snapshot of the committed generation
-//   {fallback:reason}  generation has no PACKED_SNAPSHOT yet -> keyed engine
+//   {fallback:reason}  no usable in-memory source for the generation -> keyed engine
 // Throws 503 with retry_after_seconds while a generation is still loading.
 export async function acquireSnapshot(env,{waitMs}={}){
   const wait=waitMs??envNumber(env,'SNAPSHOT_LOAD_WAIT_MS',20000);
   const maxAge=envNumber(env,'SNAPSHOT_VERIFY_MAX_AGE_SECONDS',180)*1000;
-  const fresh=Date.now()-state.verifiedAt<=maxAge;
+  // Strict: SNAPSHOT_VERIFY_MAX_AGE_SECONDS=0 must re-verify CONTROL on every
+  // check, even within the same millisecond as the last verification.
+  const fresh=maxAge>0&&Date.now()-state.verifiedAt<maxAge;
   if(fresh&&state.current&&state.current.control.sync_id===state.controlSync)return state.current;
   if(fresh&&state.noPacked&&state.noPacked.sync_id===state.controlSync)
-    return {fallback:'PACKED_SNAPSHOT_MISSING'};
+    return {fallback:state.noPacked.reason};
   const control=await verifyControl(env);
   if(state.current?.control.sync_id===control.sync_id)return state.current;
-  if(state.noPacked?.sync_id===control.sync_id)return {fallback:'PACKED_SNAPSHOT_MISSING'};
+  if(state.noPacked?.sync_id===control.sync_id)return {fallback:state.noPacked.reason};
   if(failedRecently(control.sync_id))
-    return {fallback:'PACKED_SNAPSHOT_UNAVAILABLE: '+state.lastError};
+    return {fallback:'MEMORY_SNAPSHOT_UNAVAILABLE: '+state.lastError};
   const job=startLoad(env,control.sync_id);
   let timer;
   const timeout=new Promise(resolve=>{timer=setTimeout(()=>resolve('timeout'),wait);});
@@ -550,13 +707,13 @@ export async function acquireSnapshot(env,{waitMs}={}){
     if(result==='timeout'||result.superseded)throw fail(503,
       'Loading the latest BP snapshot into memory. No decision issued yet; retrying shortly.',
       {retry_after_seconds:5,warming:true});
-    if(!result.packed)return {fallback:'PACKED_SNAPSHOT_MISSING'};
+    if(!result.loaded)return {fallback:result.reason};
     return state.current?.control.sync_id===result.control.sync_id?state.current:result;
   }catch(error){
     if(error?.warming)throw error;
-    // A corrupt/unreadable packed tab must never produce PASS: use the keyed
-    // Sheets engine, which verifies the same generation on every read.
-    return {fallback:'PACKED_SNAPSHOT_UNAVAILABLE: '+(error?.message||error)};
+    // An unreadable/corrupt generation must never produce PASS from memory:
+    // use the keyed Sheets engine, which verifies every read it makes.
+    return {fallback:'MEMORY_SNAPSHOT_UNAVAILABLE: '+(error?.message||error)};
   }finally{clearTimeout(timer);}
 }
 
@@ -579,6 +736,8 @@ export function memorySnapshotStatus(){
   const c=state.current;
   return {
     loaded:Boolean(c),
+    source:c?.source||null,
+    packed_error:c?.packedError||null,
     sync_id:c?.control.sync_id||null,
     active_control_sync_id:state.controlSync||null,
     records:c?.index.count??0,
@@ -586,7 +745,7 @@ export function memorySnapshotStatus(){
     dictionary_tokens:c?.index.dict.length??0,
     loaded_at:c?new Date(c.loadedAt).toISOString():null,
     verified_age_seconds:state.verifiedAt?Math.round((Date.now()-state.verifiedAt)/1000):null,
-    fetch_ms:c?.timings.fetch_ms??null,build_ms:c?.timings.build_ms??null,
+    load_ms:c?.timings.load_ms??null,
     packed_bytes:c?.packedBytes??null,rss_mb:c?.rss_mb??null,
     loading:Boolean(state.loading),packed_missing:Boolean(state.noPacked),
     last_error:state.lastError||null
@@ -595,7 +754,7 @@ export function memorySnapshotStatus(){
 
 // ------------------------------------------------------------------ check ---
 
-export function memoryCheck(payload,env,snapshot){
+export async function memoryCheck(payload,env,snapshot){
   const started=Date.now();
   const snap=snapshot.index,meta=snapshot.meta;
   const name=String(payload?.name_1||payload?.name1||'').trim();
@@ -606,20 +765,36 @@ export function memoryCheck(payload,env,snapshot){
   const threshold=Number(env.SIMILARITY_THRESHOLD||92);
   const direct=getSimilarityDirectRejectThreshold(env);
   const weights=getSimilarityWeights(env);
+  // Step timings, returned to the browser log (no BP data in here).
+  const trace=[];
+  let mark=Date.now();
+  const step=(name,extra={})=>{const now=Date.now();trace.push({step:name,ms:now-mark,...extra});mark=now;};
   const base={ok:true,threshold,direct_reject_threshold:direct,meta,
     input:{name_1:name,address,ktp_masked:maskKtp(ktp),normalized_length:qtext.length},
     exact_ktp_match:null,exact_name_address_match:null,exact_match_count:0,
     identity_conflict:false,similarity_match:null,top_candidates:[],
     full_scope_cursor:null,full_scope_available:false,full_scope_active:false,
-    search_backend:'MEMORY_FULL_SCAN'};
+    search_backend:'MEMORY_FULL_SCAN',memory_source:snapshot.source,trace};
   const stats=extra=>({scanned_candidates:snap.count,compared_candidates:0,
     candidate_space:snap.count,coverage_complete:true,
     search_scope:'MEMORY_FULL_SCAN_V15',snapshot_records:snap.count,
     snapshot_sync_id:snapshot.control.sync_id,...extra,
     elapsed_ms:Date.now()-started});
 
-  const ktpHits=snap.findKtp(ktp);
-  const exactHits=name&&address?snap.findExact(name,address):[];
+  // v14-tab snapshots read the matched BP rows (one batch, only on a hit).
+  const fetchRows=async rowNumbers=>{
+    const out=[];
+    for(let i=0;i<rowNumbers.length;i+=50){
+      const got=await sheetsBatchGet(env,snapshot.control.active_sheet_id,
+        rowNumbers.slice(i,i+50).map(r=>`BP_DATABASE!A${r}:H${r}`),{attempts:2});
+      out.push(...got.map(values=>values[0]||[]));
+    }
+    return out;
+  };
+  const ktpHits=await snap.findKtp(ktp,fetchRows);
+  step('exact_ktp',{attempted:Boolean(ktp),hits:ktpHits.length});
+  const exactHits=name&&address?await snap.findExact(name,address,fetchRows):[];
+  step('exact_name_address',{attempted:Boolean(name&&address),hits:exactHits.length});
   const exactLookup={attempted:Boolean(name&&address),index_version:'1',
     shard_present:Boolean(name&&address),shard_rows:snap.count,
     matching_index_rows:exactHits.length,verified_matches:exactHits.length};
@@ -650,13 +825,17 @@ export function memoryCheck(payload,env,snapshot){
   const budget=envNumber(env,'SNAPSHOT_MAX_CHECK_MS',25000,1000);
   const {top,stats:scan}=snap.scan(qtext,{weights,direct,threshold,maxLenDiff,
     deadline:started+budget});
+  step('full_scan',{records:snap.count,within_length:scan.eligible,
+    pruned_by_bound:scan.prunedByBound,scored:scan.exactScored,matches:scan.matches});
   const scanStats=stats({compared_candidates:scan.eligible,
     length_tolerance_chars:maxLenDiff,excluded_by_length_rule:scan.excludedByLength,
     safely_pruned_candidates:scan.prunedByBound,banded_levenshtein_checked:scan.bandedChecked,
     exact_scored:scan.exactScored,match_count:scan.matches,score_bound_index_used:true,
     pass_basis:top.length?null:'ALL_BP_RECORDS_EVALUATED_IN_MEMORY'});
   if(top.length){
-    const rows=top.map(({i,sim,score})=>sanitizeBpRow(snap.record(i),score,{
+    const records=await snap.records(top.map(x=>x.i),fetchRows);
+    step('match_rows',{rows:records.length,source:snapshot.source});
+    const rows=top.map(({sim,score},n)=>sanitizeBpRow(records[n],score,{
       levenshtein:sim.levenshtein,jaccard:sim.jaccard,numeric_weighted:sim.numeric,
       combined_weighted:sim.combined,direct_reject_metric:sim.direct_reject_metric,
       decision_rule:sim.direct_reject?'DIRECT_REJECT':'WEIGHTED',

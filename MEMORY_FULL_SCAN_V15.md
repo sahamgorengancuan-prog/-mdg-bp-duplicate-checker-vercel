@@ -25,10 +25,24 @@ Render: saat boot dan setiap CONTROL berganti sync_id
 Setiap /api/check: 0 read Google, semua BP dievaluasi di memori
 ```
 
-Tab v14 (INDEX_LEN_TOKEN, EXACT_INDEX, KTP_INDEX, BP_DATABASE) tetap ditulis
-sebagai **fallback**. Kalau PACKED_SNAPSHOT belum ada, rusak, atau tidak
-cocok dengan META/CONTROL, check otomatis memakai engine keyed v14. Engine
-memory tidak pernah mengeluarkan PASS dari snapshot yang belum terverifikasi.
+Sumber data engine memory, berurutan:
+
+1. **`packed`**: PACKED_SNAPSHOT (±8 request, paling hemat RAM).
+2. **`v14_tabs`**: kalau PACKED_SNAPSHOT belum ada atau gagal verifikasi,
+   engine membangun index yang sama dari tab v14 pair aktif
+   (INDEX_LEN_TOKEN + KTP_INDEX, ±24 request, ±60 MB, sekali per generasi).
+   Full scan langsung aktif tanpa menunggu sync baru. PASS tidak perlu read
+   Google; FAIL membaca baris BP yang cocok dari BP_DATABASE (1 batch) dan
+   memverifikasinya seperti v14. CONTROL dicek ulang setelah load.
+3. **Engine keyed v14** (Full Scope + cooldown quota) hanya dipakai kalau
+   kedua sumber di atas tidak konsisten atau tidak terbaca. Alasannya tampil
+   di `/api/health` → `memory.fallback_reason` dan di log UI.
+
+Engine memory tidak pernah mengeluarkan PASS dari data yang belum terverifikasi.
+
+Ukuran 400k BP (sintetis) via `v14_tabs`: cold start ±7,5 detik (+ transfer
+Google ±60 MB), check p50 ±0,13 detik, memori engine +243 MB (puncak load
++387 MB). Mode `packed` lebih hemat, jadi tetap jalankan BAT sync baru.
 
 ## Akurasi (keputusan identik dengan engine lama)
 
@@ -109,6 +123,17 @@ sebelum workbook primary standby dipakai staging, tab `INDEX_LEN_TOKEN`,
 dan pair aktif tidak pernah disentuh. Kalau Google tetap menolak, sync berhenti
 dengan instruksi (hapus manual tab tersebut) dan pointer aktif tidak berubah.
 
+## Log aktivitas (UI, pojok kanan atas)
+
+Tombol **Log** mencatat setiap langkah di browser: health, submit, setiap
+request `/api/check` (HTTP, waktu client/server, backend, sumber memory,
+alasan fallback, sync_id, trace per step server), retry warming, tunggu quota,
+progres Full Scope, reload versi, dan error JS/jaringan. Badge merah
+menunjukkan jumlah error. **Download .txt / .json** juga menyertakan snapshot
+`/api/health` terbaru. KTP selalu di-mask. Log disimpan di browser (1.000
+entri terakhir) dan bisa dihapus dengan Clear. Kirim file ini saat
+melaporkan masalah.
+
 ## Environment (Render)
 
 | Variable | Default | Keterangan |
@@ -118,6 +143,7 @@ dengan instruksi (hapus manual tab tersebut) dan pointer aktif tidak berubah.
 | `SNAPSHOT_POLL_SECONDS` | `60` | Interval cek CONTROL di background |
 | `SNAPSHOT_VERIFY_MAX_AGE_SECONDS` | `180` | Umur maksimum verifikasi CONTROL sebelum check memverifikasi ulang |
 | `SNAPSHOT_LOAD_WAIT_MS` | `20000` | Lama check menunggu load generasi baru sebelum 503 `warming` |
+| `SNAPSHOT_V14_TABS` | `on` | `off` = jangan bangun index memory dari tab v14 (langsung fallback keyed) |
 | `SNAPSHOT_MAX_CHECK_MS` | `25000` | Batas CPU per check (pengaman konfigurasi ekstrem; tidak pernah PASS parsial) |
 
 Windows `.env` (opsional): `GSHEET_PACKED_SNAPSHOT=off` mematikan penulisan

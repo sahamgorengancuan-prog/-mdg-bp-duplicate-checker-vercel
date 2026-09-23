@@ -135,13 +135,19 @@ export async function handleCheck(context) {
       // The v14 keyed Sheets engine remains the fallback until the Windows
       // sync has published PACKED_SNAPSHOT (or when SNAPSHOT_ENGINE=keyed).
       let fallback='SNAPSHOT_ENGINE=keyed';
+      const acquireStarted=Date.now();
       if (snapshotEngine(context.env)==='memory') {
         const memory=await import('./memory-engine.js');
         const snapshot=await memory.acquireSnapshot(context.env);
-        if (!snapshot.fallback) result=memory.memoryCheck(payload,context.env,snapshot);
-        else fallback=snapshot.fallback;
+        if (!snapshot.fallback) {
+          const acquireMs=Date.now()-acquireStarted;
+          result=await memory.memoryCheck(payload,context.env,snapshot);
+          result.trace=[{step:'acquire_snapshot',ms:acquireMs,sync_id:snapshot.control.sync_id},
+            ...(result.trace||[])];
+        } else fallback=snapshot.fallback;
       }
       if (!result) {
+        const keyedStarted=Date.now();
         const {control,scopedEnv,meta}=await readDualSnapshot(context.env);
         result=await (await import('./keyed-sheets.js')).keyedCheck(payload,scopedEnv,meta);
         const current=await readDualControl(context.env);
@@ -153,6 +159,9 @@ export async function handleCheck(context) {
           throw httpError(503,'Active Google Sheets generation changed during check. No decision issued; retry.');
         result.search_backend='KEYED_GOOGLE_SHEETS_DUAL';
         result.memory_fallback_reason=fallback;
+        result.trace=[{step:'memory_fallback',ms:keyedStarted-acquireStarted,reason:fallback},
+          {step:'keyed_sheets_check',ms:Date.now()-keyedStarted,
+           scanned:result.stats?.scanned_candidates??null}];
       }
     } else if(mode==='legacy') {
       result=payload?.full_scope_cursor
