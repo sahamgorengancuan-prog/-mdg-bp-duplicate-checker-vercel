@@ -45,9 +45,9 @@ test('Render yarn start boots, serves frontend and API without leaking private f
     assert.equal(root.status, 200, output);
     const html = await root.text();
     assert.match(html, /EXPECTED_ENGINE_VERSION = '2026-09-23-gsheet-dual-v14-batched'/);
-    assert.match(html, /FULL_SCOPE_WAIT_MS = 200/);
+    assert.match(html, /FULL_SCOPE_WAIT_MS = 100/);
     assert.match(html, /MAX_NORMAL_QUOTA_RETRIES = 1/);
-    assert.match(html, /FULL_SCOPE_SESSION_MS = 175000/);
+    assert.match(html, /FULL_SCOPE_SESSION_MS = 600000/);
     assert.match(html, /Normal check not completed\. Retrying the same input in/);
     assert.match(html, /if \(res\.status !== 429\)/);
     const health = await fetch('http://127.0.0.1:' + port + '/api/health');
