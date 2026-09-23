@@ -96,7 +96,7 @@ def test_bootstrap_rewrites_only_hash_column_for_unchanged_keys(monkeypatch):
         def row_values(self,num):return self.rows[num-1]
         def get(self,query):
             import re
-            start,end=map(int,re.findall(r'[AH](\d+)',query))
+            start,end=map(int,re.findall(r'[A-Z](\d+)',query))
             return [list(x) for x in self.rows[start-1:end]]
         def update(self,range_name,values,value_input_option=None):
             self.updates.append(range_name)
