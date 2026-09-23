@@ -16,18 +16,19 @@
 
 ## Required A/B/control setup (must be approved for company data)
 
-Create **three separate Google Sheets workbooks**, all owned/shared only as
-authorized by company policy; do not publish or share 'Anyone with link'.
-Google's ~10 million grid-cell limit is per spreadsheet, so the two large
-snapshot workbooks must be SEPARATE. The existing legacy SHEET_ID remains
-unchanged as rollback/reference; do not use it as A or B.
+Use **three separate Google Sheets workbooks** (A, B, CONTROL), all
+owned/shared only as authorized by company policy; do not publish or share
+'Anyone with link'. The original legacy SHEET_ID MAY equal A, as in the
+user's current configuration. B and CONTROL must be distinct from legacy A
+and from each other. Google's ~10 million grid-cell limit is per workbook.
 
-- SHEET_A_ID: new workbook for snapshot A.
-- SHEET_B_ID: new workbook for snapshot B.
-- SHEET_CONTROL_ID: new small workbook with ACTIVE tab. On the initial run
-  ACTIVE is created at final publish. Don't edit this tab manually.
+- SHEET_A_ID: existing authorized legacy workbook A, currently live.
+- SHEET_B_ID: separate workbook B for the INITIAL BUILD.
+- SHEET_CONTROL_ID: separate small workbook with ACTIVE tab. Initial ACTIVE
+  pointer is created at final publish. Don't edit this tab manually.
 
-All three IDs must differ from SHEET_ID and one another. The desktop OAuth
+B and CONTROL must NOT equal SHEET_ID. The desktop OAuth user must have edit
+access; the backend OAuth user must have read access to A, B and CONTROL. The desktop OAuth
 user must have edit access; the backend OAuth user must have read access to
 all three. The same account can be used if authorized.
 
@@ -50,18 +51,25 @@ PostgreSQL search DB is used by this mode.
 2. Download updated scripts/sync_bp_keyed.py, bats/sync_to_gsheet_now.bat,
    and bats/sync_to_gsheet_scheduled.bat into the local project. Local GitHub
    commits do not automatically update the laptop.
-3. Configure the three approved, **empty** workbooks and Windows .env.
-4. Run bats/sync_to_gsheet_now.bat manually with .venv and existing OAuth.
-   First run writes the full current BP database plus indexes into A.
-   B is untouched. CONTROL ACTIVE is the final publish step.
+3. Set Windows .env: A=the existing SHEET_ID, B=the separate authorized
+   workbook, CONTROL=its separate authorized control workbook. Do not
+   change SHEET_ID. Do not change the proven OAuth token.
+4. Run bats/sync_to_gsheet_now.bat manually. The first run writes B and
+   its indexes; legacy A is NEVER modified during this initial build.
+   CONTROL ACTIVE=B is the final publish step.
 5. Check the BAT log for "PUBLISHED snapshot" and CONTROL ACTIVE
-   sync_state=READY. In A, META.sync_id must equal CONTROL.sync_id and
+   sync_state=READY. In B, META.sync_id must equal CONTROL.sync_id and
    META.source_digest must match CONTROL.source_digest.
 6. Configure Render dual environment and check /api/health returns
    search_backend=KEYED_GOOGLE_SHEETS_DUAL, exact_index_ready=true,
-   meta.keyed_index_version=12, META READY. Test known exact, fuzzy and
-   no-match BP inputs before accepting web traffic.
-7. Enable scheduler **only after manual sync and live health tests pass**.
+   meta.keyed_index_version=12, META READY. Test exact, fuzzy and
+   no-match BP inputs before accepting traffic.
+7. Once Render is confirmed to serve B in dual mode, explicitly set
+   ALLOW_LEGACY_A_STAGING=1 on Windows. This permits A to become the
+   staging workbook at the NEXT source-data change. Never set this flag
+   before Render cutover: the second changed-data sync could otherwise
+   rewrite A while legacy Render still reads it.
+8. Enable scheduler **only after dual-mode health and live tests pass**.
 
 The old private-only v11 script is replaced. Do not add
 PRIVATE_INDEX_MODE=required. Do not run the legacy full-clear BAT/script
@@ -79,8 +87,9 @@ META READY, then writes a SINGLE CONTROL ACTIVE range and verifies it.
 Note that each A/B workbook was last written **two generations ago** after
 both snapshots have been initialized. Therefore a sync computes a delta
 relative to the selected *inactive* workbook, which may include changes from
-two periods. The first build of previously empty B is a one-time full B
-initialization. INDEX tabs are rematerialized to preserve sorted/contiguous
+two periods. B receives the initial full build while legacy A remains live.
+Only after Render cutover and ALLOW_LEGACY_A_STAGING=1 may A be updated.
+INDEX tabs are rematerialized to preserve sorted/contiguous
 range lookup; BP_DATABASE is NOT cleared or fully rewritten on subsequent
 runs. The per-run elapsed time and Google quota impact need production
 benchmarking before promising a 90-minute freshness SLA.
@@ -111,10 +120,11 @@ BAT uses the existing OS file lock. Google read quota and fuzzy work still
 limit the guaranteed latency; there is no claimed sub-3-minute SLA yet.
 
 KTP_INDEX stores the same sensitive KTP digits as the legacy authorized
-workbook, in new protected A/B workbooks. Protect access and don't export
+workbook in the authorized A/B workbooks. Protect access and don't export
 raw snapshot files into GitHub, public drives or local backups outside policy.
 
-The authoritative app and both snapshot workbooks must share authorized OAuth
-scope/access; a 403 is a configuration failure, not permission to degrade to
-an incomplete PASS. Keep the original legacy sheet untouched as an explicit
-rollback target.
+The app and all three workbooks must have authorized OAuth scope/access;
+a 403 is a configuration failure, not permission to degrade to an
+incomplete PASS. Initial rollback to legacy A is possible BEFORE the first
+explicit A staging run; after A is updated, legacy rollback requires
+rebuilding the legacy indexes before returning META to READY.

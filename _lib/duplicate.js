@@ -80,8 +80,11 @@ function dualIds(env) {
   const b=String(env.SHEET_B_ID||'').trim();
   const c=String(env.SHEET_CONTROL_ID||'').trim();
   const legacy=getSheetId(env);
-  if(!a||!b||!c||new Set([a,b,c,legacy]).size!==4)
-    throw httpError(503,'Configure separate SHEET_A_ID, SHEET_B_ID and SHEET_CONTROL_ID; each must differ from legacy SHEET_ID.');
+  // Existing authorized legacy workbook can be A. During first cutover,
+  // Windows must initialize B while the legacy site continues to read A.
+  if(!a||!b||!c||new Set([a,b,c]).size!==3||
+     legacy===b||legacy===c)
+    throw httpError(503,'Configure distinct A/B/control IDs; legacy SHEET_ID may equal A only, never B or CONTROL.');
   return {a,b,c};
 }
 async function readDualControl(env) {

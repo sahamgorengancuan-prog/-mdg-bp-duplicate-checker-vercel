@@ -201,3 +201,45 @@ def test_proven_oauth_bat_and_no_private_database():
     assert '.clear(' not in code
     assert 'del_worksheet' not in code
     assert 'append_rows(' not in code
+
+def test_legacy_A_is_preserved_during_first_B_build_and_second_run_is_gated(monkeypatch):
+    gc=configured(monkeypatch)
+    monkeypatch.setenv("SHEET_ID","A")
+    # Existing live workbook is *also* A, served by legacy Render.
+    old=gc.books["A"].add_worksheet("BP_DATABASE",rows=100,cols=8)
+    old.rows=[
+        keyed.LEGACY_COLUMNS[:],
+        ['BP-OLD','ZB02','Legacy Name','Legacy Address',
+         'legacy name legacy address','',str(len('legacy name legacy address')),
+         'old-sync-id']]
+    old_meta=gc.books["A"].add_worksheet("META",rows=100,cols=2)
+    old_meta.rows=[["key","value"],["sync_state","READY"]]
+    original_bp=[row[:] for row in old.rows]
+    original_meta=[row[:] for row in old_meta.rows]
+    first=keyed.make_records(data([
+        ['BP-X','ZB02','New Person','Street 22','1234']]))
+    assert keyed.snapshot_ids()["SHEET_A_ID"]=="A"
+    published=keyed.sync_sheet(first,"first-B")
+    assert published["sync_id"]=="first-B"
+    assert old.rows==original_bp
+    assert old_meta.rows==original_meta
+    control=dict(gc.books["CONTROL"].worksheet("ACTIVE").get("A1:B20")[1:])
+    assert control["active_sheet_id"]=="B"
+    changed=keyed.make_records(data([
+        ['BP-X','ZB02','New Person Changed','Street 22','1234']]))
+    with pytest.raises(ValueError,match="Refusing to modify original legacy A"):
+        keyed.sync_sheet(changed,"second-A")
+    assert old.rows==original_bp
+    assert old_meta.rows==original_meta
+    assert dict(gc.books["CONTROL"].worksheet("ACTIVE").get("A1:B20")[1:])==control
+    monkeypatch.setenv("ALLOW_LEGACY_A_STAGING","1")
+    second=keyed.sync_sheet(changed,"second-A")
+    assert second["sync_id"]=="second-A"
+    assert dict(gc.books["CONTROL"].worksheet("ACTIVE").get("A1:B20")[1:])["active_sheet_id"]=="A"
+
+def test_legacy_B_or_control_must_be_rejected(monkeypatch):
+    configured(monkeypatch)
+    for legacy in ("B","CONTROL"):
+        monkeypatch.setenv("SHEET_ID",legacy)
+        with pytest.raises(ValueError,match="never B or CONTROL"):
+            keyed.snapshot_ids()
