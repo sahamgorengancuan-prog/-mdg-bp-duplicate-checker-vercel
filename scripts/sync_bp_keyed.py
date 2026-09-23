@@ -120,12 +120,12 @@ def build_index_rows(records, positions, sync_id):
     exact=sorted(
         [[rec["exact_hash"],json.dumps([row,rec["bp_id"]],
                                     ensure_ascii=False,separators=(",",":"))]
-         for rec,row in source],key=lambda x:(x[0],x[2]))
+         for rec,row in source],key=lambda x:(x[0],x[1]))
     ktp=sorted(
         [[rec["ktp_number"],json.dumps([row,rec["bp_id"]],
                                     ensure_ascii=False,separators=(",",":"))]
          for rec,row in source if rec["ktp_number"]],
-        key=lambda x:(x[0][-2:],x[0],x[2]))
+        key=lambda x:(x[0][-2:],x[0],x[1]))
     def shards(items,keyer):
         out=[]
         for i,row in enumerate(items):

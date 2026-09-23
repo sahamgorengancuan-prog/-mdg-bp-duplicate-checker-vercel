@@ -258,11 +258,15 @@ def test_git_snapshot_ids_are_loaded_when_env_does_not_override(monkeypatch):
         monkeypatch.delenv(key,raising=False)
     monkeypatch.setenv("SHEET_ID","different-legacy-workbook")
     monkeypatch.setenv("GSHEET_SNAPSHOT_MODE","dual")
+    with pytest.raises(ValueError,match="SIX DISTINCT"):
+        keyed.snapshot_ids()  # Blank A2/B2 in Git; unsafe until user creates.
+    monkeypatch.setenv("SHEET_A2_ID","new-a2")
+    monkeypatch.setenv("SHEET_B2_ID","new-b2")
     ids=keyed.snapshot_ids()
     assert ids=={
         "SHEET_A_ID":"1vll0y7dO4bVTokeLbWctUUKjQvOV33V9TDp9iZfJPhA",
         "SHEET_B_ID":"13yMsb_Vsi6eXDkau1zouaRi2viOefDkVHmIuK9SHLqk",
-        "SHEET_A2_ID":"","SHEET_B2_ID":"",
+        "SHEET_A2_ID":"new-a2","SHEET_B2_ID":"new-b2",
         "SHEET_CONTROL_ID":"1wnRHX84FXNG3zwoxDofr1dzj1vu6UsN3uo907xt3KJ4",
     }
 
