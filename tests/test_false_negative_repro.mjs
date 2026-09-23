@@ -312,7 +312,7 @@ test('identity conflict beyond five duplicate source rows is detected and previe
 
 test('resumable relevant-bucket search avoids normal rescan and finds late match',async()=>{
   const input={name_1:NAME,address:ADDRESS};
-  const unrelated=Array.from({length:9},(_,i)=>row('UNRELATED-'+i,'Unrelated '+i,'Completely different sample address and another remote place street'));
+  const unrelated=Array.from({length:9},(_,i)=>row('UNRELATED-'+i,'Unrelated '+i,'Completely different sample address and another remote place street abc'));
   const f=fixture([...unrelated,row('BP-LATE',NAME,ADDRESS+' x')],{env:{MAX_CANDIDATES:'1',FULL_SCOPE_CHUNK_ROWS:'1'}});
   const fast=await run(f,input);
   assert.equal(fast.body.decision,'INCONCLUSIVE');
