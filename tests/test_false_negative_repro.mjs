@@ -233,3 +233,62 @@ test('health fails closed when META claims exact index smaller than BP_DATABASE'
   assert.equal(health.status,503);
   assert.equal((await health.json()).exact_index_ready,false);
 });
+
+test('KTP BP A and exact name+address BP B return FAIL with identity conflict and both records',async()=>{
+  const f=fixture([
+    row('110347500','Yeni','Goblok','3173085710790001'),
+    row('110061496','Tk Adit','Kp Pasir Kalong RT 001 RW 004 Ds Batujajar Kec Cigudeg')
+  ]);
+  const r=await run(f,{name_1:'Tk Adit',address:'Kp Pasir Kalong RT 001 RW 004 Ds Batujajar Kec Cigudeg',ktp_number:'3173085710790001'});
+  assert.equal(r.status,200);
+  assert.equal(r.body.decision,'FAIL');
+  assert.equal(r.body.identity_conflict,true);
+  assert.equal(r.body.exact_ktp_match?.bp_id,'110347500');
+  assert.equal(r.body.exact_name_address_match?.bp_id,'110061496');
+  assert.equal(r.body.exact_name_address_match?.score,100);
+  assert.equal(r.body.stats.scanned_candidates,0);
+});
+
+test('KTP match with unrelated free-text is still FAIL by KTP, never PASS',async()=>{
+  const f=fixture([row('110347500','Someone else','Some different place','3173085710790001')]);
+  const r=await run(f,{name_1:'Yeni',address:'Goblok',ktp_number:'3173085710790001'});
+  assert.equal(r.body.decision,'FAIL');
+  assert.equal(r.body.exact_ktp_match?.bp_id,'110347500');
+  assert.equal(r.body.identity_conflict,false);
+});
+
+test('KTP and exact name/address on same BP remain a single FAIL with no conflict',async()=>{
+  const f=fixture([row('110347500','Yeni','Goblok','3173085710790001')]);
+  const r=await run(f,{name_1:'Yeni',address:'Goblok',ktp_number:'3173085710790001'});
+  assert.equal(r.body.decision,'FAIL');
+  assert.equal(r.body.exact_ktp_match?.bp_id,'110347500');
+  assert.equal(r.body.exact_name_address_match?.bp_id,'110347500');
+  assert.equal(r.body.identity_conflict,false);
+});
+
+test('health verifies KTP index in addition to exact and length indexes',async()=>{
+  const f=fixture([row('110347500','Yeni','Goblok','3173085710790001')],{corrupt:'INDEX_KTP_SHARD!A',corruptWith:[]});
+  const res=await handleHealth({env:f.env});
+  assert.equal(res.status,503);
+  const data=await res.json();
+  assert.equal(data.sheet_ok,false);
+  assert.match(data.sheet_error,/INDEX_KTP_SHARD/);
+});
+
+test('mixed KTP_INDEX snapshot is HTTP 503, never PASS or a stale FAIL',async()=>{
+  const f=fixture([row('110347500','Yeni','Goblok','3173085710790001')]);
+  f.data.get('KTP_INDEX')[0][3]='previous-sync';
+  const r=await run(f,{name_1:'Yeni',address:'Goblok',ktp_number:'3173085710790001'});
+  assert.equal(r.status,503);
+  assert.equal(r.body.ok,false);
+  assert.match(r.body.error,/Mixed or incomplete sheet snapshot/);
+});
+
+test('Tk Adit exact name/address without KTP returns BP even when fuzzy cap is one',async()=>{
+  const f=fixture([row('110061496','Tk Adit','Kp Pasir Kalong RT 001 RW 004 Ds Batujajar Kec Cigudeg')],{env:{MAX_CANDIDATES:'1'}});
+  const r=await run(f,{name_1:'Tk Adit',address:'Kp Pasir Kalong RT 001 RW 004 Ds Batujajar Kec Cigudeg'});
+  assert.equal(r.body.decision,'FAIL');
+  assert.equal(r.body.exact_name_address_match?.bp_id,'110061496');
+  assert.equal(r.body.exact_name_address_match?.score,100);
+  assert.equal(r.body.stats.scanned_candidates,0);
+});

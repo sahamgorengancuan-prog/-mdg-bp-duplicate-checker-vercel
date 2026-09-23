@@ -323,7 +323,7 @@
     const result = $('result');
     const btn = $('submitBtn');
     const API_BASE = location.origin;
-    const EXPECTED_ENGINE_VERSION = '2026-09-22-exact-index-v2';
+    const EXPECTED_ENGINE_VERSION = '2026-09-23-identity-v3';
 
     async function checkHealth() {
       const dot = $('healthDot');
@@ -388,8 +388,9 @@
       const fail = data.decision === 'FAIL';
       const inconclusive = data.decision === 'INCONCLUSIVE';
       const badge = fail || inconclusive ? 'fail' : 'pass';
-      const title = fail ? 'Duplicate Found' : inconclusive ? 'Search Incomplete — NOT PASS' : 'No Duplicate Found';
+      const title = data.identity_conflict ? 'Identity Conflict — Review Both BP Records' : fail ? 'Duplicate Found' : inconclusive ? 'Search Incomplete — NOT PASS' : 'No Duplicate Found';
       const match = data.exact_ktp_match || data.exact_name_address_match || data.similarity_match;
+      const otherExact = data.exact_ktp_match && data.exact_name_address_match && data.exact_ktp_match.bp_id !== data.exact_name_address_match.bp_id ? data.exact_name_address_match : null;
       result.innerHTML = `
         <div class="result-head">
           <div class="status">${title}</div>
@@ -398,6 +399,7 @@
         <div class="result-body">
           <p class="reason">${escapeHtml(data.reason || '')}</p>
           ${match ? matchHtml(match) : ''}
+          ${otherExact ? '<p class="reason"><strong>Different BP found by name and address:</strong></p>' + matchHtml(otherExact) : ''}
           ${topCandidatesHtml(data.top_candidates || [])}
           <div class="match-grid">
             <div class="kv"><span>Weighted Threshold</span><strong>${data.threshold}</strong></div>

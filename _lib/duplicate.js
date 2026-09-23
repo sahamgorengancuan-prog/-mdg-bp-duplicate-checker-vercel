@@ -10,7 +10,7 @@ import { createHash } from 'node:crypto';
   Browser never receives OAuth credential, refresh token, or raw database dump.
 */
 
-export const ENGINE_VERSION = '2026-09-22-exact-index-v2';
+export const ENGINE_VERSION = '2026-09-23-identity-v3';
 const GOOGLE_TOKEN_URL = 'https://oauth2.googleapis.com/token';
 const TOKEN_TTL_SAFETY_SECONDS = 90;
 
@@ -88,6 +88,7 @@ export async function handleHealth(context) {
       requireReadyExactIndex(meta);
       await getIndexMap(context.env, 'INDEX_LEN', 'len', meta);
       await getIndexMap(context.env, 'INDEX_EXACT_SHARD', 'exact', meta);
+      await getIndexMap(context.env, 'INDEX_KTP_SHARD', 'ktp', meta);
       sheet_ok = true;
     } catch (err) {
       sheet_error = err?.message || String(err);
@@ -226,6 +227,7 @@ async function duplicateCheck(payload, env) {
     exact_ktp_match: null,
     exact_name_address_match: null,
     exact_match_count: 0,
+    identity_conflict: false,
     exact_lookup: { attempted: false, index_version: meta.exact_index_version, shard_present: null, shard_rows: 0, matching_index_rows: 0, verified_matches: 0 },
     similarity_match: null,
     top_candidates: [],
@@ -236,34 +238,43 @@ async function duplicateCheck(payload, env) {
     }
   };
 
-  if (ktpInput) {
-    const ktpMatch = await findExactKtp(ktpInput, env, meta);
-    if (ktpMatch) {
-      result.decision = 'FAIL';
-      result.reason = 'KTP exact match found in protected database.';
-      result.exact_ktp_match = sanitizeBpRow(ktpMatch, 100, { reason: 'KTP Exact Match' });
-      result.stats.coverage_complete = true;
-      result.stats.elapsed_ms = Date.now() - started;
-      return result;
-    }
+  // Independent authoritative signals: KTP is not allowed to hide an exact
+  // name+address match on a DIFFERENT BP. Surface both to human reviewers.
+  // Neither exact path consumes MAX_CANDIDATES or invokes fuzzy scanning.
+  const ktpMatch = ktpInput ? await findExactKtp(ktpInput, env, meta) : null;
+  if (ktpMatch) {
+    result.exact_ktp_match = sanitizeBpRow(ktpMatch, 100, { reason: 'KTP Exact Match' });
   }
 
-  // The name+address index is independent of fuzzy candidate caps or bucket order.
-  // It must exist for all checks with both fields; missing/old index is an error,
-  // never a silent PASS. Validate collision candidates against BOTH actual fields.
+  let nameAddressExact = { matches: [], count: 0, diagnostics: result.exact_lookup };
   if (name1 && address) {
-    const exact = await findExactNameAddress(name1, address, env, meta);
-    result.exact_lookup = exact.diagnostics;
-    result.exact_match_count = exact.count;
-    if (exact.count) {
-      result.decision = 'FAIL';
-      result.reason = `Exact Name 1 + Address match found (${exact.count} BP record(s)).`;
-      result.exact_name_address_match = sanitizeBpRow(exact.matches[0], 100, { reason: 'Exact Name 1 + Address Match' });
-      result.top_candidates = exact.matches.slice(1).map(m => sanitizeBpRow(m, 100, { reason: 'Exact Name 1 + Address Match' }));
-      result.stats.coverage_complete = true;
-      result.stats.elapsed_ms = Date.now() - started;
-      return result;
+    nameAddressExact = await findExactNameAddress(name1, address, env, meta);
+    result.exact_lookup = nameAddressExact.diagnostics;
+    result.exact_match_count = nameAddressExact.count;
+    if (nameAddressExact.matches.length) {
+      result.exact_name_address_match = sanitizeBpRow(nameAddressExact.matches[0], 100, {
+        reason: 'Exact Name 1 + Address Match'
+      });
     }
+    result.top_candidates = nameAddressExact.matches.slice(1).map(m =>
+      sanitizeBpRow(m, 100, { reason: 'Exact Name 1 + Address Match' }));
+  }
+
+  if (ktpMatch || nameAddressExact.count) {
+    const ktpBpId = String(ktpMatch?.bp_id || '');
+    result.identity_conflict = Boolean(ktpBpId && nameAddressExact.matches.some(
+      m => String(m.bp_id) !== ktpBpId));
+    result.decision = 'FAIL';
+    result.reason = result.identity_conflict
+      ? 'IDENTITY CONFLICT: the KTP and exact Name 1 + Address match different BP IDs. Review both records; do not auto-approve.'
+      : ktpMatch && nameAddressExact.count
+        ? 'KTP and Name 1 + Address exact matches found.'
+        : ktpMatch
+          ? 'KTP exact match found in protected database.'
+          : `Exact Name 1 + Address match found (${nameAddressExact.count} BP record(s)).`;
+    result.stats.coverage_complete = true; // Both requested exact paths completed.
+    result.stats.elapsed_ms = Date.now() - started;
+    return result;
   }
 
   if (!queryText || queryText.length < 3) {
