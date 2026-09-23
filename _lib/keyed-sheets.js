@@ -161,10 +161,13 @@ async function findKtp(ktp,env,meta){
       const result=await getSheetRange(env,
         'BP_DATABASE!A'+bpRow+':H'+bpRow,meta.sync_id);
       const source=result[0];
+      const expectedRowHash=sha(JSON.stringify([
+        String(source?.[0]||''),String(source?.[1]||''),
+        String(source?.[2]||''),String(source?.[3]||''),ktp]));
       if(!source||String(source[0])!==bp||
-     !/^[a-f0-9]{64}$/.test(String(source[7]||''))||
+         String(source[7]||'')!==expectedRowHash||
          normalizeText(String(source[2]||'')+' '+String(source[3]||''))!==String(source[4]||''))
-        throw fail(503,'KTP key/hash mismatch; NO PASS.');
+        throw fail(503,'KTP posting not bound to authoritative BP row/hash. NO PASS.');
       return {bp_id:bp,bp_type_id:String(source[1]||''),
         name_1:String(source[2]||''),address:String(source[3]||''),
         norm_text:String(source[4]||''),text_len:Number(source[6])};

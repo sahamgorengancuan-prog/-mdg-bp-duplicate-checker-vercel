@@ -20,4 +20,4 @@ private_snapshots/
 
 # Locally generated OAuth-created paired index spreadsheet identifiers
 config/created_index_workbooks.local.json
-config/created_index_workbooks.tmp
+config/created_index_workbooks.local.tmp

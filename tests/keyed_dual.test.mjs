@@ -7,7 +7,7 @@ const hash=(x)=>createHash('sha256').update(x).digest('hex');
 const exact=(name,address)=>hash(normalizeText(name)+'\x1f'+normalizeText(address));
 const row=(id,name,address,ktp='')=>{
   const norm=normalizeText(name+' '+address);
-  const digest=hash(JSON.stringify([id,name,address,ktp]));
+  const digest=hash(JSON.stringify([id,'ZB02',name,address,ktp]));
   return {id,name,address,ktp,norm,digest,
     bucket:String(Math.floor(norm.length/5)).padStart(3,'0'),
     tokens:new Set(norm.split(' ').filter(x=>x.length>=2)).size};
@@ -189,5 +189,15 @@ test('dual mode: invalid primary/index CONTROL pair cannot pass',async t=>{
       body:JSON.stringify({name_1:'No Matching BP',address:'Unknown Road 11'})});
     const response=await handleCheck({request,env});
     assert.equal(response.status,503);
+  });
+});
+
+test('dual mode: KTP posting cannot impersonate another BP row hash',async t=>{
+  await withSheets(t,async f=>{
+    const posting=f.a.data.get('KTP_INDEX')[1];
+    posting[0]='9999997890'; // Same suffix shard but wrong number
+    const result=await f.check({ktp_number:'9999997890'});
+    assert.equal(result.status,503);
+    assert.match(result.body.error,/KTP posting not bound/);
   });
 });
