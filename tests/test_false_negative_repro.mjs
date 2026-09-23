@@ -225,9 +225,9 @@ test('health and exact response disclose running engine and index readiness with
   const f=fixture([row('TEST-BP','Example Shop','A sample street address')]);
   const health = await handleHealth({env:f.env});
   const hb = await health.json();
-  assert.equal(hb.engine_version,'2026-09-23-bounded-normal-v10');
+  assert.equal(hb.engine_version,'2026-09-23-private-snapshot-v11');
   assert.equal(hb.exact_index_ready,true);
-  assert.equal(health.headers.get('x-bp-checker-engine'),'2026-09-23-bounded-normal-v10');
+  assert.equal(health.headers.get('x-bp-checker-engine'),'2026-09-23-private-snapshot-v11');
   const r=await run(f,{name_1:'Example Shop',address:'A sample street address'});
   assert.equal(r.body.decision,'FAIL');
   assert.equal(r.body.exact_lookup.attempted,true);
@@ -585,4 +585,17 @@ test('normal scan preserves successful BP work if Sheets quota fails at the next
   assert([200,429].includes(continued.status));
   if(continued.status===200) assert.equal(continued.body.stats.resumed_from_normal_scan,1);
   else assert.equal(continued.body.ok,false);
+});
+
+test('private-only mode rejects absent private DB without reading Sheets or claiming PASS',async()=>{
+  const env={...baseEnv,PRIVATE_INDEX_MODE:'required',PRIVATE_INDEX_DATABASE_URL:''};
+  const request=new Request('https://fixture.invalid/api/check',{
+    method:'POST',headers:{'content-type':'application/json'},
+    body:JSON.stringify({name_1:NAME,address:ADDRESS})});
+  const {handleCheck}=await import('../_lib/duplicate.js');
+  const response=await handleCheck({request,env});
+  const body=await response.json();
+  assert.equal(response.status,503);
+  assert.equal(body.ok,false);
+  assert.equal(body.decision,undefined);
 });

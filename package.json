@@ -3,15 +3,18 @@
   "version": "1.0.0",
   "private": true,
   "type": "module",
-  "description": "MDG BP Duplicate Checker API - Koyeb/Node-ready. OAuth user refresh-token mode for Google Sheets; no service account required.",
+  "description": "MDG BP duplicate checker: private transactional precomputed index with fail-closed legacy Sheets compatibility.",
   "engines": {
     "node": ">=20"
   },
   "scripts": {
     "start": "node server.js",
-    "check": "node --check server.js && node --check _lib/duplicate.js && node --check api/index.js && node --check api/health.js && node --check api/check.js",
+    "check": "node --check server.js && node --check _lib/duplicate.js && node --check api/index.js && node --check api/health.js && node --check api/check.js && node --check _lib/private-search.js",
     "test": "node --test tests/*.mjs",
     "smoke": "node --test tests/render_startup.test.js"
   },
-  "packageManager": "yarn@1.22.22"
+  "packageManager": "yarn@1.22.22",
+  "dependencies": {
+    "pg": "^8.13.1"
+  }
 }

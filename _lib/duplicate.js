@@ -10,7 +10,7 @@ import { createHash, createHmac, timingSafeEqual } from 'node:crypto';
   Browser never receives OAuth credential, refresh token, or raw database dump.
 */
 
-export const ENGINE_VERSION = '2026-09-23-bounded-normal-v10';
+export const ENGINE_VERSION = '2026-09-23-private-snapshot-v11';
 const GOOGLE_TOKEN_URL = 'https://oauth2.googleapis.com/token';
 const TOKEN_TTL_SAFETY_SECONDS = 90;
 
@@ -60,7 +60,7 @@ const DEFAULT_NORMALIZED_WEIGHTS = {
 const DEFAULT_LENGTH_TOLERANCE_PERCENT = 30;
 const DEFAULT_LENGTH_TOLERANCE_MIN_CHARS = 12;
 
-function getMaxLenDiff(env, textLen) {
+export function getMaxLenDiff(env, textLen) {
   const pct = Number(env.LENGTH_TOLERANCE_PERCENT || DEFAULT_LENGTH_TOLERANCE_PERCENT);
   const minChars = Number(env.LENGTH_TOLERANCE_MIN_CHARS || DEFAULT_LENGTH_TOLERANCE_MIN_CHARS);
   const safePct = Number.isFinite(pct) && pct >= 0 ? pct : DEFAULT_LENGTH_TOLERANCE_PERCENT;
@@ -80,10 +80,14 @@ export async function handleCheck(context) {
     await enforceRateLimit(context.request, context.env);
     await enforceOptionalAccessCode(context.request, context.env);
     const payload = await safeJson(context.request);
-    const result = payload?.full_scope_cursor
-      ? await fullScopeCheck(payload, context.env)
-      : await duplicateCheck(payload, context.env);
-    result.quota = currentSheetsQuotaState(context.env);
+    const privateMode = String(context.env.PRIVATE_INDEX_MODE || 'off').toLowerCase();
+    if (!['off','required'].includes(privateMode)) throw httpError(503,'PRIVATE_INDEX_MODE must be off or required; refusing fallback.');
+    const result = privateMode === 'required'
+      ? await (await import('./private-search.js')).checkPrivateIndex(payload, context.env)
+      : payload?.full_scope_cursor
+        ? await fullScopeCheck(payload, context.env)
+        : await duplicateCheck(payload, context.env);
+    if (privateMode !== 'required') result.quota = currentSheetsQuotaState(context.env);
     return json(result);
   } catch (err) {
     return json({
@@ -97,6 +101,26 @@ export async function handleCheck(context) {
 }
 
 export async function handleHealth(context) {
+  const mode = String(context.env.PRIVATE_INDEX_MODE || 'off').toLowerCase();
+  if (!['off','required'].includes(mode)) return json({ok:false,sheet_ok:false,sheet_error:'Invalid PRIVATE_INDEX_MODE; refusing fallback.'},503);
+  if (mode === 'required') {
+    try {
+      const meta = await (await import('./private-search.js')).privateIndexHealth(context.env);
+      return json({
+        ok: true, engine_version: ENGINE_VERSION,
+        exact_index_ready: true, sheet_ok: false,
+        search_backend: 'PRIVATE_POSTGRES_INDEX',
+        config: configStatus(context.env), meta
+      });
+    } catch (err) {
+      return json({
+        ok: false, engine_version: ENGINE_VERSION, exact_index_ready: false,
+        search_backend: 'PRIVATE_POSTGRES_INDEX',
+        sheet_ok: false, sheet_error: err?.status ? err.message : 'Private index unavailable',
+        config: configStatus(context.env)
+      }, 503);
+    }
+  }
   const cfg = configStatus(context.env);
   let meta = {};
   let sheet_ok = false;
@@ -161,6 +185,8 @@ export function configStatus(env) {
     oauth_configured: Boolean(env.GOOGLE_OAUTH_CLIENT_ID && env.GOOGLE_OAUTH_CLIENT_SECRET && env.GOOGLE_OAUTH_REFRESH_TOKEN),
     auth_mode: 'oauth_user_refresh_token',
     using_default_sheet_id: !Boolean(env.SHEET_ID),
+    private_index_mode: String(env.PRIVATE_INDEX_MODE || 'off').toLowerCase(),
+    private_index_configured: Boolean(env.PRIVATE_INDEX_DATABASE_URL),
     similarity_threshold: Number(env.SIMILARITY_THRESHOLD || DEFAULT_SIMILARITY_THRESHOLD),
     similarity_direct_reject_threshold: getSimilarityDirectRejectThreshold(env),
     max_candidates: Number(env.MAX_CANDIDATES || DEFAULT_MAX_CANDIDATES),
@@ -188,7 +214,7 @@ export function configStatus(env) {
 // from env (default 60/30/10) and normalizes them by their own sum, so any ratio the user sets
 // (percentages, plain ratios like 6/3/1, fractions like 0.6/0.3/0.1, ...) works out the same way
 // and the combined score always stays on a comparable 0-100 scale.
-function getSimilarityWeights(env) {
+export function getSimilarityWeights(env) {
   const lev = Number(env.SIMILARITY_WEIGHT_LEVENSHTEIN || DEFAULT_WEIGHT_LEVENSHTEIN);
   const jac = Number(env.SIMILARITY_WEIGHT_JACCARD || DEFAULT_WEIGHT_JACCARD);
   const num = Number(env.SIMILARITY_WEIGHT_NUMERIC || DEFAULT_WEIGHT_NUMERIC);
@@ -214,7 +240,7 @@ function similarityWeightsForDisplay(env) {
 // A candidate is rejected immediately when either Levenshtein or Jaccard reaches
 // this threshold. Numeric similarity and the combined weighted score are only used
 // when both direct metrics remain below the threshold.
-function getSimilarityDirectRejectThreshold(env) {
+export function getSimilarityDirectRejectThreshold(env) {
   const raw = String(env?.SIMILARITY_DIRECT_REJECT_THRESHOLD ?? '').trim();
   const value = raw === '' ? DEFAULT_SIMILARITY_DIRECT_REJECT_THRESHOLD : Number(raw);
   return Number.isFinite(value) && value >= 0 && value <= 100
@@ -483,7 +509,7 @@ async function duplicateCheck(payload, env) {
 // A bucket is only read if it intersects the configured length tolerance.
 // Optimistic upper bounds; never remove a group unless NO scoring path can
 // reach FAIL. Safe for the current Levenshtein, soft-Jaccard and numeric rules.
-function scoreBoundCanMatch(group, textLen, queryTokenCount, threshold, rejectThreshold, weights) {
+export function scoreBoundCanMatch(group, textLen, queryTokenCount, threshold, rejectThreshold, weights) {
   if (!Number.isSafeInteger(group.token_count)) return true; // legacy index
   const bucket = Number(group.bucket);
   const minLen = bucket * 5;
@@ -747,7 +773,7 @@ function requireReadyExactIndex(meta) {
   }
 }
 
-function exactNameAddressHash(name, address) {
+export function exactNameAddressHash(name, address) {
   return createHash('sha256')
     .update(`${normalizeText(name)}\x1f${normalizeText(address)}`, 'utf8')
     .digest('hex');
@@ -1095,7 +1121,7 @@ function bpRowFromSheet(row) {
   };
 }
 
-function sanitizeBpRow(row, score, extra = {}) {
+export function sanitizeBpRow(row, score, extra = {}) {
   return {
     bp_id: row.bp_id,
     bp_type_id: row.bp_type_id,
@@ -1106,7 +1132,7 @@ function sanitizeBpRow(row, score, extra = {}) {
   };
 }
 
-function computeSimilarity(a, b, weights, directRejectThreshold = DEFAULT_SIMILARITY_DIRECT_REJECT_THRESHOLD, queryFeatures = null) {
+export function computeSimilarity(a, b, weights, directRejectThreshold = DEFAULT_SIMILARITY_DIRECT_REJECT_THRESHOLD, queryFeatures = null) {
   const w = weights || DEFAULT_NORMALIZED_WEIGHTS;
   const lev = round2(levenshteinSimilarity(a, b));
 
@@ -1269,7 +1295,7 @@ function numericChunkSimilarity(a, b) {
   return Math.max(containScore, levenshteinSimilarity(a, b));
 }
 
-function tokens(s) {
+export function tokens(s) {
   const out = new Set();
   for (const t of String(s || '').split(' ')) {
     if (t.length >= 2) out.add(t);
@@ -1282,7 +1308,7 @@ function tokens(s) {
 // ["105", "001", "002"] as three separate chunks. This preserves field boundaries that
 // would otherwise be lost if digits were extracted after every separator was stripped
 // away first (see the comment on numericWeightedSimilarity above).
-function numericTokens(normText) {
+export function numericTokens(normText) {
   return String(normText || '').match(/\d+/g) || [];
 }
 
@@ -1293,7 +1319,7 @@ function firstUsefulToken(set) {
   return '';
 }
 
-function normalizeText(value) {
+export function normalizeText(value) {
   return String(value || '')
     .toLowerCase()
     .normalize('NFKD')
@@ -1304,7 +1330,7 @@ function normalizeText(value) {
     .trim();
 }
 
-function normalizeDigits(value) {
+export function normalizeDigits(value) {
   return String(value || '').replace(/\D+/g, '');
 }
 
@@ -1335,11 +1361,11 @@ function preview(s, n) {
   return value.length > n ? `${value.slice(0, n)}...` : value;
 }
 
-function round2(n) {
+export function round2(n) {
   return Math.round(Number(n || 0) * 100) / 100;
 }
 
-function maskKtp(ktp) {
+export function maskKtp(ktp) {
   if (!ktp) return '';
   if (ktp.length <= 6) return '*'.repeat(ktp.length);
   return `${ktp.slice(0, 4)}${'*'.repeat(Math.max(0, ktp.length - 8))}${ktp.slice(-4)}`;

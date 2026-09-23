@@ -1,0 +1,19 @@
+# Never commit company database data or local OAuth/DB credentials
+.env
+.env.*
+!.env.example
+oauth_token.json
+client_secret_oauth.json
+*.sqlite
+*.sqlite3
+*.db
+*.db-journal
+logs/
+.venv/
+venv/
+__pycache__/
+*.pyc
+node_modules/
+*.pem
+*.key
+private_snapshots/
