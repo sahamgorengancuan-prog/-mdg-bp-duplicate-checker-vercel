@@ -67,7 +67,7 @@ def test_keyed_delta_mutates_only_changed_rows_and_tombstones_missing():
 def test_task_entry_point_is_keyed_only_and_never_calls_legacy_full_sync():
     bat=(ROOT/'bats'/'sync_to_gsheet_now.bat').read_text()
     assert 'sync_bp_keyed.py' in bat
-    assert 'sync_gsheet_indexed.py' not in bat
+    assert 'python scripts\\sync_gsheet_indexed.py' not in bat
     source=(ROOT/'scripts'/'sync_bp_keyed.py').read_text()
     assert 'ws.clear(' not in source
     assert 'sh.del_worksheet' not in source
@@ -142,3 +142,15 @@ def test_bootstrap_rewrites_only_hash_column_for_unchanged_keys(monkeypatch):
     assert meta.rows[1][1]=='IN_PROGRESS'
     assert status.rows[0][1]=='READY'
     assert all('clear' not in v.lower() for v in bp.updates)
+
+def test_bat_reuses_proven_oauth_virtualenv_and_shows_early_errors():
+    bat=(ROOT/'bats'/'sync_to_gsheet_now.bat').read_text()
+    scheduler=(ROOT/'bats'/'sync_to_gsheet_scheduled.bat').read_text()
+    assert 'call ".venv\\Scripts\\activate.bat"' in bat
+    assert 'python -u "scripts\\sync_bp_keyed.py"' in bat
+    assert 'python -u "scripts\\sync_gsheet_indexed.py"' not in bat
+    assert 'pause' in bat.lower()
+    assert 'if /I "%~1"=="--scheduled" goto :end' in bat
+    assert '--scheduled' in scheduler
+    assert 'taskkill' not in bat.lower()
+    assert 'SYNC_FORCE_EXIT_AFTER_SUCCESS="' in bat
