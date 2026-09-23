@@ -313,7 +313,7 @@ test('identity conflict beyond five duplicate source rows is detected and previe
 test('resumable relevant-bucket search avoids normal rescan and finds late match',async()=>{
   const input={name_1:NAME,address:ADDRESS};
   const unrelated=Array.from({length:9},(_,i)=>row('UNRELATED-'+i,'Unrelated '+i,'Completely different sample address and another remote place street'));
-  const f=fixture([...unrelated,row('BP-LATE',NAME,ADDRESS+' extension')],{env:{MAX_CANDIDATES:'1',FULL_SCOPE_CHUNK_ROWS:'1'}});
+  const f=fixture([...unrelated,row('BP-LATE',NAME,ADDRESS+' x')],{env:{MAX_CANDIDATES:'1',FULL_SCOPE_CHUNK_ROWS:'1'}});
   const fast=await run(f,input);
   assert.equal(fast.body.decision,'INCONCLUSIVE');
   assert.equal(fast.body.full_scope_available,true);
@@ -363,7 +363,8 @@ test('manual search cursor rejects changed input and changed snapshot',async()=>
   assert.equal(invalid.status,400);
   f.data.get('META').find(r=>r[0]==='sync_id')[1]='later-snapshot';
   const stale=await run(f,{...input,full_scope_cursor:token});
-  assert.equal(stale.status,409);
+  assert.equal(stale.status,503);
+  assert.equal(stale.body.ok,false);
 });
 
 test('normal PASS proves every eligible bucket row was visited and scored',async()=>{
