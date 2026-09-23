@@ -1,8 +1,8 @@
 # Optional Render Blueprint. Existing Render services do not automatically adopt
 # this file; verify the connected repository, branch and Root Directory in Render.
-# The three public workbook IDs also exist in config/gsheet_snapshots.json and
+# All five snapshot/control workbook IDs also exist in config/gsheet_snapshots.json and
 # are read server-side by the Node API. No OAuth credentials are stored in git.
-# Keep legacy mode until the initial A build is complete and /api/health passes
+# Keep legacy mode until the first selected paired build completes and /api/health passes
 # in controlled dual mode. Set GSHEET_SNAPSHOT_MODE=dual in the Render service
 # environment ONLY after CONTROL ACTIVE is published.
 services:
@@ -24,9 +24,9 @@ services:
       - key: SHEET_B_ID
         value: 13yMsb_Vsi6eXDkau1zouaRi2viOefDkVHmIuK9SHLqk
       - key: SHEET_A2_ID
-        sync: false
+        value: 1Qov9_QDbDwwLOOr3z7a2gCtA82dQXfy5bkKdAuwyDoA
       - key: SHEET_B2_ID
-        sync: false
+        value: 1ju8u0vpMTVxIfi9J-VgwpIqj5rvTbmVW83pzHSXi3Sc
       - key: SHEET_CONTROL_ID
         value: 1wnRHX84FXNG3zwoxDofr1dzj1vu6UsN3uo907xt3KJ4
       - key: GOOGLE_OAUTH_CLIENT_ID

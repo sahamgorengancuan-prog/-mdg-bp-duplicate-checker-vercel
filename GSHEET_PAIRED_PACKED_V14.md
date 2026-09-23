@@ -1,7 +1,8 @@
 # V14 paired/packed Google Sheets — safe deployment and recovery
 
-**Status:** Code-only patch; OAuth workbook creation, Render config, and real
-Windows sync have NOT been performed remotely. Do not set Render dual mode
+**Status:** Five workbook IDs configured in GitHub. The Google Drive connector
+cannot verify their contents/permissions (403); local OAuth access, Render
+configuration and real Windows sync have NOT been verified remotely. Do not set Render dual mode
 or turn on Task Scheduler until CONTROL has committed and live health passes.
 
 ## Four data workbooks plus control and legacy
@@ -9,33 +10,26 @@ or turn on Task Scheduler until CONTROL has committed and live health passes.
 - LEGACY `SHEET_ID`: `1ZtNDikRHklwQMYxWQ6hkL1clvdH6g_Xfd3ojr5APDjo`.
   It is NEVER used as a keyed stage. Render stays legacy during initial build.
 - A primary: `1vll0y7dO4bVTokeLbWctUUKjQvOV33V9TDp9iZfJPhA`.
-  Its existing oversized incomplete v12/v13 staging MUST NOT be
-  published, removed, or rewritten until B+B2 is fully serving.
-- A2 secondary: a **new empty** company-authorized workbook, ID not yet known.
+  If prior incomplete v12/v13 staging remains, do not publish, remove or
+  rewrite it until B+B2 is serving. If empty, the first build uses A+A2.
+- A2 secondary: `1Qov9_QDbDwwLOOr3z7a2gCtA82dQXfy5bkKdAuwyDoA`.
 - B primary: `13yMsb_Vsi6eXDkau1zouaRi2viOefDkVHmIuK9SHLqk`.
-- B2 secondary: a **new empty** company-authorized workbook, ID not yet known.
+- B2 secondary: `1ju8u0vpMTVxIfi9J-VgwpIqj5rvTbmVW83pzHSXi3Sc`.
 - CONTROL: `1wnRHX84FXNG3zwoxDofr1dzj1vu6UsN3uo907xt3KJ4`.
 
 All SIX IDs are distinct. All new workbooks must be authorized to store BP
 and KTP data under the same corporate OAuth permissions. Do not enable
 "Anyone with link". No service account or private search PostgreSQL.
 
-## Create A2 and B2 with local OAuth, once
+## Configuration (A2 and B2 are already user-provided)
 
-Download `scripts/create_index_workbooks.py` and run from the project root:
-
-```powershell
-$env:CONFIRM_CREATE_A2_B2='1'; & '.\.venv\Scripts\python.exe' '.\scripts\create_index_workbooks.py'; Remove-Item Env:CONFIRM_CREATE_A2_B2
-```
-
-The script creates only missing index workbooks. It writes a local receipt
-to `config/created_index_workbooks.local.json` after each creation, so an
-interruption does not silently create duplicate workbooks on rerun. It
-prints only A2/B2 IDs. It does not touch A, B, CONTROL, legacy BP, or OAuth
-secrets. After creation: add those IDs as `SHEET_A2_ID`/`SHEET_B2_ID`
-to local `.env` and Render; consider updating the central repo config
-with the same non-secret IDs for reproducibility. GitHub does not remotely
-change local .env or Render environment.
+All five snapshot/control IDs are recorded in
+`config/gsheet_snapshots.json` and in the optional `render.yaml` blueprint.
+Do NOT run `create_index_workbooks.py`: that helper was only needed before
+the user provided A2 and B2. The local `.env` must contain these same IDs
+and an explicit, DIFFERENT legacy `SHEET_ID`; `PRIVATE_INDEX_MODE=off`.
+Local OAuth tokens and credentials remain only in authorized environments.
+GitHub config does not update local `.env` or a live Render service.
 
 ## Ownership/layout
 
@@ -64,29 +58,27 @@ primary will need further sharding or an approved larger-capacity system.
 
 ## Safe rollout — do not bypass
 
-1. Download v14 `scripts/sync_bp_keyed.py`,
-   `scripts/create_index_workbooks.py`, and
+1. Download v14 `scripts/sync_bp_keyed.py` and
    `config/gsheet_snapshots.json`. Ensure both A2/B2 IDs are present
    in .env and the OAuth user can access them.
 2. Leave Render `GSHEET_SNAPSHOT_MODE=legacy` and scheduler OFF.
-3. Because A contains a previously failed BP_DATABASE, no CONTROL pointer
-   causes the initial run to select clean **B+B2**. Verify the startup log
-   shows `STAGING=B` and preflight for BOTH books.
-4. B receives initial keyed BP rows, B2 gets the packed indexes. Both META
+3. If A is genuinely empty, initial run selects **A+A2**. If A still has
+   unpublished BP_DATABASE data from the failed run, it selects **B+B2**.
+   Verify the actual startup STAGING label and preflight for BOTH books.
+   Do not infer workbook emptiness from its title or the user's earlier log.
+4. The selected primary receives initial keyed BP rows; its paired A2/B2 gets the packed indexes. Both META
    markers must be READY/version 14 with identical digest and sync ID before
-   CONTROL publishes the exact B+B2 pair.
+   CONTROL publishes the exact selected pair.
 5. Configure Render `SHEET_A2_ID`, `SHEET_B2_ID` and existing other
    IDs, then switch `GSHEET_SNAPSHOT_MODE=dual`. The API checks CONTROL,
    fresh primary META and fresh secondary META. If a pointer/identity or
    generation differs, it returns error rather than false PASS.
 6. Test exact KTP, exact Name+Address, fuzzy match, no-match and live health.
    Turn on scheduler ONLY after BOTH generation pairs are operational.
-7. **A remediation remains mandatory.** The next changed-data sync must
-   rebuild A+A2, but A's old v12/v13 file has refused small edits. Do NOT
-   force it. Arrange a fresh authorized A replacement (and update A ID in
-   repo/local/Render together) or a separately approved cleanup of obsolete
-   staging indexes while B is active, before scheduler enables automatic
-   alternating builds.
+7. If A still contains damaged v12/v13 staging, remediate or replace it
+   while B+B2 is active; do not enable alternating scheduler until BOTH
+   generation pairs have been validated. If all four workbooks are empty,
+   build A+A2, validate B+B2 on the next changed run, then schedule.
 
 ## Incremental optimization
 
