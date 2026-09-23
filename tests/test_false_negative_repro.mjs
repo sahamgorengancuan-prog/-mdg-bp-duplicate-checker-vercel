@@ -213,9 +213,9 @@ test('health and exact response disclose running engine and index readiness with
   const f=fixture([row('TEST-BP','Example Shop','A sample street address')]);
   const health = await handleHealth({env:f.env});
   const hb = await health.json();
-  assert.equal(hb.engine_version,'2026-09-23-quota-safe-v7');
+  assert.equal(hb.engine_version,'2026-09-23-adaptive-throughput-v8');
   assert.equal(hb.exact_index_ready,true);
-  assert.equal(health.headers.get('x-bp-checker-engine'),'2026-09-23-quota-safe-v7');
+  assert.equal(health.headers.get('x-bp-checker-engine'),'2026-09-23-adaptive-throughput-v8');
   const r=await run(f,{name_1:'Example Shop',address:'A sample street address'});
   assert.equal(r.body.decision,'FAIL');
   assert.equal(r.body.exact_lookup.attempted,true);
@@ -461,4 +461,21 @@ test('Sheets 429 returns controlled retry and never PASS or raw Google project i
     assert.equal(r.body.decision,undefined);
     assert.equal(JSON.stringify(r.body).includes('private-id'),false);
   } finally {globalThis.fetch=backingFetch;}
+});
+
+test('successful quota-aware continuation reports headroom without changing exhaustive scoring',async()=>{
+  const input={name_1:NAME,address:ADDRESS};
+  const f=fixture([
+    row('BP-X','Unrelated X','Completely different sample address and another remote place street'),
+    row('BP-Y','Unrelated Y','Completely different sample address and another remote place street')
+  ],{env:{MAX_CANDIDATES:'1',FULL_SCOPE_CHUNK_ROWS:'1'}});
+  const first=await run(f,input);
+  assert.equal(first.body.decision,'INCONCLUSIVE');
+  assert.equal(first.body.quota.local_budget_per_minute,0);
+  const second=await run(f,{...input,full_scope_cursor:first.body.full_scope_cursor});
+  assert.equal(second.status,200);
+  assert.equal(second.body.decision,'PASS');
+  assert.equal(second.body.stats.pass_basis,'ALL_ELIGIBLE_BUCKET_ROWS_SCORED');
+  assert.equal(second.body.stats.scanned_candidates,2);
+  assert.equal(second.body.quota.recommended_pause_seconds,0);
 });

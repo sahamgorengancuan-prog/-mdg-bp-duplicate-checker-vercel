@@ -10,7 +10,7 @@ import { createHash, createHmac, timingSafeEqual } from 'node:crypto';
   Browser never receives OAuth credential, refresh token, or raw database dump.
 */
 
-export const ENGINE_VERSION = '2026-09-23-quota-safe-v7';
+export const ENGINE_VERSION = '2026-09-23-adaptive-throughput-v8';
 const GOOGLE_TOKEN_URL = 'https://oauth2.googleapis.com/token';
 const TOKEN_TTL_SAFETY_SECONDS = 90;
 
@@ -79,6 +79,7 @@ export async function handleCheck(context) {
     const result = payload?.full_scope_cursor
       ? await fullScopeCheck(payload, context.env)
       : await duplicateCheck(payload, context.env);
+    result.quota = currentSheetsQuotaState(context.env);
     return json(result);
   } catch (err) {
     return json({
@@ -160,6 +161,7 @@ export function configStatus(env) {
     full_scope_chunk_rows: FULL_SCOPE_MAX_ROWS_PER_REQUEST,
     full_scope_strategy: 'RESUME_ALL_ELIGIBLE_LENGTH_BUCKETS',
     sheets_local_read_budget_per_minute: SHEETS_LOCAL_READ_BUDGET_PER_MINUTE,
+    full_scope_pacing: 'ADAPTIVE_QUOTA_HEADROOM',
     max_batch_rows: Number(env.MAX_BATCH_ROWS || DEFAULT_MAX_BATCH_ROWS),
     range_cache_seconds: Number(env.RANGE_CACHE_SECONDS || DEFAULT_RANGE_CACHE_SECONDS),
     rate_limit_per_min: Number(env.RATE_LIMIT_PER_MIN || DEFAULT_RATE_LIMIT_PER_MIN),
@@ -326,6 +328,8 @@ async function duplicateCheck(payload, env) {
   result.stats.scan_budget = scanBudget;
 
   const best = [];
+  // Reuse query-side token lists instead of parsing them for each BP.
+  const queryFeatures = { tokens: tokens(queryText), numeric: numericTokens(queryText) };
   let found = null;
   let scanned = 0;
   let compared = 0;
@@ -359,7 +363,7 @@ async function duplicateCheck(payload, env) {
         // reject directly even when token overlap/prefix appears weak. Every
         // in-tolerance candidate must reach the actual scoring decision.
         compared += 1;
-        const score = computeSimilarity(queryText, candidate.norm_text, weights, directRejectThreshold);
+        const score = computeSimilarity(queryText, candidate.norm_text, weights, directRejectThreshold, queryFeatures);
         const displayedScore = score.direct_reject ? score.trigger_score : score.combined;
         const entry = sanitizeBpRow(candidate, displayedScore, {
           levenshtein: score.levenshtein,
@@ -561,6 +565,7 @@ async function fullScopeCheck(payload, env) {
   let nextRow = state.nextRow;
   let completedBuckets = state.completedBuckets;
   let found = null;
+  const queryFeatures = { tokens: tokens(queryText), numeric: numericTokens(queryText) };
 
   while (pos < plan.ordered.length && budget > 0 && !found) {
     const info = lenIndex.get(plan.ordered[pos]);
@@ -579,7 +584,7 @@ async function fullScopeCheck(payload, env) {
       if (!candidate.norm_text ||
           Math.abs(candidate.text_len - queryText.length) > plan.maxLenDiff) continue;
       compared++;
-      const score = computeSimilarity(queryText, candidate.norm_text, weights, directRejectThreshold);
+      const score = computeSimilarity(queryText, candidate.norm_text, weights, directRejectThreshold, queryFeatures);
       if (score.direct_reject || score.combined >= threshold) {
         found = sanitizeBpRow(candidate, score.direct_reject ? score.trigger_score : score.combined, {
           levenshtein: score.levenshtein, jaccard: score.jaccard,
@@ -817,7 +822,9 @@ async function getIndexMap(env, tabName, type, meta) {
   if (!Number.isSafeInteger(expected) || total !== expected) {
     throw httpError(503, `${tabName} row count ${total} differs from META ${expectedKey} ${meta[expectedKey]}. Run a full sync.`);
   }
-  setCached(cacheKey, map, Number(env.RANGE_CACHE_SECONDS || DEFAULT_RANGE_CACHE_SECONDS));
+  // Indexed rows are immutable within one sync_id; keep the index map cached
+  // through long manual continuations without caching META itself.
+  setCached(cacheKey, map, 1800);
   return map;
 }
 
@@ -825,6 +832,26 @@ async function getIndexMap(env, tabName, type, meta) {
 // fail-fast limiter (no server-side 60-second sleep that times out on Render).
 // It is per-process, not distributed; all instances/Windows sync share the
 // actual upstream user quota, so upstream 429 is still handled independently.
+function currentSheetsQuotaState(env) {
+  const requested = Number(env.SHEETS_LOCAL_READ_BUDGET_PER_MINUTE ?? SHEETS_LOCAL_READ_BUDGET_PER_MINUTE);
+  const budget = requested === 0 ? 0
+    : Number.isFinite(requested) && requested > 0
+      ? Math.min(SHEETS_LOCAL_READ_BUDGET_PER_MINUTE, Math.floor(requested))
+      : SHEETS_LOCAL_READ_BUDGET_PER_MINUTE;
+  const now = Date.now();
+  while (sheetsReadTimes.length && sheetsReadTimes[0] <= now - 60000) sheetsReadTimes.shift();
+  const used = sheetsReadTimes.length;
+  const cooldown = Math.max(0, Math.ceil((sheetsCooldownUntil - now) / 1000));
+  // Keep three slots of headroom for a chunk's fresh META + range reads.
+  const nextAvailable = budget > 0 && used >= Math.max(1, budget - 3)
+    ? Math.max(1, Math.ceil((sheetsReadTimes[0] + 60000 - now) / 1000) + 2) : 0;
+  return {
+    local_budget_per_minute: budget, local_reads_in_window: used,
+    local_remaining: budget > 0 ? Math.max(0, budget - used) : null,
+    recommended_pause_seconds: Math.max(cooldown, nextAvailable)
+  };
+}
+
 function reserveSheetsReadSlot(env) {
   // Explicit zero is only useful for controlled fixture tests; keep the
   // default production ceiling conservative and clamp positive overrides.
@@ -954,7 +981,7 @@ function sanitizeBpRow(row, score, extra = {}) {
   };
 }
 
-function computeSimilarity(a, b, weights, directRejectThreshold = DEFAULT_SIMILARITY_DIRECT_REJECT_THRESHOLD) {
+function computeSimilarity(a, b, weights, directRejectThreshold = DEFAULT_SIMILARITY_DIRECT_REJECT_THRESHOLD, queryFeatures = null) {
   const w = weights || DEFAULT_NORMALIZED_WEIGHTS;
   const lev = round2(levenshteinSimilarity(a, b));
 
@@ -973,7 +1000,7 @@ function computeSimilarity(a, b, weights, directRejectThreshold = DEFAULT_SIMILA
     };
   }
 
-  const jac = round2(jaccardSimilarity(tokens(a), tokens(b)));
+  const jac = round2(jaccardSimilarity(queryFeatures?.tokens || tokens(a), tokens(b)));
   if (jac >= directRejectThreshold) {
     return {
       levenshtein: lev,
@@ -987,7 +1014,7 @@ function computeSimilarity(a, b, weights, directRejectThreshold = DEFAULT_SIMILA
     };
   }
 
-  const num = round2(numericWeightedSimilarity(numericTokens(a), numericTokens(b)));
+  const num = round2(numericWeightedSimilarity(queryFeatures?.numeric || numericTokens(a), numericTokens(b)));
   const combined = round2((lev * w.levenshtein) + (jac * w.jaccard) + (num * w.numeric));
   return {
     levenshtein: lev,

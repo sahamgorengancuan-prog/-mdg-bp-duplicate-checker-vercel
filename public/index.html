@@ -323,9 +323,10 @@
     const result = $('result');
     const btn = $('submitBtn');
     const API_BASE = location.origin;
-    const EXPECTED_ENGINE_VERSION = '2026-09-23-quota-safe-v7';
-    // Three Sheets reads per decisive chunk plus other clients share the same user quota.
-    const FULL_SCOPE_WAIT_MS = 12000;
+    const EXPECTED_ENGINE_VERSION = '2026-09-23-adaptive-throughput-v8';
+    // Move promptly when there is quota headroom; throttle only when the
+    // backend reports pressure, rather than a fixed 12-second delay.
+    const FULL_SCOPE_WAIT_MS = 200;
     const MAX_QUOTA_RETRIES = 8;
     const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
     let lastCheckInput = null;
@@ -435,7 +436,20 @@
           if (data.decision !== 'INCONCLUSIVE') break;
           nextCursor = data.full_scope_cursor;
           if (!nextCursor) throw new Error('Full-scope continuation missing; refusing PASS.');
-          await sleep(FULL_SCOPE_WAIT_MS);
+          const pause = Number(data.quota?.recommended_pause_seconds) || 0;
+          if (pause > 0) {
+            let waitBox = $('quotaWait');
+            if (!waitBox) {
+              result.insertAdjacentHTML('beforeend', '<p id="quotaWait" class="reason" role="status"></p>');
+              waitBox = $('quotaWait');
+            }
+            for (let left = pause; left > 0 && !fullScopeCancelled; left--) {
+              waitBox.textContent = 'Quota headroom reserved. Continuing from the last unscanned BP in ' + left + 's.';
+              await sleep(1000);
+            }
+          } else {
+            await sleep(FULL_SCOPE_WAIT_MS);
+          }
         }
       } catch (error) {
         if (!fullScopeCancelled) result.innerHTML = errorHtml(error.message || 'Full-scope search interrupted; no PASS issued.');
