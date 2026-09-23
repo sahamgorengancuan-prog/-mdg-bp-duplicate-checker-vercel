@@ -3,7 +3,7 @@
 // BP row identity, normalized text and hash format verified on matching candidates.
 import {createHash,createHmac,timingSafeEqual} from 'node:crypto';
 import {
-  ENGINE_VERSION,getMeta,getIndexMap,getSheetRange,
+  ENGINE_VERSION,getMeta,getIndexMap,getSheetRange,getSheetRanges,
   normalizeText,normalizeDigits,tokens,numericTokens,
   exactNameAddressHash,computeSimilarity,sanitizeBpRow,
   getMaxLenDiff,getSimilarityWeights,getSimilarityDirectRejectThreshold,
@@ -298,37 +298,57 @@ export async function keyedCheck(payload,env,providedMeta=null){
   const allowed=payload?.full_scope_cursor?MAX_FULL:MAX_NORMAL;
   const features={tokens:tokens(qtext),numeric:numericTokens(qtext)};
   let processed=0,matched=null,scored=null;
+  // Instead of one Google read per bucket, batch up to six bounded,
+  // non-overlapping index ranges in ONE values.batchGet quota request.
+  // Each range belongs to exactly one planned eligible group; skipped groups
+  // are never silently counted, and the signed cursor advances only after
+  // a COMPLETE verified response. A 429 preserves the current cursor.
   while(state.pos<plan.ordered.length&&processed<allowed&&
         Date.now()-started<MAX_WORK_MS&&!matched){
-    const group=plan.map.get(plan.ordered[state.pos]);
-    const last=Math.min(group.row_end,state.next+MAX_BATCH-1,
-                        state.next+allowed-processed-1);
-    let rows;
+    const slices=[];
+    let p=state.pos,n=state.next,remaining=allowed-processed;
+    while(p<plan.ordered.length&&remaining>0&&slices.length<6){
+      const g=plan.map.get(plan.ordered[p]);
+      const end=Math.min(g.row_end,n+MAX_BATCH-1,n+remaining-1);
+      slices.push({pos:p,begin:n,end,group:g,
+        range:'INDEX_LEN_TOKEN!A'+n+':B'+end});
+      remaining-=end-n+1;
+      if(end===g.row_end){
+        p++;
+        if(p<plan.ordered.length)n=plan.map.get(plan.ordered[p]).row_start;
+      }else n=end+1;
+    }
+    let blocks;
     try{
-      rows=await getSheetRange(env,
-        'INDEX_LEN_TOKEN!A'+state.next+':B'+last,m.sync_id);
+      blocks=await getSheetRanges(env,slices.map(x=>x.range),m.sync_id);
     }catch(e){
-      // A previously completed range can never be silently recounted or PASS.
       if(e?.status!==429||processed===0)throw e;
       break;
     }
-    if(rows.length!==last-state.next+1)
-      throw fail(503,'Incomplete fuzzy posting range; NO PASS.');
-    for(const row of rows){
-      const candidate=ensureIndexedPosting(row,group,m);
-      state.scanned++;processed++;
-      if(Math.abs(candidate.norm.length-qtext.length)>plan.diff)continue;
-      state.compared++;
-      const sim=computeSimilarity(qtext,candidate.norm,weights,direct,features);
-      if(sim.direct_reject||sim.combined>=threshold){
-        matched=candidate;scored=sim;break;
+    if(blocks.length!==slices.length)
+      throw fail(503,'Incomplete batch response; NO PASS.');
+    for(let i=0;i<slices.length&&!matched;i++){
+      const slice=slices[i],rows=blocks[i];
+      if(rows.length!==slice.end-slice.begin+1)
+        throw fail(503,'Incomplete fuzzy posting range; NO PASS.');
+      for(const row of rows){
+        const candidate=ensureIndexedPosting(row,slice.group);
+        state.scanned++;processed++;
+        if(Math.abs(candidate.norm.length-qtext.length)>plan.diff)continue;
+        state.compared++;
+        const sim=computeSimilarity(qtext,candidate.norm,weights,direct,features);
+        if(sim.direct_reject||sim.combined>=threshold){
+          matched=candidate;scored=sim;break;
+        }
       }
-    }
-    state.next=last+1;
-    if(state.next>group.row_end){
-      state.pos++;
-      state.next=state.pos<plan.ordered.length
-        ?plan.map.get(plan.ordered[state.pos]).row_start:0;
+      if(matched)break;
+      state.pos=slice.pos;
+      state.next=slice.end+1;
+      if(state.next>slice.group.row_end){
+        state.pos++;
+        state.next=state.pos<plan.ordered.length
+          ?plan.map.get(plan.ordered[state.pos]).row_start:0;
+      }
     }
   }
   const complete=plan.ordered.length===0||

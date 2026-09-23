@@ -82,13 +82,8 @@ async function withSheets(t,fn){
   let changedOnFinal=false;
   let controlReads=0;
   const readRequests=[];
-  globalThis.fetch=async input=>{
-    const uri=String(input);
-    if(uri.includes('oauth2.googleapis.com/token'))return new Response(
-      JSON.stringify({access_token:'fixture',expires_in:3600}),{status:200});
-    const m=/spreadsheets\/([^/]+)\/values\/([^?]+)/.exec(uri);
-    assert(m,'Unexpected URL '+uri);
-    const book=decodeURIComponent(m[1]),range=decodeURIComponent(m[2]);
+  let batchCalls=0;
+  function sheetRange(book,range){
     readRequests.push({book,range});
     const [tab,where]=range.split('!');
     const a1=/^([A-Z]+)(\d+):([A-Z]+)(\d+)$/.exec(where);
@@ -112,9 +107,26 @@ async function withSheets(t,fn){
         assert(tab!=='BP_DATABASE','Primary BP cannot be read from paired index book');
       assert(sheet, 'Unexpected tab '+book+'/'+tab);
     }
-    const rows=sheet.slice(Number(a1[2])-1,Number(a1[4]))
-      .map(r=>r.slice(col(a1[1]),col(a1[3])+1));
-    return new Response(JSON.stringify({values:rows}),{status:200});
+    return sheet.slice(Number(a1[2])-1,Number(a1[4]))
+      .map(row=>row.slice(col(a1[1]),col(a1[3])+1));
+  }
+  globalThis.fetch=async input=>{
+    const uri=String(input);
+    if(uri.includes('oauth2.googleapis.com/token'))return new Response(
+      JSON.stringify({access_token:'fixture',expires_in:3600}),{status:200});
+    const batch=/spreadsheets\/([^/]+)\/values:batchGet\?/.exec(uri);
+    if(batch){
+      batchCalls++;
+      const book=decodeURIComponent(batch[1]);
+      const requested=new URL(uri).searchParams.getAll('ranges');
+      return new Response(JSON.stringify({valueRanges:requested.map(range=>({
+        range,values:sheetRange(book,range)
+      }))}),{status:200});
+    }
+    const m=/spreadsheets\/([^/]+)\/values\/([^?]+)/.exec(uri);
+    assert(m,'Unexpected URL '+uri);
+    const book=decodeURIComponent(m[1]),range=decodeURIComponent(m[2]);
+    return new Response(JSON.stringify({values:sheetRange(book,range)}),{status:200});
   };
   async function check(payload){
     const request=new Request('https://fixture.invalid/api/check',{
@@ -125,6 +137,7 @@ async function withSheets(t,fn){
   }
   try{
     await fn({a,b,env,check,readRequests,
+      batchCount:()=>batchCalls,
       switchToB:()=>{pointer='TEST_B';},
       changeDuringCheck:()=>{changedOnFinal=true;controlReads=0;}});
   }finally {globalThis.fetch=before;}
@@ -142,6 +155,7 @@ test('dual mode: exact KTP/name lookup and fuzzy matching stay in active snapsho
     assert.equal(approx.body.decision,'FAIL');
     assert.equal(approx.body.similarity_match.bp_id,'BP-A');
     assert(f.readRequests.some(x=>x.book==='TEST_A2'&&x.range.startsWith('INDEX_LEN_TOKEN!')));
+    assert(f.batchCount()>=1,'Fuzzy scan uses batched Google Sheets reads');
     assert(!f.readRequests.some(x=>x.book==='TEST_B'||x.book==='TEST_B2'));
   });
 });
@@ -199,5 +213,24 @@ test('dual mode: KTP posting cannot impersonate another BP row hash',async t=>{
     const result=await f.check({ktp_number:'9999997890'});
     assert.equal(result.status,503);
     assert.match(result.body.error,/KTP posting not bound/);
+  });
+});
+
+test('incomplete batchGet range fails closed rather than PASS',async t=>{
+  await withSheets(t,async f=>{
+    const normalFetch=globalThis.fetch;
+    globalThis.fetch=async input=>{
+      const response=await normalFetch(input);
+      if(String(input).includes('values:batchGet?')){
+        const json=await response.json();
+        json.valueRanges[0].values=[];
+        return new Response(JSON.stringify(json),{status:200});
+      }
+      return response;
+    };
+    const got=await f.check({name_1:'Nonmatching Shop',address:'Mawar Street 10'});
+    assert.equal(got.status,503);
+    assert.equal(got.body.decision,undefined);
+    assert.match(got.body.error,/Incomplete fuzzy posting range|Incomplete batch/);
   });
 });

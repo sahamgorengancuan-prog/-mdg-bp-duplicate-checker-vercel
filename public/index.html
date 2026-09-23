@@ -323,13 +323,13 @@
     const result = $('result');
     const btn = $('submitBtn');
     const API_BASE = location.origin;
-    const EXPECTED_ENGINE_VERSION = '2026-09-23-gsheet-dual-v14-paired-packed';
-    // Move promptly when there is quota headroom; throttle only when the
-    // backend reports pressure, rather than a fixed 12-second delay.
-    const FULL_SCOPE_WAIT_MS = 200;
+    const EXPECTED_ENGINE_VERSION = '2026-09-23-gsheet-dual-v14-batched';
+    // Batched ranges reduce Google requests; continue immediately when quota
+    // headroom is available. Never ignore an actual upstream 429.
+    const FULL_SCOPE_WAIT_MS = 100;
     const MAX_QUOTA_RETRIES = 8;
     const MAX_NORMAL_QUOTA_RETRIES = 1;
-    const FULL_SCOPE_SESSION_MS = 175000;
+    const FULL_SCOPE_SESSION_MS = 600000; // bounded 10-minute session; signed cursor valid for 1h
     const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
     let lastCheckInput = null;
     let lastRenderedResult = null;

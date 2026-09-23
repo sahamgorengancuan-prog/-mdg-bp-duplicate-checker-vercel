@@ -12,7 +12,7 @@ const SNAPSHOT_WORKBOOKS=JSON.parse(readFileSync(new URL('../config/gsheet_snaps
   Browser never receives OAuth credential, refresh token, or raw database dump.
 */
 
-export const ENGINE_VERSION = '2026-09-23-gsheet-dual-v14-paired-packed';
+export const ENGINE_VERSION = '2026-09-23-gsheet-dual-v14-batched';
 const GOOGLE_TOKEN_URL = 'https://oauth2.googleapis.com/token';
 const TOKEN_TTL_SAFETY_SECONDS = 90;
 
@@ -134,6 +134,7 @@ export async function handleCheck(context) {
       const {control,scopedEnv,meta}=await readDualSnapshot(context.env);
       result=await (await import('./keyed-sheets.js')).keyedCheck(payload,scopedEnv,meta);
       const current=await readDualControl(context.env);
+      result.quota=currentSheetsQuotaState(context.env);
       if(current.active_sheet_id!==control.active_sheet_id||
           current.active_index_sheet_id!==control.active_index_sheet_id||
          current.sync_id!==control.sync_id||
@@ -1130,6 +1131,63 @@ export async function getSheetRange(env, rangeA1, syncId = '', fresh = false) {
   try { return await pending; } finally {
     if (inFlightReads.get(cacheKey) === pending) inFlightReads.delete(cacheKey);
   }
+}
+
+
+/** Several bounded index ranges in ONE Google Sheets values.batchGet request.
+ * A 429 never advances the caller's signed cursor; all returned ranges must
+ * match the requested order and each range is independently verified by caller.
+ * Do not use this for META/CONTROL (their reads must remain fresh).
+ */
+export async function getSheetRanges(env,ranges,syncId='') {
+  if(!Array.isArray(ranges)||ranges.length<1||ranges.length>8||
+     ranges.some(x=>typeof x!=='string'||
+       !/^INDEX_LEN_TOKEN!A\d+:B\d+$/.test(x)))
+    throw httpError(503,'Unsafe batched index ranges. No PASS.');
+  const sheetId=String(env.INDEX_SHEET_ID||'').trim();
+  if(!sheetId||!syncId)
+    throw httpError(503,'Paired index generation missing for batch read.');
+  const maxRows=ranges.reduce((sum,x)=>{
+    const m=/!A(\d+):B(\d+)$/.exec(x);
+    const lo=Number(m[1]),hi=Number(m[2]);
+    if(!Number.isSafeInteger(lo)||!Number.isSafeInteger(hi)||
+       lo<2||hi<lo||hi-lo+1>500)return Infinity;
+    return sum+hi-lo+1;
+  },0);
+  if(maxRows>3000)throw httpError(503,'Batched index payload exceeds bounded row cap.');
+  const cacheSeconds=Number(env.RANGE_CACHE_SECONDS||DEFAULT_RANGE_CACHE_SECONDS);
+  const cached=ranges.map(x=>getCached(`range:${sheetId}:${syncId}:${x}`));
+  if(cached.every(Boolean))return cached;
+  const token=await getGoogleAccessToken(env);
+  reserveSheetsReadSlot(env);
+  const query=new URLSearchParams({majorDimension:'ROWS'});
+  for(const range of ranges)query.append('ranges',range);
+  const url=`https://sheets.googleapis.com/v4/spreadsheets/${encodeURIComponent(sheetId)}/values:batchGet?${query.toString()}`;
+  const res=await fetch(url,{headers:{Authorization:`Bearer ${token}`}});
+  if(res.status===429){
+    const retryHeader=Number(res.headers.get('retry-after'));
+    const wait=Number.isFinite(retryHeader)&&retryHeader>0
+      ?Math.max(SHEETS_UPSTREAM_RETRY_SECONDS,Math.ceil(retryHeader))
+      :SHEETS_UPSTREAM_RETRY_SECONDS;
+    sheetsCooldownUntil=Math.max(sheetsCooldownUntil,Date.now()+wait*1000);
+    const err=httpError(429,'Google Sheets batch read quota exhausted. No PASS; resume same cursor.');
+    err.retry_after_seconds=wait;
+    throw err;
+  }
+  if(!res.ok)throw httpError(502,`Google Sheets batch read failed (HTTP ${res.status}); NO PASS.`);
+  const json=await res.json();
+  if(!Array.isArray(json.valueRanges)||json.valueRanges.length!==ranges.length)
+    throw httpError(503,'Google Sheets returned incomplete range batch; NO PASS.');
+  return json.valueRanges.map((part,i)=>{
+    // A1 echo may use quoted sheet titles. Validate against the request.
+    if(!part||typeof part.range!=='string'||
+       part.range.replace(/^'([^']+)'!/, '$1!')!==ranges[i])
+      throw httpError(503,'Google Sheets batch range order mismatch; NO PASS.');
+    const rows=part.values||[];
+    if(!Array.isArray(rows))throw httpError(503,'Invalid batched index rows; NO PASS.');
+    setCached(`range:${sheetId}:${syncId}:${ranges[i]}`,rows,cacheSeconds);
+    return rows;
+  });
 }
 
 function getSheetId(env) {
