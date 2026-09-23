@@ -213,9 +213,9 @@ test('health and exact response disclose running engine and index readiness with
   const f=fixture([row('TEST-BP','Example Shop','A sample street address')]);
   const health = await handleHealth({env:f.env});
   const hb = await health.json();
-  assert.equal(hb.engine_version,'2026-09-23-full-scope-v4');
+  assert.equal(hb.engine_version,'2026-09-23-complete-bucket-v5');
   assert.equal(hb.exact_index_ready,true);
-  assert.equal(health.headers.get('x-bp-checker-engine'),'2026-09-23-full-scope-v4');
+  assert.equal(health.headers.get('x-bp-checker-engine'),'2026-09-23-complete-bucket-v5');
   const r=await run(f,{name_1:'Example Shop',address:'A sample street address'});
   assert.equal(r.body.decision,'FAIL');
   assert.equal(r.body.exact_lookup.attempted,true);
@@ -362,4 +362,41 @@ test('manual search cursor rejects changed input and changed snapshot',async()=>
   f.data.get('META').find(r=>r[0]==='sync_id')[1]='later-snapshot';
   const stale=await run(f,{...input,full_scope_cursor:token});
   assert.equal(stale.status,409);
+});
+
+test('normal PASS proves every eligible bucket row was visited and scored',async()=>{
+  const f=fixture([
+    ...Array.from({length:8},(_,i)=>row('BP-'+i,'Zzzzzz','Yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy'))
+  ],{env:{MAX_CANDIDATES:'20'}});
+  const r=await run(f,{name_1:NAME,address:ADDRESS});
+  assert.equal(r.status,200);
+  assert.equal(r.body.decision,'PASS');
+  assert.equal(r.body.stats.coverage_complete,true);
+  assert.equal(r.body.stats.pass_basis,'ALL_ELIGIBLE_BUCKET_ROWS_SCORED');
+  assert.equal(r.body.stats.scanned_candidates,r.body.stats.candidate_space);
+  assert.equal(r.body.stats.completed_buckets,r.body.stats.bucket_count);
+  assert.equal(r.body.full_scope_cursor,null);
+});
+
+test('large bucket stays INCONCLUSIVE quickly with on-demand continuation',async()=>{
+  const f=fixture([
+    ...Array.from({length:30},(_,i)=>row('BP-'+i,'Zzzzzz','Yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy'))
+  ],{env:{MAX_CANDIDATES:'5',OVERSIZED_SCAN_BUDGET:'2'}});
+  const r=await run(f,{name_1:NAME,address:ADDRESS});
+  assert.equal(r.status,200);
+  assert.equal(r.body.decision,'INCONCLUSIVE');
+  assert.equal(r.body.stats.oversized_bucket_space,true);
+  assert.equal(r.body.stats.scanned_candidates,2);
+  assert.equal(r.body.stats.pass_basis,null);
+  assert.equal(r.body.full_scope_available,true);
+  assert.equal(typeof r.body.full_scope_cursor,'string');
+});
+
+test('normal score checks all in-tolerance candidates without quickPrefilter exclusions',async()=>{
+  const f=fixture([row('BP-X','Zzzzzz','Yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy')],{env:{MAX_CANDIDATES:'10'}});
+  const r=await run(f,{name_1:NAME,address:ADDRESS});
+  assert.equal(r.status,200);
+  assert.equal(r.body.decision,'PASS');
+  assert.equal(r.body.stats.compared_candidates,1);
+  assert.equal(r.body.stats.skipped_by_prefilter,0);
 });

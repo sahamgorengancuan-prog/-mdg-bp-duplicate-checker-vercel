@@ -10,7 +10,7 @@ import { createHash, createHmac, timingSafeEqual } from 'node:crypto';
   Browser never receives OAuth credential, refresh token, or raw database dump.
 */
 
-export const ENGINE_VERSION = '2026-09-23-full-scope-v4';
+export const ENGINE_VERSION = '2026-09-23-complete-bucket-v5';
 const GOOGLE_TOKEN_URL = 'https://oauth2.googleapis.com/token';
 const TOKEN_TTL_SAFETY_SECONDS = 90;
 
@@ -18,6 +18,9 @@ const DEFAULT_SHEET_ID = '1ZtNDikRHklwQMYxWQ6hkL1clvdH6g_Xfd3ojr5APDjo';
 const DEFAULT_SIMILARITY_THRESHOLD = 92;
 const DEFAULT_SIMILARITY_DIRECT_REJECT_THRESHOLD = 80;
 const DEFAULT_MAX_CANDIDATES = 60000;
+// When the eligible bucket union exceeds the normal cap, cap the exploratory
+// work too: report INCONCLUSIVE quickly rather than wasting 60,000 reads.
+const DEFAULT_OVERSIZED_SCAN_BUDGET = 6000;
 const FULL_SCOPE_MAX_ROWS_PER_REQUEST = 3000;
 const FULL_SCOPE_CURSOR_TTL_MS = 60 * 60 * 1000;
 const DEFAULT_RANGE_CACHE_SECONDS = 300;
@@ -145,6 +148,7 @@ export function configStatus(env) {
     similarity_threshold: Number(env.SIMILARITY_THRESHOLD || DEFAULT_SIMILARITY_THRESHOLD),
     similarity_direct_reject_threshold: getSimilarityDirectRejectThreshold(env),
     max_candidates: Number(env.MAX_CANDIDATES || DEFAULT_MAX_CANDIDATES),
+    oversized_scan_budget: Number(env.OVERSIZED_SCAN_BUDGET || DEFAULT_OVERSIZED_SCAN_BUDGET),
     full_scope_chunk_rows: FULL_SCOPE_MAX_ROWS_PER_REQUEST,
     max_batch_rows: Number(env.MAX_BATCH_ROWS || DEFAULT_MAX_BATCH_ROWS),
     range_cache_seconds: Number(env.RANGE_CACHE_SECONDS || DEFAULT_RANGE_CACHE_SECONDS),
@@ -242,7 +246,10 @@ async function duplicateCheck(payload, env) {
     stats: {
       scanned_candidates: 0, compared_candidates: 0, skipped_by_prefilter: 0,
       batches_processed: 0, candidate_space: 0, coverage_complete: false,
-      scan_limit_reached: false, elapsed_ms: 0
+      scan_limit_reached: false, elapsed_ms: 0,
+      bucket_count: 0, completed_buckets: 0,
+      search_scope: 'CONFIGURED_LENGTH_BUCKETS',
+      pass_basis: null
     }
   };
 
@@ -298,11 +305,24 @@ async function duplicateCheck(payload, env) {
   const lenIndex = await getIndexMap(env, 'INDEX_LEN', 'len', meta);
   const maxLenDiff = getMaxLenDiff(env, textLen);
   const bucketIds = bucketRange(textLen, maxLenDiff);
-  const ordered = bucketIds.sort((a, b) =>
-    (Math.abs(Number(a) - Math.floor(textLen / 5)) - Math.abs(Number(b) - Math.floor(textLen / 5)))
-    || (Number(a) - Number(b)));
-  const candidateSpace = ordered.reduce((sum, bucket) => sum + (lenIndex.get(bucket)?.count || 0), 0);
+  const entries = bucketIds.filter(bucket => lenIndex.has(bucket));
+  const candidateSpace = entries.reduce((sum, bucket) => sum + lenIndex.get(bucket).count, 0);
+  const oversized = candidateSpace > maxCandidates;
+  // Complete the smaller relevant buckets first only when the search cannot
+  // fit in one normal check. This prevents one giant nearby bucket from
+  // consuming the entire budget while smaller relevant buckets are ignored.
+  const distance = bucket => Math.abs(Number(bucket) - Math.floor(textLen / 5));
+  const ordered = entries.sort((a, b) =>
+    (oversized ? lenIndex.get(a).count - lenIndex.get(b).count : 0)
+    || distance(a) - distance(b) || Number(a) - Number(b));
+  const requestedOversizedBudget = Number(env.OVERSIZED_SCAN_BUDGET || DEFAULT_OVERSIZED_SCAN_BUDGET);
+  const oversizedBudget = Number.isSafeInteger(requestedOversizedBudget) && requestedOversizedBudget > 0
+    ? requestedOversizedBudget : DEFAULT_OVERSIZED_SCAN_BUDGET;
+  const scanBudget = oversized ? Math.min(maxCandidates, oversizedBudget) : maxCandidates;
   result.stats.candidate_space = candidateSpace;
+  result.stats.bucket_count = entries.length;
+  result.stats.oversized_bucket_space = oversized;
+  result.stats.scan_budget = scanBudget;
 
   const best = [];
   let found = null;
@@ -310,13 +330,14 @@ async function duplicateCheck(payload, env) {
   let compared = 0;
   let skipped = 0;
   let batches = 0;
+  let completedBuckets = 0;
 
   for (const bucket of ordered) {
     const info = lenIndex.get(String(bucket));
     if (!info) continue;
     let rowStart = info.row_start;
-    while (rowStart <= info.row_end && scanned < maxCandidates) {
-      const chunkEnd = Math.min(rowStart + batchRows - 1, info.row_end, rowStart + maxCandidates - scanned - 1);
+    while (rowStart <= info.row_end && scanned < scanBudget) {
+      const chunkEnd = Math.min(rowStart + batchRows - 1, info.row_end, rowStart + scanBudget - scanned - 1);
       const rows = await getSheetRange(env, `BP_DATABASE!A${rowStart}:H${chunkEnd}`, meta.sync_id);
       batches += 1;
       if (rows.length !== chunkEnd - rowStart + 1) {
@@ -330,10 +351,9 @@ async function duplicateCheck(payload, env) {
           skipped += 1;
           continue;
         }
-        if (candidate.norm_text !== queryText && !quickPrefilter(queryText, candidate.norm_text).pass) {
-          skipped += 1;
-          continue;
-        }
+        // No heuristic quickPrefilter exclusions: a high Levenshtein score can
+        // reject directly even when token overlap/prefix appears weak. Every
+        // in-tolerance candidate must reach the actual scoring decision.
         compared += 1;
         const score = computeSimilarity(queryText, candidate.norm_text, weights, directRejectThreshold);
         const displayedScore = score.direct_reject ? score.trigger_score : score.combined;
@@ -357,7 +377,8 @@ async function duplicateCheck(payload, env) {
       }
       rowStart = chunkEnd + 1;
     }
-    if (scanned >= maxCandidates) break;
+    if (rowStart > info.row_end) completedBuckets++;
+    if (scanned >= scanBudget) break;
   }
 
   const complete = scanned === candidateSpace;
@@ -365,7 +386,11 @@ async function duplicateCheck(payload, env) {
     scanned_candidates: scanned, compared_candidates: compared,
     skipped_by_prefilter: skipped, batches_processed: batches,
     candidate_space: candidateSpace, coverage_complete: complete,
-    scan_limit_reached: !complete, elapsed_ms: Date.now() - started
+    scan_limit_reached: !complete, elapsed_ms: Date.now() - started,
+    bucket_count: entries.length, completed_buckets: completedBuckets,
+    oversized_bucket_space: oversized, scan_budget: scanBudget,
+    search_scope: 'CONFIGURED_LENGTH_BUCKETS',
+    pass_basis: complete ? 'ALL_ELIGIBLE_BUCKET_ROWS_SCORED' : null
   };
   result.top_candidates = best;
   if (found) {
@@ -375,11 +400,18 @@ async function duplicateCheck(payload, env) {
       ? `Name 1 + Address similarity match found (score ${found.score}%).`
       : `Name 1 + Address similarity match found (score ${found.score}%). Search cap reached; additional candidates were not checked.`;
   } else if (complete) {
+    // A PASS is evidence-backed only when EVERY row of EVERY eligible bucket
+    // was visited and the Sheet's READY snapshot is still the same generation.
+    const finalMeta = await getMeta(env);
+    requireReadyExactIndex(finalMeta);
+    if (finalMeta.sync_id !== meta.sync_id) {
+      throw httpError(503, 'Sheet generation changed before PASS; run a new duplicate check.');
+    }
     result.decision = 'PASS';
-    result.reason = 'No exact or fuzzy duplicate found in the completed configured search space.';
+    result.reason = `No duplicate under the configured similarity rules. Fully examined ${scanned} records across ${entries.length} eligible length buckets; exact indexes checked. This is a scoped PASS, not a full-database scan.`;
   } else {
     result.decision = 'INCONCLUSIVE';
-    result.reason = `No match in ${scanned} of ${candidateSpace} indexed candidates; scan limit reached. This is NOT a PASS.`;
+    result.reason = `Eligible buckets contain ${candidateSpace} records, exceeding the normal budget of ${maxCandidates}. Checked ${scanned} (including ${completedBuckets} completed smaller buckets); manual Full Scope is available. This is NOT a PASS.`;
     result.full_scope_available = true;
     result.full_scope_cursor = createFullScopeCursor({
       env, meta, name1, address, ktpInput, threshold, directRejectThreshold, weights,
