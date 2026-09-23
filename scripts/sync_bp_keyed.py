@@ -205,10 +205,12 @@ def preflight_capacity(sh,plans,new_bp_rows,role):
     return {"current":current,"projected":result,"limit":limit}
 
 def write_index(sh,title,rows):
+    created=False
     try:ws=sh.worksheet(title)
     except Exception as exc:
         if exc.__class__.__name__!="WorksheetNotFound":raise
         ws=sh.add_worksheet(title=title,rows=max(100,len(rows)),cols=len(rows[0]))
+        created=True
     # Unlike the old full sync, this NEVER calls clear(). Only index tabs are
     # materialized; indexed rows must be contiguous for efficient range reads.
     need=max(100,len(rows))
@@ -220,8 +222,8 @@ def write_index(sh,title,rows):
         a,b=start+1,start+len(block)
         # Resume failed staging efficiently: if a complete block is already
         # identical, its readback serves as verification (no duplicate write).
-        actual=update_with_retry(lambda a=a,b=b:
-            ws.get(f"A{a}:{col}{b}"))
+        actual=([] if created else update_with_retry(lambda a=a,b=b:
+            ws.get(f"A{a}:{col}{b}")))
         if actual!=block:
             update_with_retry(lambda a=a,b=b,block=block:ws.update(
                 range_name=f"A{a}:{col}{b}",
