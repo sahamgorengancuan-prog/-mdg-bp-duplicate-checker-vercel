@@ -225,9 +225,9 @@ test('health and exact response disclose running engine and index readiness with
   const f=fixture([row('TEST-BP','Example Shop','A sample street address')]);
   const health = await handleHealth({env:f.env});
   const hb = await health.json();
-  assert.equal(hb.engine_version,'2026-09-23-private-snapshot-v11');
+  assert.equal(hb.engine_version,'2026-09-23-gsheet-dual-v12');
   assert.equal(hb.exact_index_ready,true);
-  assert.equal(health.headers.get('x-bp-checker-engine'),'2026-09-23-private-snapshot-v11');
+  assert.equal(health.headers.get('x-bp-checker-engine'),'2026-09-23-gsheet-dual-v12');
   const r=await run(f,{name_1:'Example Shop',address:'A sample street address'});
   assert.equal(r.body.decision,'FAIL');
   assert.equal(r.body.exact_lookup.attempted,true);
@@ -598,4 +598,20 @@ test('private-only mode rejects absent private DB without reading Sheets or clai
   assert.equal(response.status,503);
   assert.equal(body.ok,false);
   assert.equal(body.decision,undefined);
+});
+
+test('dual Sheets mode refuses unset snapshot IDs and never issues PASS', async()=>{
+  const env={...baseEnv,GSHEET_SNAPSHOT_MODE:'dual',
+    SHEET_A_ID:'',SHEET_B_ID:'',SHEET_CONTROL_ID:''};
+  const request=new Request('https://fixture.invalid/api/check',{
+    method:'POST',headers:{'content-type':'application/json'},
+    body:JSON.stringify({name_1:NAME,address:ADDRESS})});
+  const result=await handleCheck({request,env});
+  const body=await result.json();
+  assert.equal(result.status,503);
+  assert.equal(body.ok,false);
+  assert.equal(body.decision,undefined);
+  const health=await handleHealth({env});
+  assert.equal(health.status,503);
+  assert.equal((await health.json()).exact_index_ready,false);
 });

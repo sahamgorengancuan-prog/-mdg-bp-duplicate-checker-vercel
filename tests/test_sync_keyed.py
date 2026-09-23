@@ -1,156 +1,203 @@
-"""Keyed incremental path regression: no clear/repopulate of legacy BP tables."""
+"""Google Sheets-only A/B keyed sync, proven OAuth, no private PostgreSQL."""
 import importlib
 from pathlib import Path
+import re
 import sys
 import types
 
 import pandas as pd
 import pytest
 
-for name in ['psycopg2', 'psycopg2.extras', 'gspread', 'dotenv', 'google',
-             'google.oauth2','google.oauth2.credentials','google.auth',
-             'google.auth.transport','google.auth.transport.requests',
-             'google_auth_oauthlib','google_auth_oauthlib.flow']:
+for name in ['psycopg2','gspread','dotenv','google','google.oauth2',
+             'google.oauth2.credentials','google.auth','google.auth.transport',
+             'google.auth.transport.requests','google_auth_oauthlib',
+             'google_auth_oauthlib.flow']:
     sys.modules.setdefault(name,types.ModuleType(name))
-sys.modules['psycopg2.extras'].execute_values=lambda *a,**k:None
 sys.modules['dotenv'].load_dotenv=lambda *a,**k:None
 sys.modules['google.oauth2.credentials'].Credentials=object
 sys.modules['google.auth.transport.requests'].Request=object
 sys.modules['google_auth_oauthlib.flow'].InstalledAppFlow=object
-
 ROOT=Path(__file__).parents[1]
-sys.path.insert(0,str(ROOT / 'scripts'))
+sys.path.insert(0,str(ROOT/'scripts'))
 keyed=importlib.import_module('sync_bp_keyed')
 
 def data(rows):
     return pd.DataFrame(rows,columns=[
-        'bp_id','bp_type_id','name_1','address','ktp_number'
-    ])
+        'bp_id','bp_type_id','name_1','address','ktp_number'])
 
-def test_source_bp_id_is_stable_unique_identity_and_hash_is_deterministic():
-    src=data([['BP-1','ZB02','Wr Santi','RT 001 RW 003','1234']])
-    one=keyed.make_records(src)
-    two=keyed.make_records(src)
-    assert one==two
-    row=one['BP-1']
-    assert row['bp_id']=='BP-1'
-    assert row['row_hash'] and len(row['row_hash'])==64
-    assert row['text_len']==len(row['norm_text'])
-    assert row['token_count']==len(set(
-        token for token in row['norm_text'].split() if len(token)>=2
-    ))
-    changed=data([['BP-1','ZB02','Wr Santi','RT 001 RW 003','9999']])
-    assert keyed.make_records(changed)['BP-1']['row_hash']!=row['row_hash']
+class WorksheetNotFound(Exception):
+    pass
 
-def test_duplicate_joined_bp_rows_cannot_silently_merge():
+class FakeWS:
+    def __init__(self,title,rows=100,cols=2):
+        self.title=title
+        self.row_count=rows
+        self.col_count=cols
+        self.rows=[]
+        self.writes=[]
+        self.fail=False
+    def row_values(self,num):
+        return self.rows[num-1][:] if num<=len(self.rows) else []
+    def get(self,range_name):
+        m=re.fullmatch(r'([A-Z]+)(\d+):([A-Z]+)(\d+)',range_name)
+        assert m,range_name
+        left,start,right,end=m.groups()
+        a=ord(left)-65
+        b=ord(right)-64
+        return [row[a:b] for row in self.rows[int(start)-1:int(end)]]
+    def update(self,range_name,values,value_input_option=None):
+        if self.fail:raise RuntimeError("simulated staging index failure")
+        m=re.fullmatch(r'([A-Z]+)(\d+):([A-Z]+)(\d+)',range_name)
+        assert m,range_name
+        col=ord(m[1])-65
+        start=int(m[2])
+        for offset,values_row in enumerate(values):
+            number=start+offset
+            while len(self.rows)<number:self.rows.append([])
+            target=self.rows[number-1]
+            while len(target)<col+len(values_row):target.append('')
+            for idx,value in enumerate(values_row):
+                target[col+idx]=str(value)
+        self.writes.append(range_name)
+    def batch_update(self,requests,value_input_option=None):
+        for item in requests:self.update(item["range"],item["values"])
+    def resize(self,rows,cols):
+        self.row_count=rows
+        self.col_count=cols
+        self.rows=self.rows[:rows]
+    def append_rows(self,rows,value_input_option=None):
+        raise AssertionError("append_rows should not be needed for deterministic keys")
+
+class FakeBook:
+    def __init__(self,id):
+        self.id=id;self.sheets={}
+    def worksheet(self,title):
+        if title not in self.sheets:raise WorksheetNotFound(title)
+        return self.sheets[title]
+    def add_worksheet(self,title,rows,cols):
+        assert title not in self.sheets
+        self.sheets[title]=FakeWS(title,rows,cols)
+        return self.sheets[title]
+    def fetch_sheet_metadata(self):
+        return {"sheets":[{
+            "properties":{"title":title,
+                "gridProperties":{"rowCount":sheet.row_count,
+                                  "columnCount":sheet.col_count}}
+            } for title,sheet in self.sheets.items()]}
+
+class FakeGC:
+    def __init__(self):
+        self.books={x:FakeBook(x) for x in ("A","B","CONTROL")}
+    def open_by_key(self,key):return self.books[key]
+
+def configured(monkeypatch):
+    gc=FakeGC()
+    for key,value in {
+        "GSHEET_SNAPSHOT_MODE":"dual","SHEET_A_ID":"A","SHEET_B_ID":"B",
+        "SHEET_CONTROL_ID":"CONTROL","SHEET_ID":"LEGACY",
+        "PRIVATE_INDEX_MODE":"off","GSHEET_WRITE_SLEEP_SECONDS":"0",
+        "GSHEET_READ_BATCH_SLEEP_SECONDS":"0"}.items():
+        monkeypatch.setenv(key,value)
+    monkeypatch.setattr(keyed,'gsheet_client',lambda:(gc,""))
+    monkeypatch.setattr(keyed.time,'sleep',lambda _:None)
+    return gc
+
+def test_source_keys_and_change_hash():
+    src=data([['BP-1','ZB02','Alpha','Address A','1111']])
+    first=keyed.make_records(src)
+    assert first==keyed.make_records(src)
+    assert first['BP-1']['text_len']==len(first['BP-1']['norm_text'])
+    new=keyed.make_records(data([['BP-1','ZB02','Alpha','Address A','2222']]))
+    assert first['BP-1']['row_hash']!=new['BP-1']['row_hash']
     with pytest.raises(ValueError,match='nonunique bp_id'):
         keyed.make_records(data([
             ['BP-1','ZB02','Alpha','Address A','1111'],
-            ['BP-1','ZB02','Beta','Address B','2222'],
-        ]))
+            ['BP-1','ZB02','Beta','Address B','2222']]))
 
-def test_keyed_delta_mutates_only_changed_rows_and_tombstones_missing():
-    rows=keyed.make_records(data([
-        ['BP-1','ZB02','Alpha','Address A','1111'],
-        ['BP-2','ZB02','Beta','Address B','2222'],
-        ['BP-3','ZB02','Gamma','Address C','3333']
-    ]))
-    current={'BP-1':{'row':8,'hash':rows['BP-1']['row_hash']},
-             'BP-2':{'row':9,'hash':'old-hash'},
-             'BP-MISSING':{'row':10,'hash':'old-hash'},
-             'BP-DELETED':{'row':11,'hash':'DELETED'}}
-    changes,creates,tombstones=keyed.keyed_delta(rows,current)
-    assert [(n,r['bp_id']) for n,r in changes]==[(9,'BP-2')]
-    assert {r['bp_id'] for r in creates}=={'BP-3'}
-    assert tombstones==[10]
+def test_dual_ids_fails_before_writing(monkeypatch):
+    monkeypatch.delenv("GSHEET_SNAPSHOT_MODE",raising=False)
+    with pytest.raises(ValueError,match='GSHEET_SNAPSHOT_MODE=dual'):
+        keyed.snapshot_ids()
+    monkeypatch.setenv("GSHEET_SNAPSHOT_MODE","dual")
+    monkeypatch.setenv("SHEET_A_ID","A")
+    monkeypatch.setenv("SHEET_B_ID","A")
+    monkeypatch.setenv("SHEET_CONTROL_ID","C")
+    with pytest.raises(ValueError,match='distinct'):
+        keyed.snapshot_ids()
 
-def test_task_entry_point_is_keyed_only_and_never_calls_legacy_full_sync():
+def test_index_postings_use_stable_bp_key_and_source_hash():
+    records=keyed.make_records(data([
+        ['BP-A','ZB02','Alpha','Street 10','1234'],
+        ['BP-B','ZB02','Beta','Street 12','5678']]))
+    tabs,n_ktp,n_groups=keyed.build_index_rows(
+        records,{'BP-A':17,'BP-B':2},'test-sync')
+    assert n_ktp==2 and n_groups>=1
+    assert len(tabs['INDEX_LEN_TOKEN'])==3
+    for row in tabs['INDEX_LEN_TOKEN'][1:]:
+        assert row[4] in records
+        assert row[5]==records[row[4]]['row_hash']
+    assert {row[2] for row in tabs['EXACT_INDEX'][1:]}==set(records)
+    assert {row[2] for row in tabs['KTP_INDEX'][1:]}==set(records)
+
+def test_initial_then_keyed_update_preserves_active_snapshot(monkeypatch):
+    gc=configured(monkeypatch)
+    base=keyed.make_records(data([
+        ['BP-A','ZB02','Alpha','Street 10','1234'],
+        ['BP-B','ZB02','Beta','Street 12','5678']]))
+    first=keyed.sync_sheet(base,'generation-A')
+    assert first['appended']==2
+    control=gc.books['CONTROL'].worksheet('ACTIVE')
+    assert dict(control.get("A1:B20")[1:])['active_sheet_id']=='A'
+    initial_a=[r[:] for r in gc.books['A'].worksheet('BP_DATABASE').rows]
+    noop=keyed.sync_sheet(base,'unused-generation')
+    assert noop['sync_id']=='generation-A'
+    revised=keyed.make_records(data([
+        ['BP-A','ZB02','Alpha','Street 10','1234'],
+        ['BP-B','ZB02','Beta New','Street 12','5678'],
+        ['BP-C','ZB02','Gamma','Street 13','9999']]))
+    second=keyed.sync_sheet(revised,'generation-B')
+    assert second['appended']==3  # B is an empty standby for its first build
+    assert gc.books['A'].worksheet('BP_DATABASE').rows==initial_a
+    assert dict(control.get("A1:B20")[1:])['active_sheet_id']=='B'
+    latest=keyed.make_records(data([
+        ['BP-A','ZB02','Alpha New','Street 10','1234'],
+        ['BP-B','ZB02','Beta New','Street 12','5678'],
+        ['BP-C','ZB02','Gamma','Street 13','9999']]))
+    third=keyed.sync_sheet(latest,'generation-C')
+    assert third['updated']==2  # A last had old Alpha and Beta
+    assert third['appended']==1
+    ws_a=gc.books['A'].worksheet('BP_DATABASE')
+    assert 'A2:H2' in ws_a.writes and 'A3:H3' in ws_a.writes
+    assert dict(control.get("A1:B20")[1:])['sync_id']=='generation-C'
+    assert dict(control.get("A1:B20")[1:])['active_sheet_id']=='A'
+    assert gc.books['B'].worksheet('META').get("A1:B20")[0]==['key','value']
+
+def test_failed_staging_never_changes_active_pointer(monkeypatch):
+    gc=configured(monkeypatch)
+    original=keyed.make_records(data([
+        ['BP-A','ZB02','Alpha','Street 10','1234']]))
+    keyed.sync_sheet(original,'original')
+    active=gc.books['CONTROL'].worksheet('ACTIVE')
+    expected=[row[:] for row in active.rows]
+    standby=gc.books['B']
+    standby.add_worksheet("INDEX_LEN_TOKEN",rows=100,cols=6).fail=True
+    revised=keyed.make_records(data([
+        ['BP-A','ZB02','Alpha changed','Street 10','1234']]))
+    with pytest.raises(RuntimeError,match='simulated staging'):
+        keyed.sync_sheet(revised,'failed')
+    assert active.rows==expected
+    assert gc.books['A'].worksheet('BP_DATABASE').row_values(2)[2]=='Alpha'
+
+def test_proven_oauth_bat_and_no_private_database():
     bat=(ROOT/'bats'/'sync_to_gsheet_now.bat').read_text()
-    assert 'sync_bp_keyed.py' in bat
-    assert 'python scripts\\sync_gsheet_indexed.py' not in bat
-    source=(ROOT/'scripts'/'sync_bp_keyed.py').read_text()
-    assert 'ws.clear(' not in source
-    assert 'sh.del_worksheet' not in source
-    assert 'ws.append_rows' in source
-    assert 'PRIVATE_INDEX_MODE=required' in source
-
-def test_private_index_is_mandatory_for_sheet_delta(monkeypatch):
-    monkeypatch.delenv('PRIVATE_INDEX_MODE',raising=False)
-    with pytest.raises(ValueError,match='PRIVATE_INDEX_MODE=required'):
-        keyed.ensure_private_mode()
-
-def test_bootstrap_rewrites_only_hash_column_for_unchanged_keys(monkeypatch):
-    fresh=keyed.make_records(data([
-        ['BP-A','ZB02','Alpha','Address A','1111'],
-        ['BP-B','ZB02','Beta New','Address B','2222'],
-        ['BP-C','ZB02','Gamma','Address C','3333'],
-    ]))
-    former=keyed.make_records(data([
-        ['BP-A','ZB02','Alpha','Address A','1111'],
-        ['BP-B','ZB02','Beta Old','Address B','2222'],
-        ['BP-MISSING','ZB02','Gone','Address D','4444'],
-    ]))
-    class WS:
-        row_count=4
-        def __init__(self, rows):self.rows=[list(row) for row in rows];self.updates=[]
-        def row_values(self,num):return self.rows[num-1]
-        def get(self,query):
-            import re
-            start,end=map(int,re.findall(r'[A-Z](\d+)',query))
-            return [list(x) for x in self.rows[start-1:end]]
-        def update(self,range_name,values,value_input_option=None):
-            self.updates.append(range_name)
-            import re
-            m=re.match(r'([A-H])(\d+)(?::[A-H](\d+))?$',range_name)
-            assert m,range_name
-            col=ord(m.group(1))-65;start=int(m.group(2))
-            for i,row in enumerate(values):
-                while len(self.rows)<start+i:self.rows.append(['']*8)
-                for k,value in enumerate(row):
-                    self.rows[start+i-1][col+k]=value
-        def batch_update(self,updates,value_input_option=None):
-            for update in updates:self.update(update['range'],update['values'])
-        def append_rows(self,rows,value_input_option=None):
-            self.rows.extend([list(x) for x in rows]);self.row_count=len(self.rows)
-    bp=WS([keyed.LEGACY_COLUMNS]+[
-        keyed.sheet_row(former[x])[:7]+['old-sync']
-        for x in ['BP-A','BP-B','BP-MISSING']
-    ])
-    meta=WS([['key','value'],['sync_state','READY']])
-    meta.row_count=100
-    status=WS([['key','value']])
-    status.row_count=100
-    class FakeSh:
-        def worksheet(self,name):
-            return {'BP_DATABASE':bp,'META':meta,'KEYED_SYNC_META':status}[name]
-        def fetch_sheet_metadata(self):
-            return {'sheets':[{'properties':{
-                'title':name,'gridProperties':{'rowCount':ws.row_count,'columnCount':8 if name=='BP_DATABASE' else 2}
-            }} for name,ws in [('BP_DATABASE',bp),('META',meta),('KEYED_SYNC_META',status)]]}
-    monkeypatch.setattr(keyed,'gsheet_client',lambda:(None,None))
-    class FakeGC:
-        def open_by_key(self,key):return FakeSh()
-    monkeypatch.setattr(keyed,'gsheet_client',lambda:(FakeGC(),None))
-    monkeypatch.setattr(keyed.time,'sleep',lambda seconds:None)
-    keyed.sync_sheet(fresh,'new-generation')
-    assert bp.rows[0]==keyed.COLUMNS
-    assert bp.rows[1][:7]==keyed.sheet_row(fresh['BP-A'])[:7]
-    assert bp.rows[1][7]==fresh['BP-A']['row_hash']
-    assert bp.rows[2]==keyed.sheet_row(fresh['BP-B'])
-    assert bp.rows[3][7]=='DELETED'
-    assert bp.rows[4]==keyed.sheet_row(fresh['BP-C'])
-    assert meta.rows[1][1]=='IN_PROGRESS'
-    assert status.rows[0][1]=='READY'
-    assert all('clear' not in v.lower() for v in bp.updates)
-
-def test_bat_reuses_proven_oauth_virtualenv_and_shows_early_errors():
-    bat=(ROOT/'bats'/'sync_to_gsheet_now.bat').read_text()
-    scheduler=(ROOT/'bats'/'sync_to_gsheet_scheduled.bat').read_text()
     assert 'call ".venv\\Scripts\\activate.bat"' in bat
     assert 'python -u "scripts\\sync_bp_keyed.py"' in bat
-    assert 'python -u "scripts\\sync_gsheet_indexed.py"' not in bat
     assert 'pause' in bat.lower()
-    assert 'if /I "%~1"=="--scheduled" goto :end' in bat
-    assert '--scheduled' in scheduler
     assert 'taskkill' not in bat.lower()
-    assert 'SYNC_FORCE_EXIT_AFTER_SUCCESS="' in bat
+    assert 'private PostgreSQL search index' not in bat
+    code=(ROOT/'scripts'/'sync_bp_keyed.py').read_text()
+    assert 'sync_private(' not in code
+    assert 'PRIVATE_INDEX_DATABASE_URL' not in code
+    assert '.clear(' not in code
+    assert 'del_worksheet' not in code
+    assert 'append_rows(' not in code

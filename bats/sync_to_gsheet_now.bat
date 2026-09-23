@@ -42,8 +42,9 @@ if errorlevel 1 (
     goto :finish
 )
 echo [3/3] Starting keyed delta sync with local .env and existing OAuth token...
-echo [INFO] v11 requires PRIVATE_INDEX_MODE=required and an authorized
-echo [INFO] private PostgreSQL search index before any Sheet writes.
+echo [INFO] Google Sheets ONLY: GSHEET_SNAPSHOT_MODE=dual.
+echo [INFO] Requires approved, separate SHEET_A_ID / SHEET_B_ID / SHEET_CONTROL_ID.
+echo [INFO] Active snapshot stays unchanged while staging sync runs.
 python -u "scripts\sync_bp_keyed.py"
 set "SYNC_RC=%ERRORLEVEL%"
 

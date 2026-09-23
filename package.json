@@ -9,12 +9,9 @@
   },
   "scripts": {
     "start": "node server.js",
-    "check": "node --check server.js && node --check _lib/duplicate.js && node --check api/index.js && node --check api/health.js && node --check api/check.js && node --check _lib/private-search.js",
+    "check": "node --check server.js && node --check _lib/duplicate.js && node --check api/index.js && node --check api/health.js && node --check api/check.js && node --check _lib/keyed-sheets.js",
     "test": "node --test tests/*.mjs",
     "smoke": "node --test tests/render_startup.test.js"
   },
-  "packageManager": "yarn@1.22.22",
-  "dependencies": {
-    "pg": "^8.13.1"
-  }
+  "packageManager": "yarn@1.22.22"
 }

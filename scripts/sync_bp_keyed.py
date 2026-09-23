@@ -1,42 +1,28 @@
-"""Incremental keyed BP sync. NEVER clear(), never delete a worksheet/row.
+"""Google-Sheets-only keyed BP sync. OAuth unchanged; no private search DB.
 
-The existing length-sorted/row-pointer Google index is incompatible with
-arbitrary in-place BP changes. This job MUST run with the private transactional
-search service enabled. Old META is marked IN_PROGRESS (fail closed); the
-separate KEYED_SYNC_META becomes READY only after keyed writes succeed.
+BP_DATABASE A:H is an append-only, keyed mirror: update only changed BP keys,
+append new BP keys, tombstone missing ones. H is SHA-256 row hash (NOT sync ID).
+Compact Google Sheets search indexes may need reordering/rebuilding when any BP
+changes; they are separate tabs and NEVER clear/repopulate BP_DATABASE.
+
+The INACTIVE snapshot META becomes IN_PROGRESS before its first changed cell.
+The currently ACTIVE Google workbook stays untouched and usable by the web
+app. READY and control-pointer publication follow keyed/index verification.
 """
 from __future__ import annotations
-
-import hashlib
-import hmac
-import json
-import os
-import re
-import sys
-import time
-import uuid
+import hashlib, json, os, sys, time, uuid
 from datetime import datetime
 from typing import Dict
-
 import pandas as pd
-import psycopg2
-from psycopg2.extras import execute_values
 from sync_gsheet_indexed import (
     DEFAULT_SHEET_ID, logging, normalize_text, normalize_digits,
     fetch_pg_dataframe, gsheet_client, read_env, single_sync_lock,
 )
-
-COLUMNS = ["bp_id", "bp_type_id", "name_1", "address",
-           "norm_text", "norm_digits", "text_len", "row_hash"]
-LEGACY_COLUMNS = COLUMNS[:-1] + ["sync_id"]
-BATCH = 5000
-READ_BATCH = 20000
-
-def required_secret(name: str) -> str:
-    value = os.environ.get(name, "")
-    if len(value) < 32:
-        raise ValueError(f"{name} must be configured as a private secret (>=32 chars). No updates made.")
-    return value
+COLUMNS=["bp_id","bp_type_id","name_1","address",
+         "norm_text","norm_digits","text_len","row_hash"]
+LEGACY_COLUMNS=COLUMNS[:-1]+["sync_id"]
+READ_BATCH=5000
+INDEX_WRITE_BATCH=5000
 
 def make_records(source: pd.DataFrame) -> Dict[str, dict]:
     needed = ["bp_id", "bp_type_id", "name_1", "address", "ktp_number"]
@@ -91,97 +77,6 @@ def keyed_delta(records: Dict[str,dict], existing: Dict[str,dict]):
             tombstones.append(prior["row"])
     return changes,creates,tombstones
 
-def ensure_private_mode():
-    if os.getenv("PRIVATE_INDEX_MODE","off").lower() != "required":
-        raise ValueError(
-            "PRIVATE_INDEX_MODE=required must be set before the keyed migration. "
-            "The legacy length-sorted indexes cannot remain valid after in-place updates."
-        )
-    dsn = os.getenv("PRIVATE_INDEX_DATABASE_URL","")
-    if not dsn.startswith(("postgres://","postgresql://")):
-        raise ValueError("PRIVATE_INDEX_DATABASE_URL missing. No Sheet writes made.")
-    required_secret("PRIVATE_INDEX_KTP_HMAC_KEY")
-    required_secret("PRIVATE_INDEX_CURSOR_SECRET")
-    return dsn
-
-def sync_private(records: Dict[str,dict], sync_id: str, dsn: str) -> None:
-    """Single DB transaction. Unchanged rows are NOT rewritten to durable table."""
-    sslmode = os.getenv("PRIVATE_INDEX_SSLMODE","verify-full")
-    if sslmode not in ("verify-full","verify-ca"):
-        raise ValueError("Private index TLS verification is required. No sync performed.")
-    logging.info("Preparing private search index; %s source BP keys",f"{len(records):,}")
-    with psycopg2.connect(dsn,sslmode=sslmode,connect_timeout=15) as conn:
-        with conn.cursor() as cur:
-            cur.execute("SELECT pg_advisory_xact_lock(49328217)")
-            cur.execute("""CREATE TABLE IF NOT EXISTS bp_search (
-                source_key text PRIMARY KEY,bp_id text NOT NULL,bp_type_id text NOT NULL,
-                name_1 text NOT NULL,address text NOT NULL,norm_text text NOT NULL,
-                text_len integer NOT NULL,len_bucket text NOT NULL,token_count integer NOT NULL,
-                exact_hash text NOT NULL,ktp_hash text,row_hash text NOT NULL,
-                active boolean NOT NULL DEFAULT true
-            )""")
-            cur.execute("""CREATE TABLE IF NOT EXISTS bp_search_group (
-                len_bucket text NOT NULL,token_count integer NOT NULL,
-                count bigint NOT NULL,PRIMARY KEY(len_bucket,token_count)
-            )""")
-            cur.execute("""CREATE TABLE IF NOT EXISTS bp_search_meta (
-                id integer PRIMARY KEY CHECK(id=1),sync_id text NOT NULL,
-                sync_state text NOT NULL,total_bp_rows bigint NOT NULL,
-                last_sync_at text NOT NULL
-            )""")
-            for sql in [
-                "CREATE INDEX IF NOT EXISTS bp_search_exact ON bp_search(exact_hash) WHERE active",
-                "CREATE INDEX IF NOT EXISTS bp_search_ktp ON bp_search(ktp_hash) WHERE active",
-                "CREATE INDEX IF NOT EXISTS bp_search_group_rows ON bp_search(len_bucket,token_count,source_key) WHERE active",
-            ]: cur.execute(sql)
-            cur.execute("CREATE TEMP TABLE bp_seen_keys (source_key text PRIMARY KEY) ON COMMIT DROP")
-            items=list(records.values())
-            hmac_key=required_secret("PRIVATE_INDEX_KTP_HMAC_KEY").encode("utf-8")
-            for i in range(0,len(items),BATCH):
-                group=items[i:i+BATCH]
-                execute_values(cur,"INSERT INTO bp_seen_keys(source_key) VALUES %s",
-                    [(row["bp_id"],) for row in group],page_size=1000)
-                values=[]
-                for row in group:
-                    ktp_hmac=(hmac.new(hmac_key,row["ktp_number"].encode(),"sha256").hexdigest()
-                              if row["ktp_number"] else None)
-                    values.append((
-                        row["bp_id"],row["bp_id"],row["bp_type_id"],row["name_1"],
-                        row["address"],row["norm_text"],row["text_len"],
-                        row["len_bucket"],row["token_count"],row["exact_hash"],
-                        ktp_hmac,row["row_hash"],True
-                    ))
-                execute_values(cur,"""INSERT INTO bp_search (
-                    source_key,bp_id,bp_type_id,name_1,address,norm_text,text_len,
-                    len_bucket,token_count,exact_hash,ktp_hash,row_hash,active
-                ) VALUES %s ON CONFLICT(source_key) DO UPDATE SET
-                    bp_type_id=EXCLUDED.bp_type_id,name_1=EXCLUDED.name_1,
-                    address=EXCLUDED.address,norm_text=EXCLUDED.norm_text,
-                    text_len=EXCLUDED.text_len,len_bucket=EXCLUDED.len_bucket,
-                    token_count=EXCLUDED.token_count,exact_hash=EXCLUDED.exact_hash,
-                    ktp_hash=EXCLUDED.ktp_hash,row_hash=EXCLUDED.row_hash,active=true
-                WHERE bp_search.row_hash IS DISTINCT FROM EXCLUDED.row_hash
-                   OR NOT bp_search.active""",values,page_size=1000)
-                logging.info("Private index keys processed: %s / %s",f"{min(i+BATCH,len(items)):,}",f"{len(items):,}")
-            cur.execute("""UPDATE bp_search SET active=false
-                WHERE active AND NOT EXISTS (
-                  SELECT 1 FROM bp_seen_keys k WHERE k.source_key=bp_search.source_key
-                )""")
-            cur.execute("DELETE FROM bp_search_group")
-            cur.execute("""INSERT INTO bp_search_group(len_bucket,token_count,count)
-                SELECT len_bucket,token_count,count(*) FROM bp_search WHERE active
-                GROUP BY len_bucket,token_count""")
-            cur.execute("SELECT count(*) FROM bp_search WHERE active")
-            count=cur.fetchone()[0]
-            if count!=len(items):raise ValueError("Private index coverage mismatch. Transaction rolled back.")
-            cur.execute("""INSERT INTO bp_search_meta
-                (id,sync_id,sync_state,total_bp_rows,last_sync_at)
-                VALUES(1,%s,'READY',%s,%s)
-                ON CONFLICT(id) DO UPDATE SET sync_id=EXCLUDED.sync_id,
-                sync_state=EXCLUDED.sync_state,total_bp_rows=EXCLUDED.total_bp_rows,
-                last_sync_at=EXCLUDED.last_sync_at""",
-                (sync_id,len(items),datetime.now().isoformat(timespec="seconds")))
-    logging.info("Private index COMMITTED: %s rows; sync %s",f"{len(records):,}",sync_id)
 
 def update_with_retry(action):
     for attempt in range(5):
@@ -193,143 +88,392 @@ def update_with_retry(action):
             logging.warning("Sheets temporary HTTP %s; retry in %ss",status,delay)
             time.sleep(delay)
 
-def read_sheet_index(ws, legacy: bool) -> Dict[str,dict]:
-    existing={}
-    total=ws.row_count
-    for start in range(2,total+1,READ_BATCH):
-        end=min(total,start+READ_BATCH-1)
-        if legacy:
-            raw=update_with_retry(lambda:ws.get(f"A{start}:H{end}"))
-            for offset,row in enumerate(raw):
-                if not row or not str(row[0]).strip():continue
-                key=str(row[0]).strip()
-                if key in existing:raise ValueError(f"Duplicate existing BP key {key}: no writes made.")
-                existing[key]={"row":start+offset,"hash":str(row[7]) if len(row)>7 else "",
-                    "old":row[:7]}
+
+
+def build_index_rows(records, positions, sync_id):
+    """Every posting carries BOTH immutable BP key and current BP row/hash.
+
+    A physical row is a navigation hint; it never establishes BP identity.
+    The API verifies bp_id+row_hash+normalized text before returning a hit.
+    """
+    source=[]
+    for key, rec in records.items():
+        position=positions.get(key)
+        if not isinstance(position,int) or position<2:
+            raise ValueError("Missing stable BP row position; no index may publish.")
+        source.append((rec,position))
+    source.sort(key=lambda t:(t[0]["len_bucket"],t[0]["token_count"],t[0]["bp_id"]))
+    fuzzy=[[rec["len_bucket"],str(rec["token_count"]),str(row),
+            rec["norm_text"],rec["bp_id"],rec["row_hash"]] for rec,row in source]
+    groups=[]
+    for index,(rec,row) in enumerate(source):
+        key=rec["len_bucket"]+":"+str(rec["token_count"])
+        if groups and groups[-1][0]==key:
+            groups[-1][2]=str(index+2)
+            groups[-1][3]=str(int(groups[-1][3])+1)
+        else: groups.append([key,str(index+2),str(index+2),"1",sync_id])
+    exact=sorted(
+        [[rec["exact_hash"],str(row),rec["bp_id"],rec["row_hash"]]
+         for rec,row in source],key=lambda x:(x[0],x[2]))
+    ktp=sorted(
+        [[rec["ktp_number"],str(row),rec["bp_id"],rec["row_hash"]]
+         for rec,row in source if rec["ktp_number"]],
+        key=lambda x:(x[0][-2:],x[0],x[2]))
+    def shards(items,keyer):
+        out=[]
+        for i,row in enumerate(items):
+            key=keyer(row)
+            if out and out[-1][0]==key:
+                out[-1][2]=str(i+2)
+                out[-1][3]=str(int(out[-1][3])+1)
+            else:out.append([key,str(i+2),str(i+2),"1",sync_id])
+        return out
+    exact_shards=shards(exact,lambda x:x[0][:2])
+    ktp_shards=shards(ktp,lambda x:x[0][-2:].zfill(2))
+    tabs={
+      "INDEX_LEN_TOKEN":[["len_bucket","token_count","bp_db_row","norm_text","bp_id","row_hash"]]+fuzzy,
+      "INDEX_LEN":[["len_token_key","row_start","row_end","count","sync_id"]]+groups,
+      "KTP_INDEX":[["ktp_digits","bp_db_row","bp_id","row_hash"]]+ktp,
+      "INDEX_KTP_SHARD":[["ktp_shard","row_start","row_end","count","sync_id"]]+ktp_shards,
+      "EXACT_INDEX":[["exact_hash","bp_db_row","bp_id","row_hash"]]+exact,
+      "INDEX_EXACT_SHARD":[["exact_shard","row_start","row_end","count","sync_id"]]+exact_shards
+    }
+    assert sum(int(x[3]) for x in groups)==len(records)
+    assert sum(int(x[3]) for x in exact_shards)==len(records)
+    assert sum(int(x[3]) for x in ktp_shards)==len(ktp)
+    return tabs, len(ktp), len(groups)
+
+def make_meta(sync_id,bp_count,ktp_count,group_count,state):
+    data=[
+        ["sync_id",sync_id],
+        ["last_sync_at",datetime.now().strftime("%Y-%m-%d %H:%M:%S")],
+        ["total_bp_rows",str(bp_count)],
+        ["total_ktp_index_rows",str(ktp_count)],
+        ["total_exact_index_rows",str(bp_count)],
+        ["exact_index_version","1"],
+        ["keyed_index_version","12"],
+        ["token_index_version","1"],
+        ["token_index_groups",str(group_count)],
+        ["sync_state",state],
+        ["source","PostgreSQL MDG -> protected keyed Google Sheets"],
+        ["schema","KEYED_V12:BP_DATABASE:A:H; INDEX_LEN_TOKEN:A:F; INDEX_LEN:A:E"]
+    ]
+    return [["key","value"]]+data
+
+def preflight_capacity(sh,plans,new_bp_rows):
+    metadata=sh.fetch_sheet_metadata().get("sheets",[])
+    existing={s["properties"]["title"]:s["properties"].get("gridProperties",{})
+        for s in metadata}
+    result=0
+    for title,grid in existing.items():
+        if title in plans:
+            rows=plans[title]
+            # Google allocates grid cells, not just populated cells.
+            result+=max(len(rows),100)*len(rows[0])
+        elif title=="BP_DATABASE":
+            result+=max(new_bp_rows,int(grid.get("rowCount",0)))*8
         else:
-            parts=update_with_retry(lambda:ws.batch_get(
-                [f"A{start}:A{end}",f"H{start}:H{end}"]))
-            keys,hashes=parts
-            for offset,row in enumerate(keys):
-                if not row or not str(row[0]).strip():continue
-                key=str(row[0]).strip()
-                if key in existing:raise ValueError(f"Duplicate existing BP key {key}: no writes made.")
-                old_hash=hashes[offset][0] if offset<len(hashes) and hashes[offset] else ""
-                existing[key]={"row":start+offset,"hash":str(old_hash)}
-        time.sleep(float(os.getenv("GSHEET_READ_BATCH_SLEEP_SECONDS","2.0")))
+            result+=int(grid.get("rowCount",0))*int(grid.get("columnCount",0))
+    for title,rows in plans.items():
+        if title not in existing:
+            result+=max(len(rows),100)*len(rows[0])
+    limit=int(os.getenv("GSHEET_MAX_CELLS","10000000"))
+    logging.info("Preflight required Google Sheets cells: %s / %s",
+                 f"{result:,}",f"{limit:,}")
+    if result>limit:raise ValueError(
+        f"Google Sheets cell capacity {result:,}>{limit:,}; no BP writes attempted."
+    )
+
+def write_index(sh,title,rows):
+    try:ws=sh.worksheet(title)
+    except Exception as exc:
+        if exc.__class__.__name__!="WorksheetNotFound":raise
+        ws=sh.add_worksheet(title=title,rows=max(100,len(rows)),cols=len(rows[0]))
+    # Unlike the old full sync, this NEVER calls clear(). Only index tabs are
+    # materialized; indexed rows must be contiguous for efficient range reads.
+    need=max(100,len(rows))
+    if ws.row_count<need or ws.col_count<len(rows[0]):
+        ws.resize(rows=max(ws.row_count,need),cols=len(rows[0]))
+    col=chr(ord("A")+len(rows[0])-1)
+    for start in range(0,len(rows),INDEX_WRITE_BATCH):
+        block=rows[start:start+INDEX_WRITE_BATCH]
+        a,b=start+1,start+len(block)
+        update_with_retry(lambda a=a,b=b,block=block:ws.update(
+            range_name=f"A{a}:{col}{b}",
+            values=block,value_input_option="RAW"))
+        # Verify every index row, not just the tail. A partially accepted API
+        # write must not result in a READY index and false PASS.
+        actual=update_with_retry(lambda a=a,b=b:
+            ws.get(f"A{a}:{col}{b}"))
+        if actual!=block:
+            raise RuntimeError(
+                f"{title} read-back mismatch at {a}:{b}. No publish.")
+        logging.info("%s verified index rows %s-%s",title,f"{a:,}",f"{b:,}")
+        time.sleep(float(os.getenv("GSHEET_WRITE_SLEEP_SECONDS","0.2")))
+    # Shrink obsolete *index tail* only, never BP_DATABASE physical rows.
+    if ws.row_count!=need or ws.col_count!=len(rows[0]):
+        ws.resize(rows=need,cols=len(rows[0]))
+    return ws
+
+def read_sheet_index(ws, legacy):
+    existing={}
+    max_row=1
+    for start in range(2,ws.row_count+1,READ_BATCH):
+        end=min(ws.row_count,start+READ_BATCH-1)
+        rows=update_with_retry(lambda start=start,end=end:
+                               ws.get(f"A{start}:H{end}"))
+        for offset, row in enumerate(rows):
+            if not row or not str(row[0]).strip():continue
+            key=str(row[0]).strip()
+            if key in existing:raise ValueError(
+                f"Duplicate key {key} in BP_DATABASE; zero sheet writes.")
+            old=row[:7]
+            existing[key]={"row":start+offset,
+                "hash":str(row[7]) if len(row)>7 else "","old":old}
+            max_row=max(max_row,start+offset)
+        logging.info("Scanned existing BP keys through row %s / %s",
+                     f"{end:,}",f"{ws.row_count:,}")
+        time.sleep(float(os.getenv("GSHEET_READ_BATCH_SLEEP_SECONDS","1.0")))
+    if max_row!=len(existing)+1:
+        raise ValueError("BP_DATABASE has physical key gaps; unsafe to append, no writes.")
     return existing
 
-def sync_sheet(records:Dict[str,dict], sync_id:str):
-    gc,_=gsheet_client()
-    sh=gc.open_by_key(os.getenv("SHEET_ID",DEFAULT_SHEET_ID))
-    ws=sh.worksheet("BP_DATABASE")
+
+def snapshot_ids():
+    mode=os.getenv("GSHEET_SNAPSHOT_MODE","").strip().lower()
+    if mode!="dual":
+        raise ValueError(
+            "Google-Sheets-only online sync requires GSHEET_SNAPSHOT_MODE=dual "
+            "and separate SHEET_A_ID, SHEET_B_ID, SHEET_CONTROL_ID. No writes."
+        )
+    ids={name:os.getenv(name,"").strip()
+         for name in ("SHEET_A_ID","SHEET_B_ID","SHEET_CONTROL_ID")}
+    legacy=os.getenv("SHEET_ID",DEFAULT_SHEET_ID).strip()
+    if (not all(ids.values()) or len(set(ids.values()))!=3
+        or legacy in ids.values()):
+        raise ValueError(
+            "A/B/control IDs must be nonempty, distinct and DIFFERENT from legacy "
+            "SHEET_ID. Use dedicated workbooks; no Sheets modified."
+        )
+    if os.getenv("PRIVATE_INDEX_MODE","off").lower()=="required":
+        raise ValueError("PRIVATE_INDEX_MODE=required is incompatible with Sheets-only dual mode.")
+    return ids
+
+def source_digest(records):
+    digest=hashlib.sha256()
+    for key in sorted(records):
+        digest.update(key.encode("utf-8"))
+        digest.update(b"\x1f")
+        digest.update(records[key]["row_hash"].encode("ascii"))
+        digest.update(b"\n")
+    return digest.hexdigest()
+
+def control_active(sh):
+    try: ws=sh.worksheet("ACTIVE")
+    except Exception as exc:
+        if exc.__class__.__name__=="WorksheetNotFound": return {}
+        raise
+    rows=update_with_retry(lambda:ws.get("A1:B20"))
+    return {str(row[0]):str(row[1]) for row in rows if len(row)>=2 and row[0]}
+
+def read_meta(sh):
+    try: ws=sh.worksheet("META")
+    except Exception as exc:
+        if exc.__class__.__name__=="WorksheetNotFound":return {}
+        raise
+    rows=update_with_retry(lambda:ws.get("A2:B50"))
+    return {str(row[0]):str(row[1]) for row in rows if len(row)>=2 and row[0]}
+
+def safe_worksheet(sh,title,columns):
+    try: return sh.worksheet(title)
+    except Exception as exc:
+        if exc.__class__.__name__!="WorksheetNotFound":raise
+        return sh.add_worksheet(title=title,rows=100,cols=columns)
+
+def sync_sheet(records,sync_id):
+    ids=snapshot_ids()
+    gc,_=gsheet_client()  # PROVEN local OAuth token; no other auth mechanism.
+    control=gc.open_by_key(ids["SHEET_CONTROL_ID"])
+    active=control_active(control)
+    active_id=active.get("active_sheet_id","")
+    if active_id and (active.get("sync_state")!="READY" or
+                      active_id not in (ids["SHEET_A_ID"],ids["SHEET_B_ID"])):
+        raise ValueError("Invalid committed control pointer: refusing unsafe fallback.")
+    digest=source_digest(records)
+    if active_id:
+        live=gc.open_by_key(active_id)
+        live_meta=read_meta(live)
+        if (live_meta.get("sync_state")!="READY" or
+            live_meta.get("sync_id")!=active.get("sync_id") or
+            live_meta.get("source_digest")!=active.get("source_digest") or
+            live_meta.get("total_bp_rows")!=active.get("total_bp_rows")):
+            raise ValueError("Active snapshot META does not match control pointer.")
+        if active["source_digest"]==digest and int(active["total_bp_rows"])==len(records):
+            logging.info("NOOP: no changes to source BP keys/hashes. Active snapshot remains %s",
+                         active["sync_id"])
+            return {"updated":0,"appended":0,"tombstoned":0,
+                    "unchanged":len(records),"sync_id":active["sync_id"]}
+    stage_id=(ids["SHEET_B_ID"] if active_id==ids["SHEET_A_ID"]
+              else ids["SHEET_A_ID"])
+    logging.info("Dual snapshot: ACTIVE=%s STAGING=%s (OAuth-controlled IDs)",
+                 "A" if active_id==ids["SHEET_A_ID"] else
+                 "B" if active_id else "LEGACY",
+                 "A" if stage_id==ids["SHEET_A_ID"] else "B")
+    sh=gc.open_by_key(stage_id)
+    ws=safe_worksheet(sh,"BP_DATABASE",8)
     header=ws.row_values(1)[:8]
-    if header not in (COLUMNS,LEGACY_COLUMNS):
-        raise ValueError("BP_DATABASE layout differs from expected A:H; refusing keyed writes.")
+    if header and header not in (COLUMNS,LEGACY_COLUMNS):
+        raise ValueError("Staging BP_DATABASE has unexpected A:H schema; no writes.")
     legacy=header==LEGACY_COLUMNS
-    existing=read_sheet_index(ws,legacy)
+    existing=read_sheet_index(ws,legacy) if header else {}
     changes,creates,tombstones=keyed_delta(records,existing)
-    # When migrating legacy H=sync_id, derive a hash from the SOURCE and compare
-    # A:G so unchanged data needs only a one-column H hash update, never full refill.
+    # A hash alone cannot prove A:G was completely written after a crash or
+    # concurrent manual edit. Reconcile real fields for every existing BP.
+    if not legacy:
+        changed={row for row,_ in changes}
+        for key,record in records.items():
+            prior=existing.get(key)
+            if prior and prior["row"] not in changed and (
+                    prior["old"]!=sheet_row(record)[:7]):
+                changes.append((prior["row"],record))
     if legacy:
         changes=[]
         for key,record in records.items():
-            old=existing.get(key)
-            if not old:continue
-            if old["old"]==sheet_row(record)[:7]:
-                old["hash"]=record["row_hash"]
-            else:changes.append((old["row"],record))
-        tombstones=[x["row"] for key,x in existing.items() if key not in records]
-    count_after=len(existing)+len(creates)
-    sheet_metadata=sh.fetch_sheet_metadata().get("sheets",[])
-    cells=sum(int(s["properties"].get("gridProperties",{}).get("rowCount",0))*
-              int(s["properties"].get("gridProperties",{}).get("columnCount",0))
-              for s in sheet_metadata)
-    additional=max(0,count_after+1-ws.row_count)*8
-    if cells+additional>int(os.getenv("GSHEET_MAX_CELLS","10000000")):
-        raise ValueError("Not enough workbook cells for appended keyed records; no changes made.")
-    keyed_meta=next((s for s in sheet_metadata if s["properties"].get("title")=="KEYED_SYNC_META"),None)
-    if not keyed_meta and cells+additional+200>int(os.getenv("GSHEET_MAX_CELLS","10000000")):
-        raise ValueError("Not enough cells to create KEYED_SYNC_META. No changes made.")
-    logging.info("Keyed Sheet plan: change=%s append=%s tombstone=%s unchanged=%s legacy=%s",
-        len(changes),len(creates),len(tombstones),
-        len(records)-len(changes)-len(creates),legacy)
-    try: status=sh.worksheet("KEYED_SYNC_META")
-    except Exception:status=sh.add_worksheet(title="KEYED_SYNC_META",rows=100,cols=2)
-    # Legacy reader MUST never issue PASS after its row-number indexes become
-    # inconsistent. Do not ever set old META back to READY in keyed mode.
-    old_meta=sh.worksheet("META")
-    old_meta_rows=old_meta.get("A2:B50")
-    old_row=next((i+2 for i,row in enumerate(old_meta_rows) if row and row[0]=="sync_state"),None)
-    if not old_row:raise ValueError("META lacks sync_state; no BP rows modified.")
-    update_with_retry(lambda:old_meta.update(range_name=f"B{old_row}",values=[["IN_PROGRESS"]],
-                       value_input_option="RAW"))
-    update_with_retry(lambda:status.update(range_name="A1:B4",
-        values=[["sync_state","IN_PROGRESS"],["sync_id",sync_id],
-                ["total_bp_rows",str(len(records))],["last_sync_at",datetime.now().isoformat()]],
-        value_input_option="RAW"))
-    if legacy:
-        # Bootstrap ONLY the hash column, preserving every original BP row.
-        # After an interrupted bootstrap rerun, each row is reconciled.
+            prior=existing.get(key)
+            if prior and prior["old"]!=sheet_row(record)[:7]:
+                changes.append((prior["row"],record))
+        tombstones=[v["row"] for k,v in existing.items() if k not in records]
+    positions={key:rec["row"] for key,rec in existing.items() if key in records}
+    for n,rec in enumerate(creates,start=len(existing)+2):
+        positions[rec["bp_id"]]=n
+    if len(positions)!=len(records):
+        raise ValueError("Unique BP key coverage mismatch. No writes.")
+    tabs,ktp_count,group_count=build_index_rows(records,positions,sync_id)
+    final_meta=make_meta(sync_id,len(records),ktp_count,group_count,"READY")
+    final_meta.extend([["source_digest",digest],
+                       ["physical_bp_rows",str(len(existing)+len(creates))]])
+    pending_meta=[list(row) for row in final_meta]
+    next(row for row in pending_meta if row[0]=="sync_state")[1]="IN_PROGRESS"
+    preflight_capacity(sh,{**tabs,"META":final_meta},
+                       len(existing)+len(creates)+1)
+    logging.info("Keyed delta: existing=%s changed=%s appended=%s tombstone=%s",
+                 len(existing),len(changes),len(creates),len(tombstones))
+    metadata=safe_worksheet(sh,"META",2)
+    update_with_retry(lambda:metadata.update(
+        range_name=f"A1:B{len(pending_meta)}",
+        values=pending_meta,value_input_option="RAW"))
+    if not header:
+        update_with_retry(lambda:ws.update(range_name="A1:H1",
+                           values=[COLUMNS],value_input_option="RAW"))
+    elif legacy:
         by_row={v["row"]:key for key,v in existing.items()}
-        changed_rows={row for row,_ in changes}
-        values=[]
-        for row_no in range(2,len(existing)+2):
-            key=by_row.get(row_no)
-            if key is None:
-                raise ValueError("Noncontiguous BP_DATABASE keys; no safe bootstrap.")
-            if key not in records:
-                values.append(["DELETED"])
-            elif row_no in changed_rows:
-                # Never publish a new row hash BEFORE the corresponding A:G
-                # fields have actually been updated; interrupted sync recovers.
-                values.append(["PENDING"])
-            else:
-                values.append([records[key]["row_hash"]])
-        for start in range(0,len(values),READ_BATCH):
-            stop=min(start+READ_BATCH,len(values))
-            update_with_retry(lambda start=start,stop=stop:ws.update(
-                range_name=f"H{start+2}:H{stop+1}",values=values[start:stop],
-                value_input_option="RAW"))
+        dirty={row for row,_ in changes}
+        hashes=[["PENDING" if n in dirty else
+                 ("DELETED" if by_row[n] not in records
+                  else records[by_row[n]]["row_hash"])]
+                for n in range(2,len(existing)+2)]
+        for start in range(0,len(hashes),INDEX_WRITE_BATCH):
+            stop=min(start+INDEX_WRITE_BATCH,len(hashes))
+            block=hashes[start:stop]
+            update_with_retry(lambda start=start,stop=stop,block=block:
+                ws.update(range_name=f"H{start+2}:H{stop+1}",
+                          values=block,value_input_option="RAW"))
         update_with_retry(lambda:ws.update(range_name="H1",
-            values=[["row_hash"]],value_input_option="RAW"))
-    # Changed records: update existing A:H in place using stable BP key.
+                           values=[["row_hash"]],value_input_option="RAW"))
+    required=max(100,len(existing)+len(creates)+1)
+    if ws.row_count<required:
+        ws.resize(rows=required,cols=8)
     for start in range(0,len(changes),100):
-        part=changes[start:start+100]
-        update_with_retry(lambda part=part:ws.batch_update([
+        batch=changes[start:start+100]
+        update_with_retry(lambda batch=batch:ws.batch_update([
             {"range":f"A{row}:H{row}","values":[sheet_row(rec)]}
-            for row,rec in part],value_input_option="RAW"))
+            for row,rec in batch],value_input_option="RAW"))
     if not legacy:
         for start in range(0,len(tombstones),100):
-            part=tombstones[start:start+100]
-            update_with_retry(lambda part=part:ws.batch_update([
+            batch=tombstones[start:start+100]
+            update_with_retry(lambda batch=batch:ws.batch_update([
                 {"range":f"H{row}","values":[["DELETED"]]}
-                for row in part],value_input_option="RAW"))
-    # Append-only for newly discovered keys. Reconciliation on the next run
-    # handles partial append failure without clearing or duplicating existing rows.
-    for start in range(0,len(creates),1000):
-        values=[sheet_row(x) for x in creates[start:start+1000]]
-        ws.append_rows(values,value_input_option="RAW")
-    update_with_retry(lambda:status.update(range_name="A1:B4",
-        values=[["sync_state","READY"],["sync_id",sync_id],
-                ["total_bp_rows",str(len(records))],
-                ["last_sync_at",datetime.now().isoformat(timespec="seconds")]],
-        value_input_option="RAW"))
-    logging.info("Keyed Sheet READY, source=%s, updated=%s, appended=%s, tombstoned=%s",
-        len(records),len(changes),len(creates),len(tombstones))
+                for row in batch],value_input_option="RAW"))
+    for start in range(0,len(creates),INDEX_WRITE_BATCH):
+        batch=creates[start:start+INDEX_WRITE_BATCH]
+        begin=len(existing)+2+start
+        finish=begin+len(batch)-1
+        update_with_retry(lambda begin=begin,finish=finish,batch=batch:
+            ws.update(range_name=f"A{begin}:H{finish}",
+                      values=[sheet_row(x) for x in batch],
+                      value_input_option="RAW"))
+    # Verify EVERY key/hash in staging before publishing its precomputed index.
+    reconciled=read_sheet_index(ws,False)
+    if len(reconciled)!=len(existing)+len(creates):
+        raise RuntimeError("Staging BP physical count changed during sync.")
+    for key,record in records.items():
+        actual=reconciled.get(key)
+        if (not actual or actual["hash"]!=record["row_hash"] or
+            actual["row"]!=positions[key]):
+            raise RuntimeError(f"Staging BP key/hash mismatch for {key}; not published.")
+    if any(key not in records and row["hash"]!="DELETED"
+           for key,row in reconciled.items()):
+        raise RuntimeError("Staging tombstone mismatch; not published.")
+    logging.info("Verified %s keyed source rows against Google Sheets staging.",
+                 f"{len(records):,}")
+    for title in ("INDEX_LEN_TOKEN","INDEX_LEN","KTP_INDEX",
+                  "INDEX_KTP_SHARD","EXACT_INDEX","INDEX_EXACT_SHARD"):
+        write_index(sh,title,tabs[title])
+    for title in ("INDEX_LEN_TOKEN","KTP_INDEX","EXACT_INDEX"):
+        expected=tabs[title]
+        if len(expected)>1:
+            sheet=sh.worksheet(title)
+            last=len(expected)
+            got=update_with_retry(lambda sheet=sheet,last=last,expected=expected:
+                sheet.get(f"A{last}:{chr(64+len(expected[0]))}{last}"))
+            if not got or [str(v) for v in got[0]]!=expected[-1]:
+                raise RuntimeError(f"{title} index boundary mismatch; not READY.")
+    update_with_retry(lambda:metadata.update(
+        range_name=f"A1:B{len(final_meta)}",
+        values=final_meta,value_input_option="RAW"))
+    staged=read_meta(sh)
+    if (staged.get("sync_id")!=sync_id or
+        staged.get("sync_state")!="READY" or
+        staged.get("total_bp_rows")!=str(len(records)) or
+        staged.get("source_digest")!=digest):
+        raise RuntimeError("Staging READY marker failed read-back; not published.")
+    # Check control has not changed before the SINGLE control-pointer write.
+    current=control_active(control)
+    if current.get("active_sheet_id","")!=active_id or (
+        active_id and current.get("sync_id")!=active.get("sync_id")):
+        raise RuntimeError("Control changed concurrently; refusing pointer switch.")
+    pointer=safe_worksheet(control,"ACTIVE",2)
+    values=[["key","value"],
+            ["active_sheet_id",stage_id],
+            ["sync_id",sync_id],
+            ["total_bp_rows",str(len(records))],
+            ["source_digest",digest],
+            ["sync_state","READY"],
+            ["last_sync_at",datetime.now().isoformat(timespec="seconds")]]
+    update_with_retry(lambda:pointer.update(
+        range_name="A1:B7",values=values,value_input_option="RAW"))
+    verified=control_active(control)
+    if (verified.get("active_sheet_id")!=stage_id or
+        verified.get("sync_id")!=sync_id or
+        verified.get("sync_state")!="READY"):
+        raise RuntimeError("Control publish verification failed; check ACTIVE sheet.")
+    logging.info("PUBLISHED snapshot %s: updated=%s appended=%s tombstones=%s",
+                 sync_id,len(changes),len(creates),len(tombstones))
+    return {"updated":len(changes),"appended":len(creates),
+            "tombstoned":len(tombstones),"sync_id":sync_id}
 
 def main():
     read_env()
-    dsn=ensure_private_mode()
-    df=fetch_pg_dataframe()
-    records=make_records(df)
+    snapshot_ids()   # Fail BEFORE external DB fetch or any sheet writes.
+    source=fetch_pg_dataframe()  # Original authorized WINGS MDG PostgreSQL.
+    records=make_records(source)
     sync_id=datetime.now().strftime("%Y%m%dT%H%M%S")+"-"+uuid.uuid4().hex[:12]
-    sync_private(records,sync_id,dsn)
-    sync_sheet(records,sync_id)
+    return sync_sheet(records,sync_id)
 
 if __name__=="__main__":
     try:
-        with single_sync_lock():main()
-    except (RuntimeError,ValueError) as exc:
-        logging.error("%s",exc)
+        with single_sync_lock():
+            main()
+    except Exception:
+        logging.exception("DUAL-SNAPSHOT GOOGLE SHEETS SYNC FAILED. Active pointer unchanged unless publish failed.")
         sys.exit(2)

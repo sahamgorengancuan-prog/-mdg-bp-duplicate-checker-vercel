@@ -10,7 +10,7 @@ import { createHash, createHmac, timingSafeEqual } from 'node:crypto';
   Browser never receives OAuth credential, refresh token, or raw database dump.
 */
 
-export const ENGINE_VERSION = '2026-09-23-private-snapshot-v11';
+export const ENGINE_VERSION = '2026-09-23-gsheet-dual-v12';
 const GOOGLE_TOKEN_URL = 'https://oauth2.googleapis.com/token';
 const TOKEN_TTL_SAFETY_SECONDS = 90;
 
@@ -75,19 +75,62 @@ let sheetsCooldownUntil = 0;
 const rateBucket = new Map();
 let tokenCache = { token: null, exp: 0 };
 
+function dualIds(env) {
+  const a=String(env.SHEET_A_ID||'').trim();
+  const b=String(env.SHEET_B_ID||'').trim();
+  const c=String(env.SHEET_CONTROL_ID||'').trim();
+  const legacy=getSheetId(env);
+  if(!a||!b||!c||new Set([a,b,c,legacy]).size!==4)
+    throw httpError(503,'Configure separate SHEET_A_ID, SHEET_B_ID and SHEET_CONTROL_ID; each must differ from legacy SHEET_ID.');
+  return {a,b,c};
+}
+async function readDualControl(env) {
+  const ids=dualIds(env);
+  const rows=await getSheetRange({...env,SHEET_ID:ids.c},'ACTIVE!A1:B20','',true);
+  const out={};
+  for(const row of rows) if(row[0])out[String(row[0])]=String(row[1]||'');
+  if(out.sync_state!=='READY'||!out.sync_id||
+      ![ids.a,ids.b].includes(out.active_sheet_id)||
+      !/^[a-f0-9]{64}$/.test(out.source_digest||'')||
+      !Number.isSafeInteger(Number(out.total_bp_rows))||Number(out.total_bp_rows)<1)
+    throw httpError(503,'Dual control ACTIVE pointer is not READY. Keep legacy mode until first staging sync is published.');
+  return out;
+}
+async function readDualSnapshot(env) {
+  const control=await readDualControl(env);
+  const scopedEnv={...env,SHEET_ID:control.active_sheet_id};
+  const meta=await getMeta(scopedEnv);
+  if(meta.sync_state!=='READY'||meta.sync_id!==control.sync_id||
+      meta.source_digest!==control.source_digest||
+      meta.total_bp_rows!==control.total_bp_rows||
+      meta.keyed_index_version!=='12')
+    throw httpError(503,'Active Google Sheets snapshot META/control mismatch. No PASS.');
+  return {control,scopedEnv,meta};
+}
+
 export async function handleCheck(context) {
   try {
     await enforceRateLimit(context.request, context.env);
     await enforceOptionalAccessCode(context.request, context.env);
     const payload = await safeJson(context.request);
-    const privateMode = String(context.env.PRIVATE_INDEX_MODE || 'off').toLowerCase();
-    if (!['off','required'].includes(privateMode)) throw httpError(503,'PRIVATE_INDEX_MODE must be off or required; refusing fallback.');
-    const result = privateMode === 'required'
-      ? await (await import('./private-search.js')).checkPrivateIndex(payload, context.env)
-      : payload?.full_scope_cursor
-        ? await fullScopeCheck(payload, context.env)
-        : await duplicateCheck(payload, context.env);
-    if (privateMode !== 'required') result.quota = currentSheetsQuotaState(context.env);
+    const mode = String(context.env.GSHEET_SNAPSHOT_MODE || 'legacy').toLowerCase();
+    if (String(context.env.PRIVATE_INDEX_MODE || 'off').toLowerCase()==='required')
+      throw httpError(503,'Private PostgreSQL mode is retired. Use Google Sheets dual snapshots.');
+    let result;
+    if (mode==='dual') {
+      const {control,scopedEnv,meta}=await readDualSnapshot(context.env);
+      result=await (await import('./keyed-sheets.js')).keyedCheck(payload,scopedEnv,meta);
+      const current=await readDualControl(context.env);
+      if(current.active_sheet_id!==control.active_sheet_id||
+         current.sync_id!==control.sync_id||
+         current.source_digest!==control.source_digest)
+        throw httpError(503,'Active Google Sheets generation changed during check. No decision issued; retry.');
+    } else if(mode==='legacy') {
+      result=payload?.full_scope_cursor
+        ? await fullScopeCheck(payload,context.env)
+        : await duplicateCheck(payload,context.env);
+      result.quota=currentSheetsQuotaState(context.env);
+    } else throw httpError(503,'GSHEET_SNAPSHOT_MODE must be dual or legacy.');
     return json(result);
   } catch (err) {
     return json({
@@ -101,26 +144,26 @@ export async function handleCheck(context) {
 }
 
 export async function handleHealth(context) {
-  const mode = String(context.env.PRIVATE_INDEX_MODE || 'off').toLowerCase();
-  if (!['off','required'].includes(mode)) return json({ok:false,sheet_ok:false,sheet_error:'Invalid PRIVATE_INDEX_MODE; refusing fallback.'},503);
-  if (mode === 'required') {
+  const mode=String(context.env.GSHEET_SNAPSHOT_MODE || 'legacy').toLowerCase();
+  if (mode==='dual') {
     try {
-      const meta = await (await import('./private-search.js')).privateIndexHealth(context.env);
-      return json({
-        ok: true, engine_version: ENGINE_VERSION,
-        exact_index_ready: true, sheet_ok: false,
-        search_backend: 'PRIVATE_POSTGRES_INDEX',
-        config: configStatus(context.env), meta
-      });
-    } catch (err) {
-      return json({
-        ok: false, engine_version: ENGINE_VERSION, exact_index_ready: false,
-        search_backend: 'PRIVATE_POSTGRES_INDEX',
-        sheet_ok: false, sheet_error: err?.status ? err.message : 'Private index unavailable',
-        config: configStatus(context.env)
-      }, 503);
+      const {control,scopedEnv,meta}=await readDualSnapshot(context.env);
+      await (await import('./keyed-sheets.js')).keyedHealth(scopedEnv,meta);
+      return json({ok:true,engine_version:ENGINE_VERSION,exact_index_ready:true,
+        sheet_ok:true,search_backend:'KEYED_GOOGLE_SHEETS_DUAL',
+        config:configStatus(context.env),meta:{
+          ...meta,active_generation:control.sync_id
+        }});
+    } catch (error) {
+      return json({ok:false,engine_version:ENGINE_VERSION,
+        exact_index_ready:false,sheet_ok:false,
+        search_backend:'KEYED_GOOGLE_SHEETS_DUAL',
+        sheet_error:error?.message||'Snapshot unavailable',
+        config:configStatus(context.env)},503);
     }
   }
+  if(mode!=='legacy'||String(context.env.PRIVATE_INDEX_MODE||'off').toLowerCase()==='required')
+    return json({ok:false,sheet_ok:false,sheet_error:'Unsupported snapshot mode.'},503);
   const cfg = configStatus(context.env);
   let meta = {};
   let sheet_ok = false;
@@ -185,8 +228,8 @@ export function configStatus(env) {
     oauth_configured: Boolean(env.GOOGLE_OAUTH_CLIENT_ID && env.GOOGLE_OAUTH_CLIENT_SECRET && env.GOOGLE_OAUTH_REFRESH_TOKEN),
     auth_mode: 'oauth_user_refresh_token',
     using_default_sheet_id: !Boolean(env.SHEET_ID),
-    private_index_mode: String(env.PRIVATE_INDEX_MODE || 'off').toLowerCase(),
-    private_index_configured: Boolean(env.PRIVATE_INDEX_DATABASE_URL),
+    snapshot_mode: String(env.GSHEET_SNAPSHOT_MODE || 'legacy').toLowerCase(),
+    dual_snapshot_configured: Boolean(env.SHEET_A_ID && env.SHEET_B_ID && env.SHEET_CONTROL_ID),
     similarity_threshold: Number(env.SIMILARITY_THRESHOLD || DEFAULT_SIMILARITY_THRESHOLD),
     similarity_direct_reject_threshold: getSimilarityDirectRejectThreshold(env),
     max_candidates: Number(env.MAX_CANDIDATES || DEFAULT_MAX_CANDIDATES),
@@ -892,7 +935,7 @@ export async function getMeta(env) {
   return out;
 }
 
-async function getIndexMap(env, tabName, type, meta) {
+export async function getIndexMap(env, tabName, type, meta) {
   const sync = String(meta.sync_id || '');
   if (!sync) throw httpError(503, 'META sync_id missing. Run a full sync.');
   const cacheKey = `index:${getSheetId(env)}:${sync}:${tabName}`;
@@ -1027,7 +1070,7 @@ async function getSearchIndexMap(env, meta, lenIndex) {
   return map;
 }
 
-async function getSheetRange(env, rangeA1, syncId = '', fresh = false) {
+export async function getSheetRange(env, rangeA1, syncId = '', fresh = false) {
   const cacheSeconds = Number(env.RANGE_CACHE_SECONDS || DEFAULT_RANGE_CACHE_SECONDS);
   const sheetId = getSheetId(env);
   if (!sheetId) throw httpError(500, 'SHEET_ID is not configured.');
