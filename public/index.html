@@ -366,15 +366,28 @@
           address: $('address').value,
           ktp_number: $('ktp').value
         };
-        const res = await fetch(API_BASE + '/api/check', {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json'
-          },
-          body: JSON.stringify(submittedInput)
-        });
-        const json = await res.json();
-        if (!res.ok || !json.ok) throw new Error(json.error || 'Check failed');
+        let json;
+        let quotaRetries = 0;
+        for (;;) {
+          const res = await fetch(API_BASE + '/api/check', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(submittedInput)
+          });
+          json = await res.json();
+          if (res.status !== 429) {
+            if (!res.ok || !json.ok) throw new Error(json.error || 'Check failed');
+            break;
+          }
+          if (++quotaRetries > MAX_QUOTA_RETRIES) {
+            throw new Error('Google Sheets read quota remains exhausted. No PASS issued. Please retry later when quota and sync traffic recover.');
+          }
+          const retrySeconds = Math.max(2, Math.min(120, Number(json.retry_after_seconds) || 70));
+          for (let left = retrySeconds; left > 0; left--) {
+            result.innerHTML = '<p class="reason" role="status">Google Sheets read quota reached. Normal check not completed. Retrying the same input in ' + left + 's. No PASS issued.</p>';
+            await sleep(1000);
+          }
+        }
         if (json.engine_version !== EXPECTED_ENGINE_VERSION || json.meta?.exact_index_version !== '1' || json.meta?.sync_state !== 'READY') {
           throw new Error('Backend version or exact index is outdated; result cannot be treated as PASS.');
         }

@@ -46,6 +46,8 @@ test('Render yarn start boots, serves frontend and API without leaking private f
     const html = await root.text();
     assert.match(html, /EXPECTED_ENGINE_VERSION = '2026-09-23-score-bounds-v9'/);
     assert.match(html, /FULL_SCOPE_WAIT_MS = 200/);
+    assert.match(html, /Normal check not completed\. Retrying the same input in/);
+    assert.match(html, /if \(res\.status !== 429\)/);
     const health = await fetch('http://127.0.0.1:' + port + '/api/health');
     const body = await health.json();
     assert.equal(body.engine_version, '2026-09-23-score-bounds-v9');
