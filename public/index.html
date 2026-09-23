@@ -323,8 +323,11 @@
     const result = $('result');
     const btn = $('submitBtn');
     const API_BASE = location.origin;
-    const EXPECTED_ENGINE_VERSION = '2026-09-23-resumable-buckets-v6';
-    const FULL_SCOPE_WAIT_MS = 1300;
+    const EXPECTED_ENGINE_VERSION = '2026-09-23-quota-safe-v7';
+    // Three Sheets reads per decisive chunk plus other clients share the same user quota.
+    const FULL_SCOPE_WAIT_MS = 12000;
+    const MAX_QUOTA_RETRIES = 8;
+    const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
     let lastCheckInput = null;
     let fullScopeRunning = false;
     let fullScopeCancelled = false;
@@ -393,6 +396,7 @@
       fullScopeCancelled = false;
       const snapshot = { ...lastCheckInput };
       let nextCursor = cursor;
+      let quotaRetries = 0;
       try {
         while (nextCursor && !fullScopeCancelled) {
           const response = await fetch(API_BASE + '/api/check', {
@@ -401,7 +405,27 @@
             body: JSON.stringify({ ...snapshot, full_scope_cursor: nextCursor })
           });
           const data = await response.json();
+          if (response.status === 429) {
+            quotaRetries++;
+            if (quotaRetries > MAX_QUOTA_RETRIES) {
+              throw new Error('Google Sheets remains rate-limited. Search NOT complete; retry the normal check after quota recovers.');
+            }
+            // Same cursor, same inputs: a failed HTTP request cannot advance
+            // the search or produce PASS. Let the quota minute refill.
+            const retrySeconds = Math.max(15, Math.min(120, Number(data.retry_after_seconds) || 70));
+            let waitBox = $('quotaWait');
+            if (!waitBox) {
+              result.insertAdjacentHTML('beforeend', '<p id="quotaWait" class="reason" role="status"></p>');
+              waitBox = $('quotaWait');
+            }
+            for (let left = retrySeconds; left > 0 && !fullScopeCancelled; left--) {
+              waitBox.textContent = 'Google Sheets read quota reached. Search paused at the last completed batch; retrying same cursor in ' + left + 's. No PASS issued.';
+              await sleep(1000);
+            }
+            continue;
+          }
           if (!response.ok || !data.ok) throw new Error(data.error || 'Full-scope chunk failed');
+          quotaRetries = 0;
           if (data.engine_version !== EXPECTED_ENGINE_VERSION ||
               data.meta?.sync_state !== 'READY') {
             throw new Error('Engine or Sheets snapshot changed during full-scope search.');
@@ -411,7 +435,7 @@
           if (data.decision !== 'INCONCLUSIVE') break;
           nextCursor = data.full_scope_cursor;
           if (!nextCursor) throw new Error('Full-scope continuation missing; refusing PASS.');
-          await new Promise(resolve => setTimeout(resolve, FULL_SCOPE_WAIT_MS));
+          await sleep(FULL_SCOPE_WAIT_MS);
         }
       } catch (error) {
         if (!fullScopeCancelled) result.innerHTML = errorHtml(error.message || 'Full-scope search interrupted; no PASS issued.');

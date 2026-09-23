@@ -213,9 +213,9 @@ test('health and exact response disclose running engine and index readiness with
   const f=fixture([row('TEST-BP','Example Shop','A sample street address')]);
   const health = await handleHealth({env:f.env});
   const hb = await health.json();
-  assert.equal(hb.engine_version,'2026-09-23-resumable-buckets-v6');
+  assert.equal(hb.engine_version,'2026-09-23-quota-safe-v7');
   assert.equal(hb.exact_index_ready,true);
-  assert.equal(health.headers.get('x-bp-checker-engine'),'2026-09-23-resumable-buckets-v6');
+  assert.equal(health.headers.get('x-bp-checker-engine'),'2026-09-23-quota-safe-v7');
   const r=await run(f,{name_1:'Example Shop',address:'A sample street address'});
   assert.equal(r.body.decision,'FAIL');
   assert.equal(r.body.exact_lookup.attempted,true);
@@ -433,4 +433,32 @@ test('normal PASS does not mint Full Scope button cursor',async()=>{
   assert.equal(r.body.decision,'PASS');
   assert.equal(r.body.full_scope_cursor,null);
   assert.equal(r.body.full_scope_available,false);
+});
+
+test('Sheets 429 returns controlled retry and never PASS or raw Google project info',async()=>{
+  const input={name_1:NAME,address:ADDRESS};
+  const f=fixture([
+    row('BP-X','Unrelated X','Completely different sample address and another remote place street'),
+    row('BP-Y','Unrelated Y','Completely different sample address and another remote place street')
+  ],{env:{MAX_CANDIDATES:'1',FULL_SCOPE_CHUNK_ROWS:'1'}});
+  const fast=await run(f,input);
+  assert.equal(fast.body.decision,'INCONCLUSIVE');
+  const backingFetch=globalThis.fetch;
+  globalThis.fetch=async url=>{
+    const request=String(url);
+    if(request.includes('BP_DATABASE!') || decodeURIComponent(request).includes('BP_DATABASE!')) {
+      return new Response(JSON.stringify({
+        error:{message:'Quota exceeded for consumer project_number:private-id'}
+      }),{status:429});
+    }
+    return backingFetch(url);
+  };
+  try {
+    const r=await run(f,{...input,full_scope_cursor:fast.body.full_scope_cursor});
+    assert.equal(r.status,429);
+    assert.equal(r.body.ok,false);
+    assert.equal(r.body.retry_after_seconds,70);
+    assert.equal(r.body.decision,undefined);
+    assert.equal(JSON.stringify(r.body).includes('private-id'),false);
+  } finally {globalThis.fetch=backingFetch;}
 });

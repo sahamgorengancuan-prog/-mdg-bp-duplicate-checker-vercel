@@ -10,7 +10,7 @@ import { createHash, createHmac, timingSafeEqual } from 'node:crypto';
   Browser never receives OAuth credential, refresh token, or raw database dump.
 */
 
-export const ENGINE_VERSION = '2026-09-23-resumable-buckets-v6';
+export const ENGINE_VERSION = '2026-09-23-quota-safe-v7';
 const GOOGLE_TOKEN_URL = 'https://oauth2.googleapis.com/token';
 const TOKEN_TTL_SAFETY_SECONDS = 90;
 
@@ -24,6 +24,10 @@ const DEFAULT_OVERSIZED_SCAN_BUDGET = 6000;
 const FULL_SCOPE_MAX_ROWS_PER_REQUEST = 3000;
 const FULL_SCOPE_CURSOR_TTL_MS = 60 * 60 * 1000;
 const DEFAULT_RANGE_CACHE_SECONDS = 300;
+// Quota is shared by the OAuth user across all workers and local sync jobs.
+// This per-process ceiling is deliberately BELOW Google's per-user quota.
+const SHEETS_LOCAL_READ_BUDGET_PER_MINUTE = 36;
+const SHEETS_UPSTREAM_RETRY_SECONDS = 70;
 const DEFAULT_MAX_BATCH_ROWS = 10000;
 const DEFAULT_RATE_LIMIT_PER_MIN = 60;
 
@@ -61,6 +65,9 @@ function getMaxLenDiff(env, textLen) {
 }
 
 const memoryCache = new Map();
+const inFlightReads = new Map();
+const sheetsReadTimes = [];
+let sheetsCooldownUntil = 0;
 const rateBucket = new Map();
 let tokenCache = { token: null, exp: 0 };
 
@@ -78,6 +85,7 @@ export async function handleCheck(context) {
       ok: false,
       error: err?.message || 'Unexpected error',
       hint: configHint(err?.message),
+      ...(err?.status === 429 ? { retry_after_seconds: Math.max(1, Number(err.retry_after_seconds || SHEETS_UPSTREAM_RETRY_SECONDS)) } : {}),
       requestId: crypto.randomUUID()
     }, err?.status || 500);
   }
@@ -151,6 +159,7 @@ export function configStatus(env) {
     oversized_scan_budget: Number(env.OVERSIZED_SCAN_BUDGET || DEFAULT_OVERSIZED_SCAN_BUDGET),
     full_scope_chunk_rows: FULL_SCOPE_MAX_ROWS_PER_REQUEST,
     full_scope_strategy: 'RESUME_ALL_ELIGIBLE_LENGTH_BUCKETS',
+    sheets_local_read_budget_per_minute: SHEETS_LOCAL_READ_BUDGET_PER_MINUTE,
     max_batch_rows: Number(env.MAX_BATCH_ROWS || DEFAULT_MAX_BATCH_ROWS),
     range_cache_seconds: Number(env.RANGE_CACHE_SECONDS || DEFAULT_RANGE_CACHE_SECONDS),
     rate_limit_per_min: Number(env.RATE_LIMIT_PER_MIN || DEFAULT_RATE_LIMIT_PER_MIN),
@@ -593,11 +602,14 @@ async function fullScopeCheck(payload, env) {
     }
   }
 
-  // META is always fetched uncached and must still be READY on SAME sync.
-  const finalMeta = await getMeta(env);
-  requireReadyExactIndex(finalMeta);
-  if (finalMeta.sync_id !== meta.sync_id) {
-    throw httpError(503, 'Sheet generation changed during full-scope search; restart normal check.');
+  // The next chunk verifies META afresh. Only decisive FAIL/PASS needs
+  // a second uncached META read before returning a final decision.
+  if (found || pos === plan.ordered.length) {
+    const finalMeta = await getMeta(env);
+    requireReadyExactIndex(finalMeta);
+    if (finalMeta.sync_id !== meta.sync_id) {
+      throw httpError(503, 'Sheet generation changed during full-scope search; restart normal check.');
+    }
   }
   const finished = !found && pos === plan.ordered.length && scanned === plan.candidateSpace;
   const stats = {
@@ -809,6 +821,27 @@ async function getIndexMap(env, tabName, type, meta) {
   return map;
 }
 
+// Reserve a local read slot before issuing a Google Sheets request. This is a
+// fail-fast limiter (no server-side 60-second sleep that times out on Render).
+// It is per-process, not distributed; all instances/Windows sync share the
+// actual upstream user quota, so upstream 429 is still handled independently.
+function reserveSheetsReadSlot() {
+  const now = Date.now();
+  if (now < sheetsCooldownUntil) {
+    const err = httpError(429, 'Google Sheets read quota is cooling down. The duplicate check has not completed.');
+    err.retry_after_seconds = Math.ceil((sheetsCooldownUntil - now) / 1000);
+    throw err;
+  }
+  while (sheetsReadTimes.length && sheetsReadTimes[0] <= now - 60000) sheetsReadTimes.shift();
+  if (sheetsReadTimes.length >= SHEETS_LOCAL_READ_BUDGET_PER_MINUTE) {
+    const wait = Math.ceil((sheetsReadTimes[0] + 60000 - now) / 1000) + 2;
+    const err = httpError(429, 'Local Google Sheets read budget reached; retry the same request after the indicated delay.');
+    err.retry_after_seconds = Math.max(2, wait);
+    throw err;
+  }
+  sheetsReadTimes.push(now);
+}
+
 async function getSheetRange(env, rangeA1, syncId = '', fresh = false) {
   const cacheSeconds = Number(env.RANGE_CACHE_SECONDS || DEFAULT_RANGE_CACHE_SECONDS);
   const sheetId = getSheetId(env);
@@ -816,17 +849,37 @@ async function getSheetRange(env, rangeA1, syncId = '', fresh = false) {
   const cacheKey = `range:${sheetId}:${syncId}:${rangeA1}`;
   const cached = fresh ? null : getCached(cacheKey);
   if (cached) return cached;
-  const token = await getGoogleAccessToken(env);
-  const url = `https://sheets.googleapis.com/v4/spreadsheets/${encodeURIComponent(sheetId)}/values/${encodeURIComponent(rangeA1)}?majorDimension=ROWS`;
-  const res = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
-  if (!res.ok) {
-    const txt = await res.text();
-    throw httpError(502, `Google Sheets API error ${res.status}: ${txt.slice(0, 600)}`);
+  // Coalesce concurrent identical ranges so independent checks do not
+  // amplify the Google quota. Fresh META is coalesced only while in-flight.
+  if (inFlightReads.has(cacheKey)) return inFlightReads.get(cacheKey);
+  const pending = (async () => {
+    const token = await getGoogleAccessToken(env);
+    reserveSheetsReadSlot();
+    const url = `https://sheets.googleapis.com/v4/spreadsheets/${encodeURIComponent(sheetId)}/values/${encodeURIComponent(rangeA1)}?majorDimension=ROWS`;
+    const res = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
+    if (res.status === 429) {
+      // Do not expose Google's full error payload (user/project identifiers).
+      const retryHeader = Number(res.headers.get('retry-after'));
+      const wait = Number.isFinite(retryHeader) && retryHeader > 0
+        ? Math.max(SHEETS_UPSTREAM_RETRY_SECONDS, Math.ceil(retryHeader))
+        : SHEETS_UPSTREAM_RETRY_SECONDS;
+      sheetsCooldownUntil = Math.max(sheetsCooldownUntil, Date.now() + wait * 1000);
+      const err = httpError(429, 'Google Sheets per-user read quota exceeded. Search paused without PASS; retry the SAME cursor.');
+      err.retry_after_seconds = wait;
+      throw err;
+    }
+    if (!res.ok) {
+      throw httpError(502, `Google Sheets read failed (HTTP ${res.status}); the check is not complete.`);
+    }
+    const data = await res.json();
+    const values = data.values || [];
+    if (!fresh) setCached(cacheKey, values, cacheSeconds);
+    return values;
+  })();
+  inFlightReads.set(cacheKey, pending);
+  try { return await pending; } finally {
+    if (inFlightReads.get(cacheKey) === pending) inFlightReads.delete(cacheKey);
   }
-  const data = await res.json();
-  const values = data.values || [];
-  if (!fresh) setCached(cacheKey, values, cacheSeconds);
-  return values;
 }
 
 function getSheetId(env) {
