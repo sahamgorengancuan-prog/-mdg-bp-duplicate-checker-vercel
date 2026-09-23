@@ -310,25 +310,21 @@ test('identity conflict beyond five duplicate source rows is detected and previe
   assert.equal(r.body.stats.scanned_candidates,0);
 });
 
-test('manual exhaustive search continues in chunks and finds later similar BP',async()=>{
-  const input={name_1:'Tk Adit',address:'Kp Pasir Kalong RT 001 RW 004 Ds Batujajar Kec Cigudeg'};
-  const f=fixture([
-    row('BP-X','Unrelated One','Completely different sample address and another remote place street'),
-    row('BP-Y','Unrelated Two','Completely different sample address and another remote place street'),
-    row('BP-LATE',input.name_1,input.address+' extraextraextraextraextraextraextra')
-  ],{env:{MAX_CANDIDATES:'1',FULL_SCOPE_CHUNK_ROWS:'1'}});
+test('manual exhaustive search continues across all rows and finds late similar BP',async()=>{
+  const input={name_1:NAME,address:ADDRESS};
+  const unrelated=Array.from({length:9},(_,i)=>row('UNRELATED-'+i,'Unrelated '+i,'Completely different sample address and another remote place street'));
+  const f=fixture([...unrelated,row('BP-LATE',NAME,ADDRESS+' extraextraextraextraextraextraextraextraextra')],{env:{MAX_CANDIDATES:'1',FULL_SCOPE_CHUNK_ROWS:'1'}});
   const fast=await run(f,input);
   assert.equal(fast.body.decision,'INCONCLUSIVE');
   assert.equal(fast.body.full_scope_available,true);
   let r=fast;
-  for(let i=0;i<4 && r.body.full_scope_cursor;i++){
+  for(let i=0;i<12 && r.body.full_scope_cursor;i++){
     r=await run(f,{...input,full_scope_cursor:r.body.full_scope_cursor});
     assert.equal(r.status,200,r.body.error);
   }
   assert.equal(r.body.decision,'FAIL');
   assert.equal(r.body.similarity_match.bp_id,'BP-LATE');
 });
-
 test('manual exhaustive search cannot PASS until every row is checked',async()=>{
   const input={name_1:NAME,address:ADDRESS};
   const f=fixture([
