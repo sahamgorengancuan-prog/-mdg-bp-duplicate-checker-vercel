@@ -394,7 +394,7 @@ def sync_sheet(records,sync_id):
             update_with_retry(lambda start=start,stop=stop,block=block:
                 ws.update(range_name=f"H{start+2}:H{stop+1}",
                           values=block,value_input_option="RAW"))
-        update_with_retry(lambda:ws.update(range_name="H1",
+        update_with_retry(lambda:ws.update(range_name="H1:H1",
                            values=[["row_hash"]],value_input_option="RAW"))
     required=max(100,len(existing)+len(creates)+1)
     if ws.row_count<required:
