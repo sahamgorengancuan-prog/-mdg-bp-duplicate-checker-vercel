@@ -424,9 +424,9 @@ const raw=zlib.gunzipSync(Buffer.from(x.parts.join(''),'base64'));
 if(crypto.createHash('sha256').update(raw).digest('hex')!==x.sha)throw Error('sha');
 const s=await m.buildSnapshotIndex(raw,{{expectedRecords:{len(records)}}});
 const out={{}};
-for(let i=0;i<s.count;i++){{const r=s.record(i);
+for(let i=0;i<s.count;i++){{const r=s.packedRecord(i);
   out[r.bp_id]={{norm:r.norm_text,exact:d.exactNameAddressHash(r.name_1,r.address),ktp:r.ktp,
-    found:s.findKtp(r.ktp).map(x=>x.bp_id)}};}}
+    found:(await s.findKtp(r.ktp)).map(x=>x.bp_id)}};}}
 console.log(JSON.stringify(out));
 """
     got=json.loads(subprocess.run([node,"--input-type=module","-e",script],

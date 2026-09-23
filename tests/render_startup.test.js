@@ -51,6 +51,8 @@ test('Render yarn start boots, serves frontend and API without leaking private f
     assert.match(html, /Normal check not completed\. Retrying the same input in/);
     assert.match(html, /if \(res\.status !== 429\)/);
     assert.match(html, /MAX_WARMING_RETRIES = 12/);
+    assert.match(html, /id="logButton"/);
+    assert.match(html, /id="logDownloadTxt"/);
     const health = await fetch('http://127.0.0.1:' + port + '/api/health');
     const body = await health.json();
     assert.equal(body.engine_version, '2026-09-24-memory-full-scan-v15');
