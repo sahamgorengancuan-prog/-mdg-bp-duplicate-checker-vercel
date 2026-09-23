@@ -2,8 +2,10 @@
 
 The 2026-09-23 initial A build stopped after KTP_INDEX 313,330 and before
 EXACT_INDEX creation with "This document is too large to continue editing".
-A is a PARTIAL STAGING workbook, not READY. CONTROL must remain without a
-published A pointer, and Render must remain GSHEET_SNAPSHOT_MODE=legacy.
+The failed-run workbook must be established from actual SHEET_ID / SHEET_A_ID
+and timestamped logs; the legacy workbook is distinct from new snapshot A.
+CONTROL must not publish an incomplete keyed snapshot; Render remains legacy
+until A is verified and CONTROL points to READY A.
 
 ## What changed
 
@@ -37,7 +39,7 @@ after they are successfully rewritten; BP_DATABASE is never cleared.
    remains too large, inspect A's worksheet rowCount x columnCount values
    with the same local authorized OAuth before another retry. Avoid copying
    company rows or secrets into chat.
-4. Re-run the BAT; it rereads staged BP keys and hashes and keeps unchanged
+4. Re-run the BAT only against the confirmed separate A workbook; it rereads staged BP keys and hashes and keeps unchanged
    BP_DATABASE rows. It rewrites compact derived indexes and publishes CONTROL
    only after all validations. Rerun is NOT currently a checkpoint/resume
    for index rows; previous index batches are read/written again.

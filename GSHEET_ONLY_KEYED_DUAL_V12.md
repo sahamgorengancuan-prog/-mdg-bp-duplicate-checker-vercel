@@ -10,10 +10,10 @@ NOT in Git; it must be an explicit environment value in Windows and Render.
 
 | Purpose | Spreadsheet ID |
 |---|---|
-| Snapshot A | `1ZtNDikRHklwQMYxWQ6hkL1clvdH6g_Xfd3ojr5APDjo` |
+| Snapshot A | `1vll0y7dO4bVTokeLbWctUUKjQvOV33V9TDp9iZfJPhA` |
 | Snapshot B | `13yMsb_Vsi6eXDkau1zouaRi2viOefDkVHmIuK9SHLqk` |
 | CONTROL | `1wnRHX84FXNG3zwoxDofr1dzj1vu6UsN3uo907xt3KJ4` |
-| Legacy initial | Existing `SHEET_ID` from local .env and Render, MUST differ from A/B/CONTROL |
+| Legacy initial | `1ZtNDikRHklwQMYxWQ6hkL1clvdH6g_Xfd3ojr5APDjo` (explicit existing `SHEET_ID` in local .env and Render; NOT a snapshot) |
 
 Do not guess the legacy ID from a DEFAULT_SHEET_ID; the previous hardcoded
 default was equal to A and has been removed. If `SHEET_ID` is missing, the

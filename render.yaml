@@ -20,7 +20,7 @@ services:
       - key: GSHEET_SNAPSHOT_MODE
         value: legacy
       - key: SHEET_A_ID
-        value: 1ZtNDikRHklwQMYxWQ6hkL1clvdH6g_Xfd3ojr5APDjo
+        value: 1vll0y7dO4bVTokeLbWctUUKjQvOV33V9TDp9iZfJPhA
       - key: SHEET_B_ID
         value: 13yMsb_Vsi6eXDkau1zouaRi2viOefDkVHmIuK9SHLqk
       - key: SHEET_CONTROL_ID
