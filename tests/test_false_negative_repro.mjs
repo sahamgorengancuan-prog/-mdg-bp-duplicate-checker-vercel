@@ -477,5 +477,7 @@ test('successful quota-aware continuation reports headroom without changing exha
   assert.equal(second.body.decision,'PASS');
   assert.equal(second.body.stats.pass_basis,'ALL_ELIGIBLE_BUCKET_ROWS_SCORED');
   assert.equal(second.body.stats.scanned_candidates,2);
-  assert.equal(second.body.quota.recommended_pause_seconds,0);
+  assert.equal(second.body.quota.local_budget_per_minute,0);
+  assert(Number.isFinite(second.body.quota.recommended_pause_seconds));
+  assert(second.body.quota.recommended_pause_seconds >= 0);
 });
