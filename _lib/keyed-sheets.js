@@ -17,15 +17,15 @@ const int=x=>Number.isSafeInteger(Number(x))&&Number(x)>=0?Number(x):NaN;
 
 function ready(m){
   const bp=int(m.total_bp_rows),exact=int(m.total_exact_index_rows);
-  if(m.sync_state!=='READY'||m.keyed_index_version!=='13'||
+  if(m.sync_state!=='READY'||m.keyed_index_version!=='14'||
      m.exact_index_version!=='1'||!m.sync_id||bp<1||exact!==bp)
-    throw fail(503,'Keyed Google Sheets v13 snapshot is not READY or index counts differ. No PASS.');
+    throw fail(503,'Keyed Google Sheets v14 paired snapshot is not READY or index counts differ. No PASS.');
   return m;
 }
 function hashKey(env){
   const secret=String(env.GOOGLE_OAUTH_REFRESH_TOKEN||'');
   if(secret.length<16)throw fail(503,'Configured server OAuth required for signed resume.');
-  return createHmac('sha256',secret).update('bp-keyed-gsheet-v13/cursor').digest();
+  return createHmac('sha256',secret).update('bp-keyed-gsheet-v14/cursor').digest();
 }
 function sign(state,env){
   const body=Buffer.from(JSON.stringify(state)).toString('base64url');
@@ -43,7 +43,7 @@ function restore(token,env,meta,queryHash,plan){
   let state;
   try{state=JSON.parse(Buffer.from(pair[0],'base64url').toString('utf8'));}
   catch(_){throw fail(400,'Invalid keyed cursor payload.');}
-  if(state.v!==13||state.engine!==ENGINE_VERSION||state.sync!==meta.sync_id||
+  if(state.v!==14||state.engine!==ENGINE_VERSION||state.sync!==meta.sync_id||
      state.queryHash!==queryHash||state.plan!==plan.signature||
      !Number.isSafeInteger(state.issuedAt)||state.issuedAt>Date.now()+30000||
      Date.now()-state.issuedAt>3600000)
@@ -62,15 +62,23 @@ function restore(token,env,meta,queryHash,plan){
     throw fail(400,'Cursor would skip or repeat BP candidates.');
   return state;
 }
+function packed(row,size,label){
+  if(row.length!==2)throw fail(503,'Incomplete packed '+label+' row. No PASS.');
+  let a;
+  try{a=JSON.parse(String(row[1]||''));}
+  catch{throw fail(503,'Invalid packed '+label+' JSON. No PASS.');}
+  if(!Array.isArray(a)||a.length!==size)
+    throw fail(503,'Invalid packed '+label+' array. No PASS.');
+  return a;
+}
 function ensureIndexedPosting(row,info) {
-  if(row.length<4)throw fail(503,'Incomplete compact BP posting. No PASS.');
-  const [key,norm,position,bp]=row.map(x=>String(x||''));
+  const [norm,position,bp]=packed(row,3,'fuzzy');
   const rowNo=Number(position);
-  if(key!==info.bucket+':'+info.token_count||
-     Math.floor(norm.length/5)!==Number(info.bucket)||
+  if(String(row[0])!==info.bucket+':'+info.token_count||
+     typeof norm!=='string'||Math.floor(norm.length/5)!==Number(info.bucket)||
      tokens(norm).size!==info.token_count||
-     !bp||!Number.isSafeInteger(rowNo)||rowNo<2)
-    throw fail(503,'Keyed compact posting integrity mismatch. No PASS.');
+     !bp||typeof bp!=='string'||!Number.isSafeInteger(rowNo)||rowNo<2)
+    throw fail(503,'Keyed packed posting integrity mismatch. No PASS.');
   return {bpRow:rowNo,norm,bp};
 }
 async function verifiedBp(env,meta,posting) {
@@ -88,8 +96,9 @@ async function verifiedBp(env,meta,posting) {
     norm_text:String(row[4]||''),text_len:Number(row[6])};
 }
 async function readExactBp(env,meta,row,expectedHash){
-  const bpRow=int(row[1]),bp=String(row[2]||'');
-  if(!Number.isSafeInteger(bpRow)||bpRow<2||!bp)
+  const [pointer,bp]=packed(row,2,'exact');
+  const bpRow=int(pointer);
+  if(!Number.isSafeInteger(bpRow)||bpRow<2||typeof bp!=='string'||!bp)
     throw fail(503,'Invalid exact keyed posting. NO PASS.');
   const rows=await getSheetRange(env,'BP_DATABASE!A'+bpRow+':H'+bpRow,meta.sync_id);
   const source=rows[0];
@@ -112,7 +121,7 @@ async function findExact(name,address,env,meta){
   const shard=map.get(hash.slice(0,2));
   if(!shard)return empty;
   const rows=await getSheetRange(env,
-    'EXACT_INDEX!A'+shard.row_start+':C'+shard.row_end,meta.sync_id);
+    'EXACT_INDEX!A'+shard.row_start+':B'+shard.row_end,meta.sync_id);
   if(rows.length!==shard.count)throw fail(503,'Exact shard range incomplete.');
   const pointer=[];
   for(const row of rows){
@@ -122,8 +131,10 @@ async function findExact(name,address,env,meta){
   }
   const matches=[],ids=new Set();
   for(const row of pointer){
-    ids.add(String(row[2]||''));
-    if(matches.length<5&&!matches.some(m=>m.bp_id===String(row[2])))
+    const [,bp]=packed(row,2,'exact');
+    if(typeof bp!=='string'||!bp)throw fail(503,'Invalid packed exact BP ID.');
+    ids.add(bp);
+    if(matches.length<5&&!matches.some(m=>m.bp_id===bp))
       matches.push(await readExactBp(env,meta,row,hash));
   }
   return {matches,count:pointer.length,bpIds:[...ids],diagnostics:{
@@ -136,15 +147,16 @@ async function findKtp(ktp,env,meta){
   const shard=shards.get(ktp.slice(-2).padStart(2,'0'));
   if(!shard)return null;
   const rows=await getSheetRange(env,
-    'KTP_INDEX!A'+shard.row_start+':C'+shard.row_end,meta.sync_id);
+    'KTP_INDEX!A'+shard.row_start+':B'+shard.row_end,meta.sync_id);
   if(rows.length!==shard.count)throw fail(503,'KTP shard incomplete.');
   for(const row of rows){
     if(String(row[0]||'').slice(-2).padStart(2,'0')!==
        ktp.slice(-2).padStart(2,'0'))
       throw fail(503,'KTP shard sorting invalid.');
     if(normalizeDigits(row[0])===ktp){
-      const bpRow=int(row[1]),bp=String(row[2]||'');
-      if(!Number.isSafeInteger(bpRow)||bpRow<2||!bp)
+      const [pointer,bp]=packed(row,2,'KTP');
+      const bpRow=int(pointer);
+      if(!Number.isSafeInteger(bpRow)||bpRow<2||typeof bp!=='string'||!bp)
         throw fail(503,'Invalid KTP keyed posting.');
       const result=await getSheetRange(env,
         'BP_DATABASE!A'+bpRow+':H'+bpRow,meta.sync_id);
@@ -259,7 +271,7 @@ export async function keyedCheck(payload,env,providedMeta=null){
         top_candidates:exact.matches.slice(1).map(x=>sanitizeBpRow(x,100)),
         full_scope_available:false,full_scope_cursor:null,
         stats:{coverage_complete:true,scanned_candidates:0,
-          search_scope:'KEYED_GOOGLE_SHEETS_V12',elapsed_ms:Date.now()-started}};
+          search_scope:'KEYED_GOOGLE_SHEETS_V14',elapsed_ms:Date.now()-started}};
     }
     if(qtext.length<3){
       return {ok:true,decision:ktp?'PASS':'INCONCLUSIVE',
@@ -269,14 +281,14 @@ export async function keyedCheck(payload,env,providedMeta=null){
         exact_lookup:exact.diagnostics,full_scope_cursor:null,
         full_scope_available:false,top_candidates:[],
         stats:{coverage_complete:Boolean(ktp),scanned_candidates:0,
-          search_scope:'KEYED_GOOGLE_SHEETS_V12',elapsed_ms:Date.now()-started}};
+          search_scope:'KEYED_GOOGLE_SHEETS_V14',elapsed_ms:Date.now()-started}};
     }
   }
   if(qtext.length<3)throw fail(400,'Full Scope needs sufficient text.');
   const plan=await makePlan(env,m,qtext,threshold,direct,weights);
   const state=payload?.full_scope_cursor
     ?restore(payload.full_scope_cursor,env,m,fp,plan)
-    :{v:13,engine:ENGINE_VERSION,sync:m.sync_id,queryHash:fp,
+    :{v:14,engine:ENGINE_VERSION,sync:m.sync_id,queryHash:fp,
        plan:plan.signature,pos:0,next:plan.ordered.length
          ?plan.map.get(plan.ordered[0]).row_start:0,
        scanned:0,compared:0,issuedAt:Date.now()};
@@ -291,7 +303,7 @@ export async function keyedCheck(payload,env,providedMeta=null){
     let rows;
     try{
       rows=await getSheetRange(env,
-        'INDEX_LEN_TOKEN!A'+state.next+':D'+last,m.sync_id);
+        'INDEX_LEN_TOKEN!A'+state.next+':B'+last,m.sync_id);
     }catch(e){
       // A previously completed range can never be silently recounted or PASS.
       if(e?.status!==429||processed===0)throw e;
@@ -322,7 +334,7 @@ export async function keyedCheck(payload,env,providedMeta=null){
     compared_candidates:state.compared,candidate_space:plan.candidateSpace,
     safely_pruned_candidates:plan.pruned,
     coverage_complete:complete,score_bound_index_used:true,
-    search_scope:'KEYED_GOOGLE_SHEETS_V12',
+    search_scope:'KEYED_GOOGLE_SHEETS_V14',
     pass_basis:complete?'ALL_RELEVANT_INDEXED_BP_ROWS_SCORED_OR_SAFELY_PRUNED':null,
     elapsed_ms:Date.now()-started};
   if(matched){

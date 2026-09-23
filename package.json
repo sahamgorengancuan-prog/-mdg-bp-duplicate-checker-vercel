@@ -3,7 +3,7 @@
   "version": "1.0.0",
   "private": true,
   "type": "module",
-  "description": "MDG BP duplicate checker: OAuth Google Sheets A/B snapshots with keyed incremental BP and compact precomputed indexes.",
+  "description": "MDG BP duplicate checker: OAuth A/A2 and B/B2 paired Sheets, packed two-column indexed search with fail-closed cutover.",
   "engines": {
     "node": ">=20"
   },

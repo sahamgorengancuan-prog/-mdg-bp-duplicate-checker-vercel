@@ -12,7 +12,7 @@ const SNAPSHOT_WORKBOOKS=JSON.parse(readFileSync(new URL('../config/gsheet_snaps
   Browser never receives OAuth credential, refresh token, or raw database dump.
 */
 
-export const ENGINE_VERSION = '2026-09-23-gsheet-dual-v13-compact';
+export const ENGINE_VERSION = '2026-09-23-gsheet-dual-v14-paired-packed';
 const GOOGLE_TOKEN_URL = 'https://oauth2.googleapis.com/token';
 const TOKEN_TTL_SAFETY_SECONDS = 90;
 
@@ -80,35 +80,44 @@ let tokenCache = { token: null, exp: 0 };
 function dualIds(env) {
   const a=String(env.SHEET_A_ID||SNAPSHOT_WORKBOOKS.sheet_a_id||'').trim();
   const b=String(env.SHEET_B_ID||SNAPSHOT_WORKBOOKS.sheet_b_id||'').trim();
+  const a2=String(env.SHEET_A2_ID||SNAPSHOT_WORKBOOKS.sheet_a2_id||'').trim();
+  const b2=String(env.SHEET_B2_ID||SNAPSHOT_WORKBOOKS.sheet_b2_id||'').trim();
   const c=String(env.SHEET_CONTROL_ID||SNAPSHOT_WORKBOOKS.sheet_control_id||'').trim();
-  // Never accept the old hardcoded DEFAULT_SHEET_ID as evidence of the
-  // user's distinct initial workbook. SHEET_ID must be explicit on Render.
   const legacy=String(env.SHEET_ID||'').trim();
-  if(!a||!b||!c||!legacy||new Set([a,b,c,legacy]).size!==4)
-    throw httpError(503,'Set explicit legacy SHEET_ID and three DISTINCT A/B/CONTROL workbook IDs.');
-  return {a,b,c};
+  if(!a||!b||!a2||!b2||!c||!legacy||
+     new Set([a,b,a2,b2,c,legacy]).size!==6)
+    throw httpError(503,'Configure SIX distinct OAuth-accessible legacy/A/A2/B/B2/CONTROL workbooks. No partial fallback.');
+  return {a,b,a2,b2,c};
 }
 async function readDualControl(env) {
   const ids=dualIds(env);
   const rows=await getSheetRange({...env,SHEET_ID:ids.c},'ACTIVE!A1:B20','',true);
   const out={};
   for(const row of rows) if(row[0])out[String(row[0])]=String(row[1]||'');
-  if(out.sync_state!=='READY'||!out.sync_id||
-      ![ids.a,ids.b].includes(out.active_sheet_id)||
+  const expected=out.active_sheet_id===ids.a?ids.a2:
+                 out.active_sheet_id===ids.b?ids.b2:'';
+  if(out.sync_state!=='READY'||!out.sync_id||!expected||
+      out.active_index_sheet_id!==expected||
       !/^[a-f0-9]{64}$/.test(out.source_digest||'')||
       !Number.isSafeInteger(Number(out.total_bp_rows))||Number(out.total_bp_rows)<1)
-    throw httpError(503,'Dual control ACTIVE pointer is not READY. Keep legacy mode until first staging sync is published.');
+    throw httpError(503,'Primary/index CONTROL pair not READY or mismatched. No decision issued.');
   return out;
 }
 async function readDualSnapshot(env) {
   const control=await readDualControl(env);
-  const scopedEnv={...env,SHEET_ID:control.active_sheet_id};
-  const meta=await getMeta(scopedEnv);
-  if(meta.sync_state!=='READY'||meta.sync_id!==control.sync_id||
-      meta.source_digest!==control.source_digest||
-      meta.total_bp_rows!==control.total_bp_rows||
-      meta.keyed_index_version!=='13')
-    throw httpError(503,'Active Google Sheets snapshot META/control mismatch. No PASS.');
+  const scopedEnv={...env,SHEET_ID:control.active_sheet_id,
+                   INDEX_SHEET_ID:control.active_index_sheet_id};
+  const [meta,indexMeta]=await Promise.all([
+    getMeta(scopedEnv),
+    getMeta({...scopedEnv,SHEET_ID:control.active_index_sheet_id,INDEX_SHEET_ID:''})
+  ]);
+  for(const m of [meta,indexMeta]){
+    if(m.sync_state!=='READY'||m.sync_id!==control.sync_id||
+       m.source_digest!==control.source_digest||
+       m.total_bp_rows!==control.total_bp_rows||
+       m.keyed_index_version!=='14')
+      throw httpError(503,'Primary/index META differs from committed CONTROL. No PASS.');
+  }
   return {control,scopedEnv,meta};
 }
 
@@ -126,6 +135,7 @@ export async function handleCheck(context) {
       result=await (await import('./keyed-sheets.js')).keyedCheck(payload,scopedEnv,meta);
       const current=await readDualControl(context.env);
       if(current.active_sheet_id!==control.active_sheet_id||
+          current.active_index_sheet_id!==control.active_index_sheet_id||
          current.sync_id!==control.sync_id||
          current.source_digest!==control.source_digest)
         throw httpError(503,'Active Google Sheets generation changed during check. No decision issued; retry.');
@@ -234,7 +244,12 @@ export function configStatus(env) {
     using_default_sheet_id: false,
     snapshot_ids_from_repo: true,
     snapshot_mode: String(env.GSHEET_SNAPSHOT_MODE || 'legacy').toLowerCase(),
-    dual_snapshot_configured: Boolean(SNAPSHOT_WORKBOOKS.sheet_a_id && SNAPSHOT_WORKBOOKS.sheet_b_id && SNAPSHOT_WORKBOOKS.sheet_control_id),
+    dual_snapshot_configured: Boolean(
+      (env.SHEET_A_ID||SNAPSHOT_WORKBOOKS.sheet_a_id)&&
+      (env.SHEET_B_ID||SNAPSHOT_WORKBOOKS.sheet_b_id)&&
+      (env.SHEET_A2_ID||SNAPSHOT_WORKBOOKS.sheet_a2_id)&&
+      (env.SHEET_B2_ID||SNAPSHOT_WORKBOOKS.sheet_b2_id)&&
+      (env.SHEET_CONTROL_ID||SNAPSHOT_WORKBOOKS.sheet_control_id)),
     similarity_threshold: Number(env.SIMILARITY_THRESHOLD || DEFAULT_SIMILARITY_THRESHOLD),
     similarity_direct_reject_threshold: getSimilarityDirectRejectThreshold(env),
     max_candidates: Number(env.MAX_CANDIDATES || DEFAULT_MAX_CANDIDATES),
@@ -943,7 +958,7 @@ export async function getMeta(env) {
 export async function getIndexMap(env, tabName, type, meta) {
   const sync = String(meta.sync_id || '');
   if (!sync) throw httpError(503, 'META sync_id missing. Run a full sync.');
-  const cacheKey = `index:${getSheetId(env)}:${sync}:${tabName}`;
+  const cacheKey = `index:${env.INDEX_SHEET_ID||getSheetId(env)}:${sync}:${tabName}`;
   const cached = getCached(cacheKey);
   if (cached) return cached;
   const rows = await getSheetRange(env, `${tabName}!A2:E10000`, sync);
@@ -1077,8 +1092,10 @@ async function getSearchIndexMap(env, meta, lenIndex) {
 
 export async function getSheetRange(env, rangeA1, syncId = '', fresh = false) {
   const cacheSeconds = Number(env.RANGE_CACHE_SECONDS || DEFAULT_RANGE_CACHE_SECONDS);
-  const sheetId = getSheetId(env);
-  if (!sheetId) throw httpError(500, 'SHEET_ID is not configured.');
+  const indexTab=/^(INDEX_LEN_TOKEN|INDEX_LEN|KTP_INDEX|EXACT_INDEX|INDEX_EXACT_SHARD|INDEX_KTP_SHARD)!/.test(rangeA1);
+  const sheetId=indexTab&&env.INDEX_SHEET_ID
+    ? String(env.INDEX_SHEET_ID).trim():getSheetId(env);
+  if (!sheetId) throw httpError(503, 'Primary/index SHEET_ID is not configured.');
   const cacheKey = `range:${sheetId}:${syncId}:${rangeA1}`;
   const cached = fresh ? null : getCached(cacheKey);
   if (cached) return cached;

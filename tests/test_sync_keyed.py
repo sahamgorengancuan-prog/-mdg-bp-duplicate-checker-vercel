@@ -1,5 +1,6 @@
 """Google Sheets-only A/B keyed sync, proven OAuth, no private PostgreSQL."""
 import importlib
+import json
 from pathlib import Path
 import re
 import sys
@@ -87,13 +88,14 @@ class FakeBook:
 
 class FakeGC:
     def __init__(self):
-        self.books={x:FakeBook(x) for x in ("A","B","CONTROL")}
+        self.books={x:FakeBook(x) for x in ("A","B","A2","B2","CONTROL")}
     def open_by_key(self,key):return self.books[key]
 
 def configured(monkeypatch):
     gc=FakeGC()
     for key,value in {
         "GSHEET_SNAPSHOT_MODE":"dual","SHEET_A_ID":"A","SHEET_B_ID":"B",
+        "SHEET_A2_ID":"A2","SHEET_B2_ID":"B2",
         "SHEET_CONTROL_ID":"CONTROL","SHEET_ID":"LEGACY",
         "PRIVATE_INDEX_MODE":"off","GSHEET_WRITE_SLEEP_SECONDS":"0",
         "GSHEET_READ_BATCH_SLEEP_SECONDS":"0"}.items():
@@ -123,7 +125,7 @@ def test_dual_ids_fails_before_writing(monkeypatch):
     monkeypatch.setenv("SHEET_A_ID","A")
     monkeypatch.setenv("SHEET_B_ID","A")
     monkeypatch.setenv("SHEET_CONTROL_ID","C")
-    with pytest.raises(ValueError,match='FOUR DISTINCT'):
+    with pytest.raises(ValueError,match='SIX DISTINCT'):
         keyed.snapshot_ids()
 
 def test_index_postings_use_stable_bp_key_and_source_hash():
@@ -135,15 +137,15 @@ def test_index_postings_use_stable_bp_key_and_source_hash():
     assert n_ktp==2 and n_groups>=1
     assert len(tabs['INDEX_LEN_TOKEN'])==3
     for row in tabs['INDEX_LEN_TOKEN'][1:]:
-        assert len(row)==4
-        assert row[3] in records
-        assert row[1]==records[row[3]]['norm_text']
-        assert row[0]==records[row[3]]['len_bucket']+':'+str(
-            records[row[3]]['token_count'])
-    assert all(len(row)==3 for row in tabs['EXACT_INDEX'][1:])
-    assert all(len(row)==3 for row in tabs['KTP_INDEX'][1:])
-    assert {row[2] for row in tabs['EXACT_INDEX'][1:]}==set(records)
-    assert {row[2] for row in tabs['KTP_INDEX'][1:]}==set(records)
+        assert len(row)==2
+        norm,rownum,bp=json.loads(row[1])
+        assert bp in records and rownum in (2,17)
+        assert norm==records[bp]['norm_text']
+        assert row[0]==records[bp]['len_bucket']+':'+str(records[bp]['token_count'])
+    assert all(len(row)==2 for row in tabs['EXACT_INDEX'][1:])
+    assert all(len(row)==2 for row in tabs['KTP_INDEX'][1:])
+    assert {json.loads(row[1])[1] for row in tabs['EXACT_INDEX'][1:]}==set(records)
+    assert {json.loads(row[1])[1] for row in tabs['KTP_INDEX'][1:]}==set(records)
 
 def test_initial_then_keyed_update_preserves_active_snapshot(monkeypatch):
     gc=configured(monkeypatch)
@@ -154,6 +156,9 @@ def test_initial_then_keyed_update_preserves_active_snapshot(monkeypatch):
     assert first['appended']==2
     control=gc.books['CONTROL'].worksheet('ACTIVE')
     assert dict(control.get("A1:B20")[1:])['active_sheet_id']=='A'
+    assert dict(control.get("A1:B20")[1:])['active_index_sheet_id']=='A2'
+    assert "INDEX_LEN_TOKEN" in gc.books["A2"].sheets
+    assert "INDEX_LEN_TOKEN" not in gc.books["A"].sheets
     initial_a=[r[:] for r in gc.books['A'].worksheet('BP_DATABASE').rows]
     noop=keyed.sync_sheet(base,'unused-generation')
     assert noop['sync_id']=='generation-A'
@@ -165,6 +170,7 @@ def test_initial_then_keyed_update_preserves_active_snapshot(monkeypatch):
     assert second['appended']==3  # B is an empty standby for its first build
     assert gc.books['A'].worksheet('BP_DATABASE').rows==initial_a
     assert dict(control.get("A1:B20")[1:])['active_sheet_id']=='B'
+    assert dict(control.get("A1:B20")[1:])['active_index_sheet_id']=='B2'
     latest=keyed.make_records(data([
         ['BP-A','ZB02','Alpha New','Street 10','1234'],
         ['BP-B','ZB02','Beta New','Street 12','5678'],
@@ -176,7 +182,11 @@ def test_initial_then_keyed_update_preserves_active_snapshot(monkeypatch):
     assert 'A2:H2' in ws_a.writes and 'A3:H3' in ws_a.writes
     assert dict(control.get("A1:B20")[1:])['sync_id']=='generation-C'
     assert dict(control.get("A1:B20")[1:])['active_sheet_id']=='A'
+    assert dict(control.get("A1:B20")[1:])['active_index_sheet_id']=='A2'
+    assert "INDEX_LEN_TOKEN" in gc.books["A2"].sheets
+    assert "INDEX_LEN_TOKEN" not in gc.books["A"].sheets
     assert gc.books['B'].worksheet('META').get("A1:B20")[0]==['key','value']
+    assert gc.books['B2'].worksheet('META').get("A1:B20")[0]==['key','value']
 
 def test_failed_staging_never_changes_active_pointer(monkeypatch):
     gc=configured(monkeypatch)
@@ -185,8 +195,8 @@ def test_failed_staging_never_changes_active_pointer(monkeypatch):
     keyed.sync_sheet(original,'original')
     active=gc.books['CONTROL'].worksheet('ACTIVE')
     expected=[row[:] for row in active.rows]
-    standby=gc.books['B']
-    standby.add_worksheet("INDEX_LEN_TOKEN",rows=100,cols=6).fail=True
+    standby=gc.books['B2']
+    standby.add_worksheet("INDEX_LEN_TOKEN",rows=100,cols=2).fail=True
     revised=keyed.make_records(data([
         ['BP-A','ZB02','Alpha changed','Street 10','1234']]))
     with pytest.raises(RuntimeError,match='simulated staging'):
@@ -201,7 +211,7 @@ def test_proven_oauth_bat_and_no_private_database():
     assert 'pause' in bat.lower()
     assert 'taskkill' not in bat.lower()
     assert 'private PostgreSQL search index' not in bat
-    assert 'KEYED_V13_COMPACT' in (ROOT/'scripts'/'sync_bp_keyed.py').read_text()
+    assert 'KEYED_V14_SHARDED' in (ROOT/'scripts'/'sync_bp_keyed.py').read_text()
     code=(ROOT/'scripts'/'sync_bp_keyed.py').read_text()
     assert 'sync_private(' not in code
     assert 'PRIVATE_INDEX_DATABASE_URL' not in code
@@ -213,12 +223,14 @@ def test_new_A_B_CONTROL_are_distinct_from_legacy_and_first_build_is_A(monkeypat
     gc=configured(monkeypatch)
     legacy=keyed.snapshot_ids()
     assert (legacy["SHEET_A_ID"],legacy["SHEET_B_ID"],
-            legacy["SHEET_CONTROL_ID"])==("A","B","CONTROL")
+            legacy["SHEET_A2_ID"],legacy["SHEET_B2_ID"],
+            legacy["SHEET_CONTROL_ID"])==("A","B","A2","B2","CONTROL")
     source=keyed.make_records(data([
         ['BP-X','ZB02','New Person','Street 22','1234']]))
     first=keyed.sync_sheet(source,"first-A")
     assert first["sync_id"]=="first-A"
     assert gc.books["B"].sheets=={}
+    assert gc.books["B2"].sheets=={}
     control=dict(gc.books["CONTROL"].worksheet("ACTIVE").get("A1:B20")[1:])
     assert control["active_sheet_id"]=="A"
     assert keyed.sync_sheet(source,"no-changes")["sync_id"]=="first-A"
@@ -232,9 +244,9 @@ def test_new_A_B_CONTROL_are_distinct_from_legacy_and_first_build_is_A(monkeypat
 
 def test_legacy_cannot_equal_any_snapshot_workbook(monkeypatch):
     configured(monkeypatch)
-    for legacy in ("A","B","CONTROL"):
+    for legacy in ("A","B","A2","B2","CONTROL"):
         monkeypatch.setenv("SHEET_ID",legacy)
-        with pytest.raises(ValueError,match="FOUR DISTINCT"):
+        with pytest.raises(ValueError,match="SIX DISTINCT"):
             keyed.snapshot_ids()
     monkeypatch.delenv("SHEET_ID")
     with pytest.raises(ValueError,match="explicitly identify"):
@@ -242,7 +254,7 @@ def test_legacy_cannot_equal_any_snapshot_workbook(monkeypatch):
 
 
 def test_git_snapshot_ids_are_loaded_when_env_does_not_override(monkeypatch):
-    for key in ("SHEET_A_ID","SHEET_B_ID","SHEET_CONTROL_ID"):
+    for key in ("SHEET_A_ID","SHEET_B_ID","SHEET_A2_ID","SHEET_B2_ID","SHEET_CONTROL_ID"):
         monkeypatch.delenv(key,raising=False)
     monkeypatch.setenv("SHEET_ID","different-legacy-workbook")
     monkeypatch.setenv("GSHEET_SNAPSHOT_MODE","dual")
@@ -250,5 +262,31 @@ def test_git_snapshot_ids_are_loaded_when_env_does_not_override(monkeypatch):
     assert ids=={
         "SHEET_A_ID":"1vll0y7dO4bVTokeLbWctUUKjQvOV33V9TDp9iZfJPhA",
         "SHEET_B_ID":"13yMsb_Vsi6eXDkau1zouaRi2viOefDkVHmIuK9SHLqk",
+        "SHEET_A2_ID":"","SHEET_B2_ID":"",
         "SHEET_CONTROL_ID":"1wnRHX84FXNG3zwoxDofr1dzj1vu6UsN3uo907xt3KJ4",
     }
+
+def test_two_book_capacity_guard_and_pair_fail_closed(monkeypatch):
+    gc=configured(monkeypatch)
+    src=keyed.make_records(data([['BP-1','ZB02','A','B','123']]))
+    old=gc.books['A'].add_worksheet('BP_DATABASE',rows=100,cols=8)
+    old.rows=[keyed.COLUMNS[:],keyed.sheet_row(src['BP-1'])]
+    result=keyed.sync_sheet(src,'first-B')
+    assert result['sync_id']=='first-B'
+    control=dict(gc.books['CONTROL'].worksheet('ACTIVE').get("A1:B20")[1:])
+    assert control['active_sheet_id']=='B'
+    assert control['active_index_sheet_id']=='B2'
+    assert len(old.rows)==2
+    gc.books['A'].add_worksheet('EXCESS',rows=100,cols=2).row_count=8000000
+    newer=keyed.make_records(data([['BP-1','ZB02','Changed','B','123']]))
+    with pytest.raises(ValueError,match='75% guard'):
+        keyed.sync_sheet(newer,'blocked-A')
+    assert dict(gc.books['CONTROL'].worksheet('ACTIVE').get("A1:B20")[1:])==control
+
+def test_new_index_book_is_not_published_if_metadata_write_fails(monkeypatch):
+    gc=configured(monkeypatch)
+    gc.books['A2'].add_worksheet('META',100,2).fail=True
+    data0=keyed.make_records(data([['BP-1','ZB02','A','B','123']]))
+    with pytest.raises(RuntimeError,match='simulated staging'):
+        keyed.sync_sheet(data0,'fail-secondary-meta')
+    assert gc.books['CONTROL'].sheets=={}

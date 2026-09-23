@@ -104,11 +104,12 @@ def build_index_rows(records, positions, sync_id):
             raise ValueError("Missing stable BP row position; no index may publish.")
         source.append((rec,position))
     source.sort(key=lambda t:(t[0]["len_bucket"],t[0]["token_count"],t[0]["bp_id"]))
-    # Compact four-column postings: stable group + normalized text + physical
-    # row navigation + immutable BP key. The reader verifies BP ID and text
-    # against BP_DATABASE on a match, rather than storing duplicate row_hash.
+    # Two-cell posting: searchable group and compact JSON array.
+    # Array stores only text, physical row hint and stable BP ID.
     fuzzy=[[rec["len_bucket"]+":"+str(rec["token_count"]),
-            rec["norm_text"],str(row),rec["bp_id"]] for rec,row in source]
+            json.dumps([rec["norm_text"],row,rec["bp_id"]],
+                       ensure_ascii=False,separators=(",",":"))]
+           for rec,row in source]
     groups=[]
     for index,(rec,row) in enumerate(source):
         key=rec["len_bucket"]+":"+str(rec["token_count"])
@@ -117,10 +118,12 @@ def build_index_rows(records, positions, sync_id):
             groups[-1][3]=str(int(groups[-1][3])+1)
         else: groups.append([key,str(index+2),str(index+2),"1",sync_id])
     exact=sorted(
-        [[rec["exact_hash"],str(row),rec["bp_id"]]
+        [[rec["exact_hash"],json.dumps([row,rec["bp_id"]],
+                                    ensure_ascii=False,separators=(",",":"))]
          for rec,row in source],key=lambda x:(x[0],x[2]))
     ktp=sorted(
-        [[rec["ktp_number"],str(row),rec["bp_id"]]
+        [[rec["ktp_number"],json.dumps([row,rec["bp_id"]],
+                                    ensure_ascii=False,separators=(",",":"))]
          for rec,row in source if rec["ktp_number"]],
         key=lambda x:(x[0][-2:],x[0],x[2]))
     def shards(items,keyer):
@@ -135,11 +138,11 @@ def build_index_rows(records, positions, sync_id):
     exact_shards=shards(exact,lambda x:x[0][:2])
     ktp_shards=shards(ktp,lambda x:x[0][-2:].zfill(2))
     tabs={
-      "INDEX_LEN_TOKEN":[["len_token_key","norm_text","bp_db_row","bp_id"]]+fuzzy,
+      "INDEX_LEN_TOKEN":[["len_token_key","posting_json"]]+fuzzy,
       "INDEX_LEN":[["len_token_key","row_start","row_end","count","sync_id"]]+groups,
-      "KTP_INDEX":[["ktp_digits","bp_db_row","bp_id"]]+ktp,
+      "KTP_INDEX":[["ktp_digits","posting_json"]]+ktp,
       "INDEX_KTP_SHARD":[["ktp_shard","row_start","row_end","count","sync_id"]]+ktp_shards,
-      "EXACT_INDEX":[["exact_hash","bp_db_row","bp_id"]]+exact,
+      "EXACT_INDEX":[["exact_hash","posting_json"]]+exact,
       "INDEX_EXACT_SHARD":[["exact_shard","row_start","row_end","count","sync_id"]]+exact_shards
     }
     assert sum(int(x[3]) for x in groups)==len(records)
@@ -155,45 +158,51 @@ def make_meta(sync_id,bp_count,ktp_count,group_count,state):
         ["total_ktp_index_rows",str(ktp_count)],
         ["total_exact_index_rows",str(bp_count)],
         ["exact_index_version","1"],
-        ["keyed_index_version","13"],
+        ["keyed_index_version","14"],
         ["token_index_version","1"],
         ["token_index_groups",str(group_count)],
         ["sync_state",state],
         ["source","PostgreSQL MDG -> protected keyed Google Sheets"],
-        ["schema","KEYED_V13_COMPACT:BP_DATABASE:A:H; INDEX_LEN_TOKEN:A:D; KTP_INDEX:A:C; EXACT_INDEX:A:C"]
+        ["schema","KEYED_V14_SHARDED:BP_DATABASE:A:H primary; PACKED_INDEXES:A:B secondary"]
     ]
     return [["key","value"]]+data
 
-def preflight_capacity(sh,plans,new_bp_rows):
+def preflight_capacity(sh,plans,new_bp_rows,role):
+    """Fail closed above 75% of the conservative 10M grid-cell ceiling, per book.
+
+    This checks ALLOCATED cells, not only populated cells; Google's additional
+    document-size limits can still refuse editing below the allocation cap.
+    """
     metadata=sh.fetch_sheet_metadata().get("sheets",[])
     existing={s["properties"]["title"]:s["properties"].get("gridProperties",{})
         for s in metadata}
     result=0
+    current=0
     for title,grid in existing.items():
+        allocated=int(grid.get("rowCount",0))*int(grid.get("columnCount",0))
+        current+=allocated
         if title in plans:
             rows=plans[title]
-            # Google allocates grid cells, not just populated cells.
             result+=max(len(rows),100)*len(rows[0])
         elif title=="BP_DATABASE":
             result+=max(new_bp_rows,int(grid.get("rowCount",0)))*8
         else:
-            result+=int(grid.get("rowCount",0))*int(grid.get("columnCount",0))
+            result+=allocated
+        logging.info("%s allocated %s: %s rows x %s cols = %s cells",
+                     role,title,grid.get("rowCount",0),
+                     grid.get("columnCount",0),f"{allocated:,}")
     for title,rows in plans.items():
         if title not in existing:
             result+=max(len(rows),100)*len(rows[0])
-    # Headroom prevents a failed add_worksheet near a legacy 10M-cell cap.
-    # Some Google Workspace domains may already have the 20M-cell rollout;
-    # only raise this deliberately after verifying that workbook's entitlement.
-    limit=int(os.getenv("GSHEET_MAX_CELLS","9500000"))
-    for title,grid in existing.items():
-        logging.info("Google allocated grid %s: %s rows x %s columns = %s cells",
-                     title,grid.get("rowCount",0),grid.get("columnCount",0),
-                     int(grid.get("rowCount",0))*int(grid.get("columnCount",0)))
-    logging.info("Preflight COMPACT expected allocated cells: %s / %s",
-                 f"{result:,}",f"{limit:,}")
-    if result>limit:raise ValueError(
-        f"Google Sheets cell capacity {result:,}>{limit:,}; no BP writes attempted."
-    )
+    limit=7500000
+    logging.info("%s capacity preflight: current=%s projected=%s hard_guard=%s",
+                 role,f"{current:,}",f"{result:,}",f"{limit:,}")
+    if current>limit or result>limit:
+        raise ValueError(
+            f"{role} workbook capacity current={current:,} projected="
+            f"{result:,} exceeds strict 75% guard {limit:,}. "
+            "Do not raise the limit or publish partial snapshots.")
+    return {"current":current,"projected":result,"limit":limit}
 
 def write_index(sh,title,rows):
     try:ws=sh.worksheet(title)
@@ -209,17 +218,22 @@ def write_index(sh,title,rows):
     for start in range(0,len(rows),INDEX_WRITE_BATCH):
         block=rows[start:start+INDEX_WRITE_BATCH]
         a,b=start+1,start+len(block)
-        update_with_retry(lambda a=a,b=b,block=block:ws.update(
-            range_name=f"A{a}:{col}{b}",
-            values=block,value_input_option="RAW"))
-        # Verify every index row, not just the tail. A partially accepted API
-        # write must not result in a READY index and false PASS.
+        # Resume failed staging efficiently: if a complete block is already
+        # identical, its readback serves as verification (no duplicate write).
         actual=update_with_retry(lambda a=a,b=b:
             ws.get(f"A{a}:{col}{b}"))
         if actual!=block:
-            raise RuntimeError(
-                f"{title} read-back mismatch at {a}:{b}. No publish.")
-        logging.info("%s verified index rows %s-%s",title,f"{a:,}",f"{b:,}")
+            update_with_retry(lambda a=a,b=b,block=block:ws.update(
+                range_name=f"A{a}:{col}{b}",
+                values=block,value_input_option="RAW"))
+            actual=update_with_retry(lambda a=a,b=b:
+                ws.get(f"A{a}:{col}{b}"))
+            if actual!=block:
+                raise RuntimeError(
+                    f"{title} read-back mismatch at {a}:{b}. No publish.")
+            logging.info("%s WRITTEN+VERIFIED rows %s-%s",title,f"{a:,}",f"{b:,}")
+        else:
+            logging.info("%s REUSED+VERIFIED rows %s-%s",title,f"{a:,}",f"{b:,}")
         time.sleep(float(os.getenv("GSHEET_WRITE_SLEEP_SECONDS","0.2")))
     # Shrink obsolete *index tail* only, never BP_DATABASE physical rows.
     if ws.row_count!=need or ws.col_count!=len(rows[0]):
@@ -264,16 +278,18 @@ def snapshot_ids():
     if mode!="dual":
         raise ValueError("GSHEET_SNAPSHOT_MODE=dual is required for keyed A/B sync.")
     names={"SHEET_A_ID":"sheet_a_id","SHEET_B_ID":"sheet_b_id",
+           "SHEET_A2_ID":"sheet_a2_id","SHEET_B2_ID":"sheet_b2_id",
            "SHEET_CONTROL_ID":"sheet_control_id"}
     ids={key:os.getenv(key,config.get(field,"")).strip()
          for key,field in names.items()}
     legacy=os.getenv("SHEET_ID","").strip()
     if not legacy:
         raise ValueError("SHEET_ID must explicitly identify the DIFFERENT legacy/initial sheet in .env. No writes.")
-    if (not all(ids.values()) or len(set(ids.values()))!=3 or
+    if (not all(ids.values()) or len(set(ids.values()))!=5 or
         legacy in ids.values()):
         raise ValueError(
-            "A, B, CONTROL and legacy SHEET_ID must be FOUR DISTINCT workbooks. No writes."
+            "A/A2, B/B2, CONTROL and legacy SHEET_ID must be SIX DISTINCT workbooks. "
+            "Create the two authorized index workbooks before syncing; no writes."
         )
     if os.getenv("PRIVATE_INDEX_MODE","off").lower()=="required":
         raise ValueError("PRIVATE_INDEX_MODE=required is incompatible with Sheets-only dual mode.")
@@ -316,32 +332,55 @@ def sync_sheet(records,sync_id):
     control=gc.open_by_key(ids["SHEET_CONTROL_ID"])
     active=control_active(control)
     active_id=active.get("active_sheet_id","")
+    book_pairs={
+        ids["SHEET_A_ID"]:ids["SHEET_A2_ID"],
+        ids["SHEET_B_ID"]:ids["SHEET_B2_ID"]}
     if active_id and (active.get("sync_state")!="READY" or
-                      active_id not in (ids["SHEET_A_ID"],ids["SHEET_B_ID"])):
-        raise ValueError("Invalid committed control pointer: refusing unsafe fallback.")
+                      active_id not in book_pairs or
+                      active.get("active_index_sheet_id")!=book_pairs[active_id]):
+        raise ValueError("Invalid committed PRIMARY+INDEX control pair; no fallback.")
     digest=source_digest(records)
     if active_id:
         live=gc.open_by_key(active_id)
         live_meta=read_meta(live)
-        if (live_meta.get("sync_state")!="READY" or
-            live_meta.get("sync_id")!=active.get("sync_id") or
-            live_meta.get("source_digest")!=active.get("source_digest") or
-            live_meta.get("total_bp_rows")!=active.get("total_bp_rows")):
-            raise ValueError("Active snapshot META does not match control pointer.")
+        index_live=gc.open_by_key(book_pairs[active_id])
+        live_index_meta=read_meta(index_live)
+        if any(
+            m.get("sync_state")!="READY" or
+            m.get("sync_id")!=active.get("sync_id") or
+            m.get("source_digest")!=active.get("source_digest") or
+            m.get("total_bp_rows")!=active.get("total_bp_rows") or
+            m.get("keyed_index_version")!="14"
+            for m in (live_meta,live_index_meta)
+        ):
+            raise ValueError("Active primary/index META does not match control.")
         if active["source_digest"]==digest and int(active["total_bp_rows"])==len(records):
             logging.info("NOOP: no changes to source BP keys/hashes. Active snapshot remains %s",
                          active["sync_id"])
             return {"updated":0,"appended":0,"tombstoned":0,
                     "unchanged":len(records),"sync_id":active["sync_id"]}
-    # All three A/B/CONTROL workbooks are distinct from the legacy sheet.
-    # The first build is always A; legacy remains untouched until cutover.
+    # A already contains a failed oversized v12/v13 staging run. Initial
+    # publication uses fresh B+B2 instead of attempting to edit that document.
+    # A/A2 can only be reused after B is active and A has been remediated.
     stage_id=(ids["SHEET_B_ID"] if active_id==ids["SHEET_A_ID"]
               else ids["SHEET_A_ID"])
+    if not active_id:
+        a=gc.open_by_key(ids["SHEET_A_ID"])
+        try:
+            prior_a=a.worksheet("BP_DATABASE")
+            if prior_a.row_values(1):
+                stage_id=ids["SHEET_B_ID"]
+                logging.warning("Existing unpublished A staging detected; initial "
+                                "publication goes to fresh B+B2. A untouched.")
+        except Exception as exc:
+            if exc.__class__.__name__!="WorksheetNotFound":raise
+    stage_index_id=book_pairs[stage_id]
     logging.info("Dual snapshot: ACTIVE=%s STAGING=%s (OAuth-controlled IDs)",
                  "A" if active_id==ids["SHEET_A_ID"] else
                  "B" if active_id else "LEGACY",
                  "A" if stage_id==ids["SHEET_A_ID"] else "B")
     sh=gc.open_by_key(stage_id)
+    ish=gc.open_by_key(stage_index_id)
     ws=safe_worksheet(sh,"BP_DATABASE",8)
     header=ws.row_values(1)[:8]
     if header and header not in (COLUMNS,LEGACY_COLUMNS):
@@ -376,14 +415,18 @@ def sync_sheet(records,sync_id):
                        ["physical_bp_rows",str(len(existing)+len(creates))]])
     pending_meta=[list(row) for row in final_meta]
     next(row for row in pending_meta if row[0]=="sync_state")[1]="IN_PROGRESS"
-    preflight_capacity(sh,{**tabs,"META":final_meta},
-                       len(existing)+len(creates)+1)
+    # Both workbooks must pass BEFORE any BP or index values are written.
+    preflight_capacity(sh,{"META":final_meta},len(existing)+len(creates)+1,
+                       "STAGING_PRIMARY")
+    preflight_capacity(ish,{**tabs,"META":final_meta},1,"STAGING_INDEX")
     logging.info("Keyed delta: existing=%s changed=%s appended=%s tombstone=%s",
                  len(existing),len(changes),len(creates),len(tombstones))
     metadata=safe_worksheet(sh,"META",2)
-    update_with_retry(lambda:metadata.update(
-        range_name=f"A1:B{len(pending_meta)}",
-        values=pending_meta,value_input_option="RAW"))
+    index_metadata=safe_worksheet(ish,"META",2)
+    for marker in (metadata,index_metadata):
+        update_with_retry(lambda marker=marker:marker.update(
+            range_name=f"A1:B{len(pending_meta)}",
+            values=pending_meta,value_input_option="RAW"))
     if not header:
         update_with_retry(lambda:ws.update(range_name="A1:H1",
                            values=[COLUMNS],value_input_option="RAW"))
@@ -440,42 +483,55 @@ def sync_sheet(records,sync_id):
                  f"{len(records):,}")
     for title in ("INDEX_LEN_TOKEN","INDEX_LEN","KTP_INDEX",
                   "INDEX_KTP_SHARD","EXACT_INDEX","INDEX_EXACT_SHARD"):
-        write_index(sh,title,tabs[title])
+        write_index(ish,title,tabs[title])
     for title in ("INDEX_LEN_TOKEN","KTP_INDEX","EXACT_INDEX"):
         expected=tabs[title]
         if len(expected)>1:
-            sheet=sh.worksheet(title)
+            sheet=ish.worksheet(title)
             last=len(expected)
             got=update_with_retry(lambda sheet=sheet,last=last,expected=expected:
                 sheet.get(f"A{last}:{chr(64+len(expected[0]))}{last}"))
             if not got or [str(v) for v in got[0]]!=expected[-1]:
                 raise RuntimeError(f"{title} index boundary mismatch; not READY.")
-    update_with_retry(lambda:metadata.update(
-        range_name=f"A1:B{len(final_meta)}",
-        values=final_meta,value_input_option="RAW"))
-    staged=read_meta(sh)
-    if (staged.get("sync_id")!=sync_id or
-        staged.get("sync_state")!="READY" or
-        staged.get("total_bp_rows")!=str(len(records)) or
-        staged.get("source_digest")!=digest):
-        raise RuntimeError("Staging READY marker failed read-back; not published.")
+    # Both READY markers must be verified before CONTROL can reference this pair.
+    for marker in (index_metadata,metadata):
+        update_with_retry(lambda marker=marker:marker.update(
+            range_name=f"A1:B{len(final_meta)}",
+            values=final_meta,value_input_option="RAW"))
+    for book in (sh,ish):
+        staged=read_meta(book)
+        if (staged.get("sync_id")!=sync_id or
+            staged.get("sync_state")!="READY" or
+            staged.get("total_bp_rows")!=str(len(records)) or
+            staged.get("source_digest")!=digest or
+            staged.get("keyed_index_version")!="14"):
+            raise RuntimeError("Primary/index READY marker mismatch; no publish.")
+    # A final conservative cell cap check before publishing the pair.
+    preflight_capacity(sh,{"META":final_meta},len(existing)+len(creates)+1,
+                       "STAGING_PRIMARY_FINAL")
+    preflight_capacity(ish,{**tabs,"META":final_meta},1,
+                       "STAGING_INDEX_FINAL")
     # Check control has not changed before the SINGLE control-pointer write.
     current=control_active(control)
-    if current.get("active_sheet_id","")!=active_id or (
-        active_id and current.get("sync_id")!=active.get("sync_id")):
+    if (current.get("active_sheet_id","")!=active_id or
+        current.get("active_index_sheet_id","")!=
+            active.get("active_index_sheet_id","") or
+        (active_id and current.get("sync_id")!=active.get("sync_id"))):
         raise RuntimeError("Control changed concurrently; refusing pointer switch.")
     pointer=safe_worksheet(control,"ACTIVE",2)
     values=[["key","value"],
             ["active_sheet_id",stage_id],
+            ["active_index_sheet_id",stage_index_id],
             ["sync_id",sync_id],
             ["total_bp_rows",str(len(records))],
             ["source_digest",digest],
             ["sync_state","READY"],
             ["last_sync_at",datetime.now().isoformat(timespec="seconds")]]
     update_with_retry(lambda:pointer.update(
-        range_name="A1:B7",values=values,value_input_option="RAW"))
+        range_name="A1:B8",values=values,value_input_option="RAW"))
     verified=control_active(control)
     if (verified.get("active_sheet_id")!=stage_id or
+        verified.get("active_index_sheet_id")!=stage_index_id or
         verified.get("sync_id")!=sync_id or
         verified.get("sync_state")!="READY"):
         raise RuntimeError("Control publish verification failed; check ACTIVE sheet.")

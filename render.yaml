@@ -23,6 +23,10 @@ services:
         value: 1vll0y7dO4bVTokeLbWctUUKjQvOV33V9TDp9iZfJPhA
       - key: SHEET_B_ID
         value: 13yMsb_Vsi6eXDkau1zouaRi2viOefDkVHmIuK9SHLqk
+      - key: SHEET_A2_ID
+        sync: false
+      - key: SHEET_B2_ID
+        sync: false
       - key: SHEET_CONTROL_ID
         value: 1wnRHX84FXNG3zwoxDofr1dzj1vu6UsN3uo907xt3KJ4
       - key: GOOGLE_OAUTH_CLIENT_ID
