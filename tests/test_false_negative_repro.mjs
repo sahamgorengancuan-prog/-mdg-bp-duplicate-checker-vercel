@@ -512,3 +512,17 @@ test('token index mismatch blocks PASS instead of silently skipping candidates',
   assert.equal(r.status,503);
   assert.equal(r.body.ok,false);
 });
+
+test('score upper bounds provide fast PASS on complete, provably excluded group',async()=>{
+  const f=fixture([row('PROVABLY-UNRELATED','x','x'.repeat(103))],
+    {tokenIndexed:true,env:{MAX_CANDIDATES:'1'}});
+  const r=await run(f,{name_1:NAME,address:ADDRESS});
+  assert.equal(r.status,200,r.body.error);
+  assert.equal(r.body.decision,'PASS');
+  assert.equal(r.body.stats.score_bound_index_used,true);
+  assert.equal(r.body.stats.safely_pruned_candidates,1);
+  assert.equal(r.body.stats.candidate_space,0);
+  assert.equal(r.body.stats.scanned_candidates,0);
+  assert.equal(r.body.stats.coverage_complete,true);
+  assert.equal(r.body.full_scope_cursor,null);
+});

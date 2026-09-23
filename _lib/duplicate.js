@@ -526,7 +526,7 @@ function createFullScopeCursor({env, meta, name1, address, ktpInput, threshold, 
   return raw + '.' + signature;
 }
 
-function readFullScopeCursor(token, env, meta, query, plan, lenIndex) {
+function readFullScopeCursor(token, env, meta, query, plan, searchIndex) {
   if (typeof token !== 'string' || token.length > 4096) throw httpError(400, 'Invalid full-scope cursor.');
   const pieces = token.split('.');
   if (pieces.length !== 2 || !pieces.every(Boolean)) throw httpError(400, 'Invalid full-scope cursor.');
@@ -569,7 +569,7 @@ function readFullScopeCursor(token, env, meta, query, plan, lenIndex) {
     throw httpError(400, 'Invalid full-scope row pointer.');
   }
   const preceding = plan.ordered.slice(0, pos).reduce(
-    (n, bucket) => n + lenIndex.get(bucket).count, 0);
+    (n, bucket) => n + searchIndex.get(bucket).count, 0);
   if (state.scanned !== preceding + state.nextRow - info.row_start) {
     throw httpError(400, 'Invalid full-scope scan count.');
   }
