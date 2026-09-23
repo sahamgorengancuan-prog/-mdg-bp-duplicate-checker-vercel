@@ -47,7 +47,7 @@ def test_indexes_carry_snapshot_identity_for_cross_tab_consistency():
         ['110646122', 'ZB02', 'Target BP', 'Some address', '3673011202760004'],
     ])
 
-    bp_out, ktp_out, idx_len, idx_ktp, exact_out, idx_exact, meta = mod.prepare_indexes(src)
+    bp_out, ktp_out, idx_len, idx_ktp, exact_out, idx_exact, idx_token, meta = mod.prepare_indexes(src)
 
     assert 'sync_id' in bp_out.columns
     assert {'bp_id', 'sync_id'}.issubset(ktp_out.columns)
@@ -67,7 +67,7 @@ def test_exact_index_is_complete_and_points_to_original_bp_rows():
         ['DIFFERENT', 'ZB02', 'Wr Santi', 'Different address', ''],
         ['SAME', 'ZB02', 'Wr Santi', 'Kp Cisaat Lebak RT 013 RW 003 Kel Bolang Kec Malingping Stlh Sdn 3 Bolang', ''],
     ])
-    bp, ktp, ilen, iktp, exact, shards, meta = mod.prepare_indexes(src)
+    bp, ktp, ilen, iktp, exact, shards, idx_token, meta = mod.prepare_indexes(src)
     assert len(exact) == len(bp) == 3
     assert sum(shards['count']) == len(bp)
     assert dict(zip(meta['key'], meta['value']))['exact_index_version'] == '1'
@@ -105,7 +105,7 @@ def test_capacity_preflight_accounts_for_actual_columns_and_unrelated_tabs(monke
 def test_full_12000_row_fixture_all_exact_hashes_and_row_pointers_complete():
     src = _df([[str(i).zfill(9), 'ZB02', f'Customer {i}',
                 f'Jl Sudirman No {i % 1000} Jakarta', ''] for i in range(12000)])
-    bp, _, _, _, exact, shards, meta = mod.prepare_indexes(src)
+    bp, _, _, _, exact, shards, idx_token, meta = mod.prepare_indexes(src)
     assert len(bp) == len(exact) == 12000
     assert sum(shards['count']) == 12000
     assert all(int(a) + int(c) - 1 == int(b)
@@ -134,3 +134,29 @@ def test_sync_logging_has_no_unsupported_thousands_separator():
     assert 'logging.info("Fetched %,d' not in source
     assert 'logging.info("Writing %s: %,d' not in source
     assert "ws.update(range_name=" in source
+
+
+def test_token_groups_cover_every_bp_once_and_match_node_tokenization():
+    src = _df([
+        ['BP1', 'ZB02', 'Tk Adit', 'RT 001 RW 002 RT 001', ''],
+        ['BP2', 'ZB02', 'Tk Adit', 'RT 001 RW 002 RT 001', ''],
+        ['BP3', 'ZB02', 'S', 'A 1 B', ''],
+        ['BP4', 'ZB02', 'A B', 'CV Jalan 1', ''],
+    ])
+    bp, _, idx_len, _, _, _, idx_token, meta = mod.prepare_indexes(src)
+    assert dict(zip(meta['key'], meta['value']))['token_index_version'] == '1'
+    assert sum(idx_token['count']) == len(bp)
+    assert list(idx_token['row_start'])[0] == 2
+    assert list(idx_token['row_end'])[-1] == len(bp) + 1
+    for row in idx_token.itertuples(index=False):
+        segment = bp.iloc[int(row.row_start)-2:int(row.row_end)-1]
+        counts = segment['norm_text'].map(
+            lambda text: len({x for x in text.split(' ') if len(x) >= 2})
+        )
+        assert len(segment) == int(row.count)
+        assert set(counts) == {int(row.token_count)}
+        assert set(segment['sync_id']) == {row.sync_id}
+        assert set(segment['text_len'].map(mod.len_bucket)) == {row.len_bucket}
+    assert list(idx_token['row_start'])[1:] == [
+        int(x) + 1 for x in list(idx_token['row_end'])[:-1]
+    ]

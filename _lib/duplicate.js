@@ -10,7 +10,7 @@ import { createHash, createHmac, timingSafeEqual } from 'node:crypto';
   Browser never receives OAuth credential, refresh token, or raw database dump.
 */
 
-export const ENGINE_VERSION = '2026-09-23-adaptive-throughput-v8';
+export const ENGINE_VERSION = '2026-09-23-score-bounds-v9';
 const GOOGLE_TOKEN_URL = 'https://oauth2.googleapis.com/token';
 const TOKEN_TTL_SAFETY_SECONDS = 90;
 
@@ -103,6 +103,9 @@ export async function handleHealth(context) {
       meta = await getMeta(context.env);
       requireReadyExactIndex(meta);
       await getIndexMap(context.env, 'INDEX_LEN', 'len', meta);
+      // Verify the precomputed score-bound index before reporting readiness.
+      const lenForHealth = await getIndexMap(context.env, 'INDEX_LEN', 'len', meta);
+      await getSearchIndexMap(context.env, meta, lenForHealth);
       await getIndexMap(context.env, 'INDEX_EXACT_SHARD', 'exact', meta);
       await getIndexMap(context.env, 'INDEX_KTP_SHARD', 'ktp', meta);
       sheet_ok = true;
@@ -162,6 +165,7 @@ export function configStatus(env) {
     full_scope_strategy: 'RESUME_ALL_ELIGIBLE_LENGTH_BUCKETS',
     sheets_local_read_budget_per_minute: SHEETS_LOCAL_READ_BUDGET_PER_MINUTE,
     full_scope_pacing: 'ADAPTIVE_QUOTA_HEADROOM',
+    score_bound_index: 'INDEX_LEN_TOKEN/v1',
     max_batch_rows: Number(env.MAX_BATCH_ROWS || DEFAULT_MAX_BATCH_ROWS),
     range_cache_seconds: Number(env.RANGE_CACHE_SECONDS || DEFAULT_RANGE_CACHE_SECONDS),
     rate_limit_per_min: Number(env.RATE_LIMIT_PER_MIN || DEFAULT_RATE_LIMIT_PER_MIN),
@@ -260,7 +264,7 @@ async function duplicateCheck(payload, env) {
       batches_processed: 0, candidate_space: 0, coverage_complete: false,
       scan_limit_reached: false, elapsed_ms: 0,
       bucket_count: 0, completed_buckets: 0,
-      search_scope: 'CONFIGURED_LENGTH_BUCKETS',
+      search_scope: meta.token_index_version === '1' ? 'SCORE_BOUND_INDEXED_LENGTH_BUCKETS' : 'CONFIGURED_LENGTH_BUCKETS',
       pass_basis: null
     }
   };
@@ -315,7 +319,8 @@ async function duplicateCheck(payload, env) {
   }
 
   const lenIndex = await getIndexMap(env, 'INDEX_LEN', 'len', meta);
-  const plan = buildBucketPlan(env, lenIndex, textLen, maxCandidates);
+  const searchIndex = await getSearchIndexMap(env, meta, lenIndex);
+  const plan = buildBucketPlan(env, searchIndex, textLen, maxCandidates, threshold, directRejectThreshold, weights, tokens(queryText).size);
   const {maxLenDiff, ordered, candidateSpace, oversized} = plan;
   const entries = ordered;
   const requestedOversizedBudget = Number(env.OVERSIZED_SCAN_BUDGET || DEFAULT_OVERSIZED_SCAN_BUDGET);
@@ -341,7 +346,7 @@ async function duplicateCheck(payload, env) {
 
   for (let pos = 0; pos < ordered.length; pos++) {
     const bucket = ordered[pos];
-    const info = lenIndex.get(String(bucket));
+    const info = searchIndex.get(String(bucket));
     if (!info) continue;
     let rowStart = info.row_start;
     while (rowStart <= info.row_end && scanned < scanBudget) {
@@ -389,7 +394,7 @@ async function duplicateCheck(payload, env) {
       completedBuckets++;
       nextBucketPos = pos + 1;
       nextBucketRow = nextBucketPos < ordered.length
-        ? lenIndex.get(ordered[nextBucketPos]).row_start : 0;
+        ? searchIndex.get(ordered[nextBucketPos]).row_start : 0;
     } else {
       nextBucketPos = pos;
       nextBucketRow = rowStart;
@@ -405,8 +410,10 @@ async function duplicateCheck(payload, env) {
     scan_limit_reached: !complete, elapsed_ms: Date.now() - started,
     bucket_count: entries.length, completed_buckets: completedBuckets,
     oversized_bucket_space: oversized, scan_budget: scanBudget,
-    search_scope: 'CONFIGURED_LENGTH_BUCKETS',
-    pass_basis: complete ? 'ALL_ELIGIBLE_BUCKET_ROWS_SCORED' : null
+    search_scope: meta.token_index_version === '1' ? 'SCORE_BOUND_INDEXED_LENGTH_BUCKETS' : 'CONFIGURED_LENGTH_BUCKETS',
+    pass_basis: complete ? 'ALL_ELIGIBLE_BUCKET_ROWS_SCORED' : null,
+    safely_pruned_candidates: plan.safelyPruned,
+    score_bound_index_used: meta.token_index_version === '1'
   };
   result.top_candidates = best;
   if (found) {
@@ -441,22 +448,55 @@ async function duplicateCheck(payload, env) {
 // One deterministic plan is shared by the fast check AND the manual continuation.
 // INDEX_LEN is cached per Sheets sync_id; no additional Google Sheets index is needed.
 // A bucket is only read if it intersects the configured length tolerance.
-function buildBucketPlan(env, lenIndex, textLen, maxCandidates) {
+// Optimistic upper bounds; never remove a group unless NO scoring path can
+// reach FAIL. Safe for the current Levenshtein, soft-Jaccard and numeric rules.
+function scoreBoundCanMatch(group, textLen, queryTokenCount, threshold, rejectThreshold, weights) {
+  if (!Number.isSafeInteger(group.token_count)) return true; // legacy index
+  const bucket = Number(group.bucket);
+  const minLen = bucket * 5;
+  const maxLen = minLen + 4;
+  const levenshteinUpper = textLen < minLen ? (100 * textLen / Math.max(1, minLen))
+    : textLen > maxLen ? (100 * maxLen / Math.max(1, textLen)) : 100;
+  const n = group.token_count;
+  // Even perfect fuzzy token matching cannot exceed min(|A|,|B|)/max.
+  const jaccardUpper = queryTokenCount === 0 && n === 0 ? 100
+    : queryTokenCount === 0 || n === 0 ? 0
+      : 100 * Math.min(queryTokenCount, n) / Math.max(queryTokenCount, n);
+  const epsilon = 0.025; // preserve decisions near round2 thresholds
+  if (levenshteinUpper + epsilon >= rejectThreshold
+      || jaccardUpper + epsilon >= rejectThreshold) return true;
+  // Custom negative/nonfinite weights cannot be bounded this way: scan them.
+  if (![weights.levenshtein, weights.jaccard, weights.numeric].every(
+    w => Number.isFinite(w) && w >= 0)) return true;
+  const upperCombined = levenshteinUpper * weights.levenshtein
+    + jaccardUpper * weights.jaccard + 100 * weights.numeric;
+  return upperCombined + epsilon >= threshold;
+}
+function buildBucketPlan(env, searchIndex, textLen, maxCandidates, threshold, rejectThreshold, weights, queryTokenCount) {
   const maxLenDiff = getMaxLenDiff(env, textLen);
-  const eligible = bucketRange(textLen, maxLenDiff).filter(bucket => lenIndex.has(bucket));
-  const candidateSpace = eligible.reduce((n, bucket) => n + lenIndex.get(bucket).count, 0);
+  const eligibleBuckets = new Set(bucketRange(textLen, maxLenDiff));
+  const allEligible = [...searchIndex.keys()].filter(key => eligibleBuckets.has(searchIndex.get(key).bucket || key));
+  let safelyPruned = 0;
+  const eligible = allEligible.filter(key => {
+    const group = searchIndex.get(key);
+    if (scoreBoundCanMatch(group, textLen, queryTokenCount, threshold, rejectThreshold, weights)) return true;
+    safelyPruned += group.count;
+    return false;
+  });
+  const candidateSpace = eligible.reduce((sum, key) => sum + searchIndex.get(key).count, 0);
   const oversized = candidateSpace > maxCandidates;
-  const distance = bucket => Math.abs(Number(bucket) - Math.floor(textLen / 5));
+  const distance = key => Math.abs(Number(searchIndex.get(key).bucket || key) - Math.floor(textLen / 5));
   const ordered = eligible.sort((a, b) =>
-    (oversized ? lenIndex.get(a).count - lenIndex.get(b).count : 0)
-    || distance(a) - distance(b) || Number(a) - Number(b));
+    (oversized ? searchIndex.get(a).count - searchIndex.get(b).count : 0)
+    || distance(a) - distance(b) || searchIndex.get(a).row_start - searchIndex.get(b).row_start);
   const signature = createHash('sha256').update(JSON.stringify({
-    maxLenDiff, maxCandidates, ordered: ordered.map(bucket => {
-      const info = lenIndex.get(bucket);
-      return [bucket, info.row_start, info.row_end, info.count];
+    maxLenDiff, maxCandidates, threshold, rejectThreshold, weights, queryTokenCount,
+    ordered: ordered.map(key => {
+      const info = searchIndex.get(key);
+      return [key, info.row_start, info.row_end, info.count];
     })
   })).digest('hex');
-  return {ordered, candidateSpace, oversized, maxLenDiff, signature};
+  return {ordered, candidateSpace, oversized, maxLenDiff, signature, safelyPruned};
 }
 
 function fullScopeFingerprint({name1, address, ktpInput, threshold, directRejectThreshold, weights}) {
@@ -523,7 +563,7 @@ function readFullScopeCursor(token, env, meta, query, plan, lenIndex) {
       !Number.isSafeInteger(state.completedBuckets) || state.completedBuckets !== pos) {
     throw httpError(400, 'Invalid or completed full-scope cursor.');
   }
-  const info = lenIndex.get(plan.ordered[pos]);
+  const info = searchIndex.get(plan.ordered[pos]);
   if (!Number.isSafeInteger(state.nextRow) ||
       state.nextRow < info.row_start || state.nextRow > info.row_end) {
     throw httpError(400, 'Invalid full-scope row pointer.');
@@ -550,9 +590,10 @@ async function fullScopeCheck(payload, env) {
   requireReadyExactIndex(meta);
   const lenIndex = await getIndexMap(env, 'INDEX_LEN', 'len', meta);
   const maxCandidates = Math.max(1, Number(env.MAX_CANDIDATES || DEFAULT_MAX_CANDIDATES));
-  const plan = buildBucketPlan(env, lenIndex, queryText.length, maxCandidates);
+  const searchIndex = await getSearchIndexMap(env, meta, lenIndex);
+  const plan = buildBucketPlan(env, searchIndex, queryText.length, maxCandidates, threshold, directRejectThreshold, weights, tokens(queryText).size);
   const query = {name1, address, ktpInput, threshold, directRejectThreshold, weights};
-  const state = readFullScopeCursor(payload.full_scope_cursor, env, meta, query, plan, lenIndex);
+  const state = readFullScopeCursor(payload.full_scope_cursor, env, meta, query, plan, searchIndex);
   const configuredRows = Number(env.FULL_SCOPE_CHUNK_ROWS || FULL_SCOPE_MAX_ROWS_PER_REQUEST);
   const rowsPerRequest = Number.isFinite(configuredRows)
     ? Math.max(1, Math.min(FULL_SCOPE_MAX_ROWS_PER_REQUEST, Math.floor(configuredRows)))
@@ -568,7 +609,7 @@ async function fullScopeCheck(payload, env) {
   const queryFeatures = { tokens: tokens(queryText), numeric: numericTokens(queryText) };
 
   while (pos < plan.ordered.length && budget > 0 && !found) {
-    const info = lenIndex.get(plan.ordered[pos]);
+    const info = searchIndex.get(plan.ordered[pos]);
     const endRow = Math.min(info.row_end, nextRow + budget - 1);
     const rows = await getSheetRange(env, 'BP_DATABASE!A' + nextRow + ':H' + endRow, meta.sync_id);
     if (rows.length !== endRow - nextRow + 1) {
@@ -603,7 +644,7 @@ async function fullScopeCheck(payload, env) {
     if (nextRow > info.row_end) {
       completedBuckets++;
       pos++;
-      nextRow = pos < plan.ordered.length ? lenIndex.get(plan.ordered[pos]).row_start : 0;
+      nextRow = pos < plan.ordered.length ? searchIndex.get(plan.ordered[pos]).row_start : 0;
     }
   }
 
@@ -623,8 +664,11 @@ async function fullScopeCheck(payload, env) {
     skipped_by_prefilter: 0, coverage_complete: finished,
     scan_limit_reached: !finished && !found,
     elapsed_ms: Date.now() - started, bucket_count: plan.ordered.length,
-    completed_buckets: completedBuckets, search_scope: 'CONFIGURED_LENGTH_BUCKETS',
+    completed_buckets: completedBuckets,
+    search_scope: meta.token_index_version === '1' ? 'SCORE_BOUND_INDEXED_LENGTH_BUCKETS' : 'CONFIGURED_LENGTH_BUCKETS',
     pass_basis: finished ? 'ALL_ELIGIBLE_BUCKET_ROWS_SCORED' : null,
+    safely_pruned_candidates: plan.safelyPruned,
+    score_bound_index_used: meta.token_index_version === '1',
     resumed_from_normal_scan: state.scanned, full_scope_batch_rows: rowsPerRequest
   };
   if (found) {
@@ -874,6 +918,54 @@ function reserveSheetsReadSlot(env) {
     throw err;
   }
   sheetsReadTimes.push(now);
+}
+
+// The new compact search index contains ONLY length bucket, unique-token
+// count and BP_DATABASE range pointers. It never copies raw names/KTP to a
+// public deployment. Legacy sheets use the original complete length buckets
+// until the patched Windows sync publishes token_index_version=1.
+async function getSearchIndexMap(env, meta, lenIndex) {
+  if (meta.token_index_version !== '1') {
+    return new Map([...lenIndex].map(([key, info]) => [
+      key, {...info, bucket: key, token_count: null}
+    ]));
+  }
+  const sync = String(meta.sync_id || '');
+  const cacheKey = 'tokenIndex:' + getSheetId(env) + ':' + sync;
+  const cached = getCached(cacheKey);
+  if (cached) return cached;
+  const rows = await getSheetRange(env, 'INDEX_LEN_TOKEN!A2:F100000', sync);
+  const map = new Map();
+  const bucketTotals = new Map();
+  let rowPointer = 2;
+  for (const row of rows) {
+    if (!row[0]) continue;
+    const bucket = String(row[0]);
+    const tokenCount = Number(row[1]);
+    const start = Number(row[2]);
+    const end = Number(row[3]);
+    const count = Number(row[4]);
+    assertSnapshotConsistency(sync, String(row[5] || ''), 'INDEX_LEN_TOKEN -> META');
+    if (!lenIndex.has(bucket) || !Number.isSafeInteger(tokenCount) || tokenCount < 0
+        || !Number.isSafeInteger(start) || start !== rowPointer
+        || !Number.isSafeInteger(end) || !Number.isSafeInteger(count) || count < 1
+        || end - start + 1 !== count
+        || start < lenIndex.get(bucket).row_start || end > lenIndex.get(bucket).row_end) {
+      throw httpError(503, 'INDEX_LEN_TOKEN incomplete or unsorted. Run patched full sync.');
+    }
+    const key = bucket + ':' + tokenCount;
+    if (map.has(key)) throw httpError(503, 'INDEX_LEN_TOKEN duplicate group. Run patched full sync.');
+    map.set(key, {bucket, token_count: tokenCount, row_start: start, row_end: end, count, sync_id: sync});
+    bucketTotals.set(bucket, (bucketTotals.get(bucket) || 0) + count);
+    rowPointer = end + 1;
+  }
+  if (map.size !== Number(meta.token_index_groups)
+      || rowPointer !== Number(meta.total_bp_rows) + 2
+      || [...lenIndex].some(([bucket, info]) => bucketTotals.get(bucket) !== info.count)) {
+    throw httpError(503, 'INDEX_LEN_TOKEN row coverage does not match INDEX_LEN/META. No PASS allowed.');
+  }
+  setCached(cacheKey, map, 1800);
+  return map;
 }
 
 async function getSheetRange(env, rangeA1, syncId = '', fresh = false) {

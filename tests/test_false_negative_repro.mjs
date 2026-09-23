@@ -8,6 +8,7 @@ const ADDRESS = 'Kp Cisaat Lebak RT 013 RW 003 Kel Bolang Kec Malingping Stlh Sd
 const normalize = s => String(s || '').toLowerCase().normalize('NFKD').replace(/[\u0300-\u036f]/g, '').replace(/[^a-z0-9 ]+/g, ' ').replace(/\b(pt|cv|tbk|ud|toko|tk|jl|jalan|gg|gang|no|nomor)\b/g, ' ').replace(/\s+/g, ' ').trim();
 const hash = (n,a) => createHash('sha256').update(`${normalize(n)}\x1f${normalize(a)}`).digest('hex');
 const bucket = n => String(Math.floor(n / 5)).padStart(3,'0');
+const tokenCount = s => new Set(s.split(' ').filter(x=>x.length>=2)).size;
 const baseEnv = { GOOGLE_OAUTH_CLIENT_ID: 'fixture', GOOGLE_OAUTH_CLIENT_SECRET: 'fixture', GOOGLE_OAUTH_REFRESH_TOKEN: 'fixture', MAX_CANDIDATES: '5', MAX_BATCH_ROWS: '10', RANGE_CACHE_SECONDS: '0', RATE_LIMIT_PER_MIN: '0', SHEETS_LOCAL_READ_BUDGET_PER_MINUTE: '0' };
 let counter = 0;
 const originalFetch = globalThis.fetch;
@@ -15,7 +16,7 @@ const originalFetch = globalThis.fetch;
 function fixture(entries, opt={}) {
   const sync = `fixture-sync-${++counter}`;
   const indexed = [...entries].map(e=> ({...e, norm: normalize(`${e.name} ${e.address}`), hash: hash(e.name,e.address)}))
-    .sort((a,b) => bucket(a.norm.length).localeCompare(bucket(b.norm.length)) || a.norm.length - b.norm.length || a.id.localeCompare(b.id));
+    .sort((a,b) => bucket(a.norm.length).localeCompare(bucket(b.norm.length)) || (opt.tokenIndexed ? tokenCount(a.norm)-tokenCount(b.norm) : 0) || a.norm.length - b.norm.length || a.id.localeCompare(b.id));
   const data = new Map();
   const bp = indexed.map((e,i) => [e.id,'ZB02',e.name,e.address,e.norm,'',String(e.norm.length),sync]);
   const exact = indexed.map((e,i) => [e.hash,i+2,e.id,sync]).sort((a,b)=>a[0].localeCompare(b[0]) || a[1]-b[1]);
@@ -33,12 +34,23 @@ function fixture(entries, opt={}) {
     return [...map.values()];
   }
   data.set('INDEX_LEN', summarize(bp,row=>bucket(Number(row[6]))));
+  if (opt.tokenIndexed) {
+    const groups=new Map();
+    bp.forEach((entry,i)=>{
+      const len=bucket(Number(entry[6])), count=tokenCount(entry[4]);
+      const key=len+':'+count;
+      const value=groups.get(key)||[len,String(count),i+2,i+2,0,sync];
+      value[3]=i+2;value[4]++;groups.set(key,value);
+    });
+    data.set('INDEX_LEN_TOKEN',[...groups.values()]);
+  }
   data.set('INDEX_EXACT_SHARD',summarize(exact,row=>row[0].slice(0,2)));
   data.set('INDEX_KTP_SHARD',summarize(ktp,row=>row[0].slice(-2)));
   const meta = [
     ['sync_id',sync],['total_bp_rows',String(bp.length)],
     ['total_exact_index_rows',String(exact.length)],['total_ktp_index_rows',String(ktp.length)],
-    ['exact_index_version',opt.oldVersion ? '' : '1'],['sync_state', opt.inProgress ? 'IN_PROGRESS' : 'READY']
+    ['exact_index_version',opt.oldVersion ? '' : '1'],['sync_state', opt.inProgress ? 'IN_PROGRESS' : 'READY'],
+    ...(opt.tokenIndexed ? [['token_index_version','1'],['token_index_groups',String(data.get('INDEX_LEN_TOKEN').length)]] : [])
   ];
   data.set('META',meta);
   const env={...baseEnv, SHEET_ID:`fixture-${sync}`,...opt.env};
@@ -213,9 +225,9 @@ test('health and exact response disclose running engine and index readiness with
   const f=fixture([row('TEST-BP','Example Shop','A sample street address')]);
   const health = await handleHealth({env:f.env});
   const hb = await health.json();
-  assert.equal(hb.engine_version,'2026-09-23-adaptive-throughput-v8');
+  assert.equal(hb.engine_version,'2026-09-23-score-bounds-v9');
   assert.equal(hb.exact_index_ready,true);
-  assert.equal(health.headers.get('x-bp-checker-engine'),'2026-09-23-adaptive-throughput-v8');
+  assert.equal(health.headers.get('x-bp-checker-engine'),'2026-09-23-score-bounds-v9');
   const r=await run(f,{name_1:'Example Shop',address:'A sample street address'});
   assert.equal(r.body.decision,'FAIL');
   assert.equal(r.body.exact_lookup.attempted,true);
@@ -480,4 +492,23 @@ test('successful quota-aware continuation reports headroom without changing exha
   assert.equal(second.body.quota.local_budget_per_minute,0);
   assert(Number.isFinite(second.body.quota.recommended_pause_seconds));
   assert(second.body.quota.recommended_pause_seconds >= 0);
+});
+
+test('new token-count index prunes provably unrelated groups without missing a FAIL',async()=>{
+  const f=fixture([
+    row('OTHER','abc','zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz'),
+    row('NEAR',NAME,ADDRESS+' x')
+  ],{tokenIndexed:true,env:{MAX_CANDIDATES:'20'}});
+  const r=await run(f,{name_1:NAME,address:ADDRESS});
+  assert.equal(r.status,200,r.body.error);
+  assert.equal(r.body.decision,'FAIL');
+  assert.equal(r.body.similarity_match?.bp_id,'NEAR');
+  assert.equal(r.body.stats.score_bound_index_used,true);
+});
+test('token index mismatch blocks PASS instead of silently skipping candidates',async()=>{
+  const f=fixture([row('BP-X','X','unrelated'.repeat(10))],{tokenIndexed:true});
+  f.data.get('INDEX_LEN_TOKEN')[0][4]=999;
+  const r=await run(f,{name_1:NAME,address:ADDRESS});
+  assert.equal(r.status,503);
+  assert.equal(r.body.ok,false);
 });

@@ -146,7 +146,7 @@ def fetch_pg_dataframe() -> pd.DataFrame:
     return df
 
 
-def prepare_indexes(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+def prepare_indexes(df: pd.DataFrame) -> Tuple[pd.DataFrame, ...]:
     required = ["bp_id", "bp_type_id", "name_1", "address", "ktp_number"]
     missing = [c for c in required if c not in df.columns]
     if missing:
@@ -167,13 +167,17 @@ def prepare_indexes(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame, pd.Da
     df["norm_digits"] = (df["name_1"] + " " + df["address"]).map(normalize_digits)
     df["text_len"] = df["norm_text"].str.len().astype(int)
     df["len_bucket"] = df["text_len"].map(len_bucket)
+    # Unique token count EXACTLY mirrors the Node tokens() rule (length >=2).
+    df["token_count"] = df["norm_text"].map(
+        lambda text: len({token for token in text.split(" ") if len(token) >= 2})
+    )
     df["ktp_digits"] = df["ktp_number"].map(normalize_digits)
     df["ktp_shard"] = df["ktp_digits"].map(ktp_shard)
     df["exact_hash"] = [exact_hash(n, a) for n, a in zip(df["name_1"], df["address"])]
 
     # Main database is sorted by length bucket, enabling A1 range lookup.
-    bp = df[["_source_row_id", "bp_id", "bp_type_id", "name_1", "address", "norm_text", "norm_digits", "text_len", "len_bucket", "exact_hash"]].copy()
-    bp = bp.sort_values(["len_bucket", "text_len", "bp_id", "_source_row_id"], kind="mergesort").reset_index(drop=True)
+    bp = df[["_source_row_id", "bp_id", "bp_type_id", "name_1", "address", "norm_text", "norm_digits", "text_len", "len_bucket", "token_count", "exact_hash"]].copy()
+    bp = bp.sort_values(["len_bucket", "token_count", "text_len", "bp_id", "_source_row_id"], kind="mergesort").reset_index(drop=True)
     bp["bp_db_row"] = bp.index + 2  # Sheet row number; header is row 1.
     bp["sync_id"] = sync_id
 
@@ -186,6 +190,18 @@ def prepare_indexes(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame, pd.Da
           .reset_index()
     )
     idx_len["sync_id"] = sync_id
+
+    # Each (length bucket, unique-token count) is contiguous. At query time
+    # these compact groups can be safely excluded only when mathematical score
+    # upper bounds prove they cannot reach ANY configured duplicate rule.
+    logging.info("Building INDEX_LEN_TOKEN...")
+    idx_token = (
+        bp.groupby(["len_bucket", "token_count"], sort=True)
+          .agg(row_start=("bp_db_row", "min"),
+               row_end=("bp_db_row", "max"), count=("bp_id", "count"))
+          .reset_index()
+    )
+    idx_token["sync_id"] = sync_id
 
     logging.info("Building KTP_INDEX...")
     # Map each KTP-bearing source record to the exact BP_DATABASE row produced from
@@ -225,7 +241,7 @@ def prepare_indexes(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame, pd.Da
     )
     idx_exact["sync_id"] = sync_id
 
-    cell_estimate = len(bp_out) * len(bp_out.columns) + len(ktp_out) * len(ktp_out.columns) + len(exact_out) * len(exact_out.columns) + 10000
+    cell_estimate = len(bp_out) * len(bp_out.columns) + len(ktp_out) * len(ktp_out.columns) + len(exact_out) * len(exact_out.columns) + len(idx_token) * len(idx_token.columns) + 10000
     if cell_estimate > int(os.environ.get("GSHEET_MAX_CELL_WARNING", "9500000")):
         logging.warning(
             "Estimated Google Sheet cells %s is close to or above safe limit. Consider reducing columns or moving index to a dedicated database.",
@@ -242,12 +258,14 @@ def prepare_indexes(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame, pd.Da
         ["total_exact_index_rows", str(len(exact_out))],
         ["exact_shard_count", str(len(idx_exact))],
         ["exact_index_version", "1"],
+        ["token_index_version", "1"],
+        ["token_index_groups", str(len(idx_token))],
         ["sync_state", "READY"],
         ["source", "PostgreSQL MDG -> Protected Google Sheet"],
-        ["schema", "BP_DATABASE:A:H; KTP_INDEX:A:D; INDEX_LEN:A:E; INDEX_KTP_SHARD:A:E"],
+        ["schema", "BP_DATABASE:A:H; INDEX_LEN_TOKEN:A:F; KTP_INDEX:A:D; INDEX_LEN:A:E; INDEX_KTP_SHARD:A:E"],
     ], columns=["key", "value"])
 
-    return bp_out, ktp_out, idx_len, idx_ktp, exact_out, idx_exact, meta
+    return bp_out, ktp_out, idx_len, idx_ktp, exact_out, idx_exact, idx_token, meta
 
 
 def load_oauth_credentials() -> Credentials:
@@ -473,7 +491,7 @@ def main():
     chunk_size = int(os.environ.get("GSHEET_CHUNK_SIZE", "20000"))
 
     df = fetch_pg_dataframe()
-    bp_out, ktp_out, idx_len, idx_ktp, exact_out, idx_exact, meta = prepare_indexes(df)
+    bp_out, ktp_out, idx_len, idx_ktp, exact_out, idx_exact, idx_token, meta = prepare_indexes(df)
 
     gc, authorized_user_email = gsheet_client()
     sh = gc.open_by_key(sheet_id)
@@ -481,6 +499,7 @@ def main():
         "BP_DATABASE": bp_out, "KTP_INDEX": ktp_out,
         "INDEX_LEN": idx_len, "INDEX_KTP_SHARD": idx_ktp,
         "EXACT_INDEX": exact_out, "INDEX_EXACT_SHARD": idx_exact,
+        "INDEX_LEN_TOKEN": idx_token,
         "META": meta,
     })
 
@@ -495,14 +514,15 @@ def main():
     write_dataframe(sh, "INDEX_KTP_SHARD", idx_ktp, chunk_size)
     write_dataframe(sh, "EXACT_INDEX", exact_out, chunk_size)
     write_dataframe(sh, "INDEX_EXACT_SHARD", idx_exact, chunk_size)
+    write_dataframe(sh, "INDEX_LEN_TOKEN", idx_token, chunk_size)
     # META=READY is the commit marker; publish it only after all six data/index tabs.
     write_dataframe(sh, "META", meta, chunk_size)
 
     protect_and_hide_tabs(
         sh,
         authorized_user_email,
-        protected_titles=["BP_DATABASE", "KTP_INDEX", "INDEX_LEN", "INDEX_KTP_SHARD", "EXACT_INDEX", "INDEX_EXACT_SHARD", "META"],
-        hidden_titles=["KTP_INDEX", "INDEX_LEN", "INDEX_KTP_SHARD", "EXACT_INDEX", "INDEX_EXACT_SHARD"],
+        protected_titles=["BP_DATABASE", "KTP_INDEX", "INDEX_LEN", "INDEX_KTP_SHARD", "EXACT_INDEX", "INDEX_EXACT_SHARD", "INDEX_LEN_TOKEN", "META"],
+        hidden_titles=["KTP_INDEX", "INDEX_LEN", "INDEX_KTP_SHARD", "EXACT_INDEX", "INDEX_EXACT_SHARD", "INDEX_LEN_TOKEN"],
     )
 
     logging.info("DONE. Sheet synced and indexed successfully.")
