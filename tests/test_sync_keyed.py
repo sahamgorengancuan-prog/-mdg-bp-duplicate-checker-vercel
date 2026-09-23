@@ -119,6 +119,7 @@ def test_dual_ids_fails_before_writing(monkeypatch):
     with pytest.raises(ValueError,match='GSHEET_SNAPSHOT_MODE=dual'):
         keyed.snapshot_ids()
     monkeypatch.setenv("GSHEET_SNAPSHOT_MODE","dual")
+    monkeypatch.setenv("SHEET_ID","LEGACY")
     monkeypatch.setenv("SHEET_A_ID","A")
     monkeypatch.setenv("SHEET_B_ID","A")
     monkeypatch.setenv("SHEET_CONTROL_ID","C")
