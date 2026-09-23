@@ -292,3 +292,20 @@ test('Tk Adit exact name/address without KTP returns BP even when fuzzy cap is o
   assert.equal(r.body.exact_name_address_match?.score,100);
   assert.equal(r.body.stats.scanned_candidates,0);
 });
+
+test('identity conflict beyond five duplicate source rows is detected and previewed',async()=>{
+  const address='Kp Pasir Kalong RT 001 RW 004 Ds Batujajar Kec Cigudeg';
+  const records=[
+    ...Array.from({length:6},(_,i)=>row('BP-A','Tk Adit',address,i===0?'3173085710790001':'')),
+    row('BP-B','Tk Adit',address)
+  ];
+  const f=fixture(records);
+  const r=await run(f,{name_1:'Tk Adit',address,ktp_number:'3173085710790001'});
+  assert.equal(r.body.decision,'FAIL');
+  assert.equal(r.body.identity_conflict,true);
+  assert.equal(r.body.exact_match_count,7);
+  assert.equal(r.body.exact_ktp_match?.bp_id,'BP-A');
+  assert.equal(r.body.exact_name_address_match?.bp_id,'BP-A');
+  assert(r.body.top_candidates.some(x=>x.bp_id==='BP-B'));
+  assert.equal(r.body.stats.scanned_candidates,0);
+});

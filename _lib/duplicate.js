@@ -246,7 +246,7 @@ async function duplicateCheck(payload, env) {
     result.exact_ktp_match = sanitizeBpRow(ktpMatch, 100, { reason: 'KTP Exact Match' });
   }
 
-  let nameAddressExact = { matches: [], count: 0, diagnostics: result.exact_lookup };
+  let nameAddressExact = { matches: [], count: 0, bpIds: [], diagnostics: result.exact_lookup };
   if (name1 && address) {
     nameAddressExact = await findExactNameAddress(name1, address, env, meta);
     result.exact_lookup = nameAddressExact.diagnostics;
@@ -262,8 +262,8 @@ async function duplicateCheck(payload, env) {
 
   if (ktpMatch || nameAddressExact.count) {
     const ktpBpId = String(ktpMatch?.bp_id || '');
-    result.identity_conflict = Boolean(ktpBpId && nameAddressExact.matches.some(
-      m => String(m.bp_id) !== ktpBpId));
+    result.identity_conflict = Boolean(ktpBpId && nameAddressExact.bpIds.some(
+      id => String(id) !== ktpBpId));
     result.decision = 'FAIL';
     result.reason = result.identity_conflict
       ? 'IDENTITY CONFLICT: the KTP and exact Name 1 + Address match different BP IDs. Review both records; do not auto-approve.'
@@ -403,7 +403,7 @@ async function findExactNameAddress(name, address, env, meta) {
   const shardMap = await getIndexMap(env, 'INDEX_EXACT_SHARD', 'exact', meta);
   const hash = exactNameAddressHash(name, address);
   const info = shardMap.get(hash.slice(0, 2));
-  if (!info) return { matches: [], count: 0, diagnostics: { attempted: true, index_version: meta.exact_index_version, shard_present: false, shard_rows: 0, matching_index_rows: 0, verified_matches: 0 } };
+  if (!info) return { matches: [], count: 0, bpIds: [], diagnostics: { attempted: true, index_version: meta.exact_index_version, shard_present: false, shard_rows: 0, matching_index_rows: 0, verified_matches: 0 } };
   const rows = await getSheetRange(env, `EXACT_INDEX!A${info.row_start}:D${info.row_end}`, meta.sync_id);
   if (rows.length !== info.count) {
     throw httpError(503, 'EXACT_INDEX shard contains fewer rows than advertised. Run a full sync.');
@@ -417,9 +417,25 @@ async function findExactNameAddress(name, address, env, meta) {
     if (String(row[0]) === hash) pointers.push(row);
   }
   const matches = [];
-  // Bound row lookups if many BP share the same name and address.  The index
-  // supplies the total number of identical keys; five previews are sufficient.
-  for (const pointer of pointers.slice(0, 5)) {
+  // Inspect all pointer IDs but fetch at most five BP rows; select distinct
+  // BP IDs first so conflicting identities do not hide beyond preview five.
+  const bpIds = [...new Set(pointers.map(p => String(p[2])))];
+  const chosen = [];
+  const seen = new Set();
+  for (const pointer of pointers) {
+    if (!seen.has(String(pointer[2]))) {
+      chosen.push(pointer);
+      seen.add(String(pointer[2]));
+      if (chosen.length >= 5) break;
+    }
+  }
+  if (chosen.length < 5) {
+    for (const pointer of pointers) {
+      if (!chosen.includes(pointer)) chosen.push(pointer);
+      if (chosen.length >= 5) break;
+    }
+  }
+  for (const pointer of chosen) {
     const rowNo = Number(pointer[1]);
     if (!Number.isSafeInteger(rowNo) || rowNo < 2 || rowNo > Number(meta.total_bp_rows) + 1) {
       throw httpError(503, 'Invalid EXACT_INDEX BP pointer. Run a full sync.');
@@ -439,7 +455,7 @@ async function findExactNameAddress(name, address, env, meta) {
       if (matches.length < 5) matches.push(candidate);
     }
   }
-  return { matches, count: pointers.length, diagnostics: { attempted: true, index_version: meta.exact_index_version, shard_present: true, shard_rows: rows.length, matching_index_rows: pointers.length, verified_matches: matches.length } }; 
+  return { matches, count: pointers.length, bpIds, diagnostics: { attempted: true, index_version: meta.exact_index_version, shard_present: true, shard_rows: rows.length, matching_index_rows: pointers.length, verified_matches: matches.length } }; 
 }
 
 async function findExactKtp(ktpDigits, env, activeMeta) {
