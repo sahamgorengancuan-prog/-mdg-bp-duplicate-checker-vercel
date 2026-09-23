@@ -12,7 +12,7 @@ const SNAPSHOT_WORKBOOKS=JSON.parse(readFileSync(new URL('../config/gsheet_snaps
   Browser never receives OAuth credential, refresh token, or raw database dump.
 */
 
-export const ENGINE_VERSION = '2026-09-23-gsheet-dual-v14-batched';
+export const ENGINE_VERSION = '2026-09-23-gsheet-dual-v14-wide-batch';
 const GOOGLE_TOKEN_URL = 'https://oauth2.googleapis.com/token';
 const TOKEN_TTL_SAFETY_SECONDS = 90;
 
@@ -1151,10 +1151,10 @@ export async function getSheetRanges(env,ranges,syncId='') {
     const m=/!A(\d+):B(\d+)$/.exec(x);
     const lo=Number(m[1]),hi=Number(m[2]);
     if(!Number.isSafeInteger(lo)||!Number.isSafeInteger(hi)||
-       lo<2||hi<lo||hi-lo+1>500)return Infinity;
+       lo<2||hi<lo||hi-lo+1>1500)return Infinity;
     return sum+hi-lo+1;
   },0);
-  if(maxRows>3000)throw httpError(503,'Batched index payload exceeds bounded row cap.');
+  if(maxRows>12000)throw httpError(503,'Batched index payload exceeds bounded row cap.');
   const cacheSeconds=Number(env.RANGE_CACHE_SECONDS||DEFAULT_RANGE_CACHE_SECONDS);
   const cached=ranges.map(x=>getCached(`range:${sheetId}:${syncId}:${x}`));
   if(cached.every(Boolean))return cached;

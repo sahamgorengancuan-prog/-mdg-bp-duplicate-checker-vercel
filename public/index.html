@@ -323,13 +323,13 @@
     const result = $('result');
     const btn = $('submitBtn');
     const API_BASE = location.origin;
-    const EXPECTED_ENGINE_VERSION = '2026-09-23-gsheet-dual-v14-batched';
+    const EXPECTED_ENGINE_VERSION = '2026-09-23-gsheet-dual-v14-wide-batch';
     // Batched ranges reduce Google requests; continue immediately when quota
     // headroom is available. Never ignore an actual upstream 429.
     const FULL_SCOPE_WAIT_MS = 100;
-    const MAX_QUOTA_RETRIES = 8;
+    const MAX_QUOTA_RETRIES = 40;
     const MAX_NORMAL_QUOTA_RETRIES = 1;
-    const FULL_SCOPE_SESSION_MS = 600000; // bounded 10-minute session; signed cursor valid for 1h
+    const FULL_SCOPE_SESSION_MS = 2700000; // bounded 45-minute browser session; cursor valid for 2h
     const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
     let lastCheckInput = null;
     let lastRenderedResult = null;
@@ -406,7 +406,7 @@
 
 
     // Only a user click on INCONCLUSIVE starts full scope. Each HTTP request
-    // scans at most 3,000 rows and uses a server-signed continuation cursor.
+    // scans at most 12,000 rows per HTTP request with a signed cursor.
     async function runFullScope(cursor) {
       if (fullScopeRunning || !lastCheckInput || !cursor) return;
       fullScopeRunning = true;
@@ -474,7 +474,7 @@
         if (paused && !fullScopeCancelled && lastKnown?.full_scope_cursor) {
           fullScopeRunning = false;
           renderResult(lastKnown);
-          result.insertAdjacentHTML('beforeend', '<p class="reason" role="status">Long scan paused after a bounded session. Progress is preserved in the signed cursor; use the Full Scope button to continue. No PASS issued.</p>');
+          result.insertAdjacentHTML('beforeend', '<p class="reason" role="status">Scan paused at the 45-minute safety limit. Your signed cursor preserves the completed rows; use Full Scope to resume before its 2-hour expiry. No PASS issued.</p>');
         }
       } catch (error) {
         if (!fullScopeCancelled) result.innerHTML = errorHtml(error.message || 'Full-scope search interrupted; no PASS issued.');
@@ -511,7 +511,7 @@
           ${match ? matchHtml(match) : ''}
           ${otherExact ? '<p class="reason"><strong>Different BP found by name and address:</strong></p>' + matchHtml(otherExact) : ''}
           ${topCandidatesHtml(data.top_candidates || [])}
-          ${inconclusive && data.full_scope_cursor && lastCheckInput ? '<div class="settings"><button id="fullScopeButton" type="button" ' + (fullScopeRunning ? 'disabled' : '') + '>' + (data.full_scope_active ? 'Full Scope Search Running...' : 'Full Scope Search — Relevant Buckets') + '</button><p class="small">Manual action only. Resumes unscanned relevant length buckets in batches up to 3,000 rows. PASS only after all eligible buckets finish; not a full-database claim.</p></div>' : ''}
+          ${inconclusive && data.full_scope_cursor && lastCheckInput ? '<div class="settings"><button id="fullScopeButton" type="button" ' + (fullScopeRunning ? 'disabled' : '') + '>' + (data.full_scope_active ? 'Full Scope Search Running...' : 'Full Scope Search — Relevant Buckets') + '</button><p class="small">Manual action only. Resumes unscanned relevant length buckets in verified batches up to 12,000 rows. PASS only after all eligible buckets finish; not a full-database claim.</p></div>' : ''}
           ${data.full_scope_active ? '<p class="small">Relevant bucket progress: ' + (data.stats?.scanned_candidates ?? 0) + ' / ' + (data.stats?.candidate_space ?? '?') + ' BP records. Keep this tab open.</p>' : ''}
                     <div class="match-grid">
             <div class="kv"><span>Weighted Threshold</span><strong>${data.threshold}</strong></div>

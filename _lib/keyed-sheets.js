@@ -11,7 +11,13 @@ import {
 } from './duplicate.js';
 
 const fail=(status,message)=>Object.assign(new Error(message),{status});
-const MAX_NORMAL=6000,MAX_FULL=3000,MAX_BATCH=500,MAX_WORK_MS=20000;
+// A single signed continuation previously scanned only 3,000 BPs while
+// consuming fresh CONTROL + 2 META reads on every request. For 280k candidates
+// that caused ~94 HTTP continuations before quota pauses. Pack up to twelve
+// thousand A2/B2 postings into one bounded Google values.batchGet request;
+// no extra Google read per indexed group. Keep a 20s server work ceiling.
+const MAX_NORMAL=12000,MAX_FULL=12000,MAX_BATCH=1500,MAX_RANGES=8,
+  MAX_WORK_MS=20000;
 const sha=x=>createHash('sha256').update(x).digest('hex');
 const int=x=>Number.isSafeInteger(Number(x))&&Number(x)>=0?Number(x):NaN;
 
@@ -46,7 +52,7 @@ function restore(token,env,meta,queryHash,plan){
   if(state.v!==14||state.engine!==ENGINE_VERSION||state.sync!==meta.sync_id||
      state.queryHash!==queryHash||state.plan!==plan.signature||
      !Number.isSafeInteger(state.issuedAt)||state.issuedAt>Date.now()+30000||
-     Date.now()-state.issuedAt>3600000)
+     Date.now()-state.issuedAt>7200000)
     throw fail(409,'Search or Google Sheets generation changed; repeat Normal Check.');
   if(!Number.isSafeInteger(state.pos)||state.pos<0||
      state.pos>=plan.ordered.length||
@@ -298,8 +304,8 @@ export async function keyedCheck(payload,env,providedMeta=null){
   const allowed=payload?.full_scope_cursor?MAX_FULL:MAX_NORMAL;
   const features={tokens:tokens(qtext),numeric:numericTokens(qtext)};
   let processed=0,matched=null,scored=null;
-  // Instead of one Google read per bucket, batch up to six bounded,
-  // non-overlapping index ranges in ONE values.batchGet quota request.
+  // Instead of one Google read per bucket, batch up to eight bounded,
+  // non-overlapping ranges in ONE values.batchGet quota request.
   // Each range belongs to exactly one planned eligible group; skipped groups
   // are never silently counted, and the signed cursor advances only after
   // a COMPLETE verified response. A 429 preserves the current cursor.
@@ -307,7 +313,7 @@ export async function keyedCheck(payload,env,providedMeta=null){
         Date.now()-started<MAX_WORK_MS&&!matched){
     const slices=[];
     let p=state.pos,n=state.next,remaining=allowed-processed;
-    while(p<plan.ordered.length&&remaining>0&&slices.length<6){
+    while(p<plan.ordered.length&&remaining>0&&slices.length<MAX_RANGES){
       const g=plan.map.get(plan.ordered[p]);
       const end=Math.min(g.row_end,n+MAX_BATCH-1,n+remaining-1);
       slices.push({pos:p,begin:n,end,group:g,

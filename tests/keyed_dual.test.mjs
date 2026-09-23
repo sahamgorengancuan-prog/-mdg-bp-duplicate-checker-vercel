@@ -63,7 +63,7 @@ function makeFixture(records){
       ...shards(k,r=>r[0].slice(-2).padStart(2,'0'))]]
   ])};
 }
-async function withSheets(t,fn){
+async function withSheets(t,fn,overrideA=null){
   const before=globalThis.fetch;
   const env={
     GOOGLE_OAUTH_CLIENT_ID:'fixture',GOOGLE_OAUTH_CLIENT_SECRET:'fixture',
@@ -74,7 +74,7 @@ async function withSheets(t,fn){
     RATE_LIMIT_PER_MIN:'0',SHEETS_LOCAL_READ_BUDGET_PER_MINUTE:'0',
     RANGE_CACHE_SECONDS:'0'
   };
-  const a=makeFixture([row('BP-A','Alpha Shop','Mawar Street 10','1234567890'),
+  const a=makeFixture(overrideA || [row('BP-A','Alpha Shop','Mawar Street 10','1234567890'),
                        row('BP-B','Beta Mart','Rindu Street 8')]);
   const b=makeFixture([row('BP-A','Alpha Changed','Mawar Street 10','1234567890'),
                        row('BP-B','Beta Mart','Rindu Street 8')]);
@@ -233,4 +233,34 @@ test('incomplete batchGet range fails closed rather than PASS',async t=>{
     assert.equal(got.body.decision,undefined);
     assert.match(got.body.error,/Incomplete fuzzy posting range|Incomplete batch/);
   });
+});
+
+test('wide batched continuation scans over 3k rows per request without skipping and returns PASS only after complete coverage',async t=>{
+  const records=Array.from({length:13050},(_,i)=>
+    row('BP-'+String(i).padStart(6,'0'),'ZZZZZZZZZZZZZZ','RRRRRRRRRRRRRR'));
+  await withSheets(t,async f=>{
+    const query={name_1:'AAAAAAAAAAAAAA',address:'BBBBBBBBBBBBBB'};
+    const first=await f.check(query);
+    assert.equal(first.status,200,JSON.stringify(first.body));
+    assert.equal(first.body.decision,'INCONCLUSIVE');
+    assert(first.body.stats.scanned_candidates>3000,
+      'The old 3,000-BP ceiling must be gone');
+    assert(first.body.stats.scanned_candidates<=12000);
+    assert(f.batchCount()<=2,'Multiple groups must be fetched with minimal Google requests');
+    let cursor=first.body.full_scope_cursor;
+    let last=first.body.stats.scanned_candidates;
+    let done=null;
+    for(let attempt=0;cursor&&attempt<8;attempt++){
+      const next=await f.check({...query,full_scope_cursor:cursor});
+      assert.equal(next.status,200,JSON.stringify(next.body));
+      assert(next.body.stats.scanned_candidates>=last,'Cursor progress never rewinds');
+      last=next.body.stats.scanned_candidates;
+      if(next.body.decision==='PASS'){done=next.body;break;}
+      assert.equal(next.body.decision,'INCONCLUSIVE');
+      cursor=next.body.full_scope_cursor;
+    }
+    assert(done,'Expected all relevant BP postings to complete');
+    assert.equal(done.stats.scanned_candidates,13050);
+    assert.equal(done.stats.coverage_complete,true);
+  },records);
 });
