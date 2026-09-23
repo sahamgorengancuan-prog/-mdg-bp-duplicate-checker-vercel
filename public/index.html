@@ -323,7 +323,7 @@
     const result = $('result');
     const btn = $('submitBtn');
     const API_BASE = location.origin;
-    const EXPECTED_ENGINE_VERSION = '2026-09-23-complete-bucket-v5';
+    const EXPECTED_ENGINE_VERSION = '2026-09-23-resumable-buckets-v6';
     const FULL_SCOPE_WAIT_MS = 1300;
     let lastCheckInput = null;
     let fullScopeRunning = false;
@@ -447,8 +447,8 @@
           ${match ? matchHtml(match) : ''}
           ${otherExact ? '<p class="reason"><strong>Different BP found by name and address:</strong></p>' + matchHtml(otherExact) : ''}
           ${topCandidatesHtml(data.top_candidates || [])}
-          ${inconclusive && data.full_scope_cursor && lastCheckInput ? '<div class="settings"><button id="fullScopeButton" type="button" ' + (fullScopeRunning ? 'disabled' : '') + '>' + (data.full_scope_active ? 'Full Scope Search Running...' : 'Full Scope Search — Check All BP') + '</button><p class="small">Manual action only; checks every BP in chunks of up to 3,000 rows. This can take minutes. PASS is impossible until the full scan completes.</p></div>' : ''}
-          ${data.full_scope_active ? '<p class="small">Full-scope progress: ' + (data.stats?.scanned_candidates ?? 0) + ' / ' + (data.stats?.candidate_space ?? '?') + ' BP records. Keep this tab open.</p>' : ''}
+          ${inconclusive && data.full_scope_cursor && lastCheckInput ? '<div class="settings"><button id="fullScopeButton" type="button" ' + (fullScopeRunning ? 'disabled' : '') + '>' + (data.full_scope_active ? 'Full Scope Search Running...' : 'Full Scope Search — Relevant Buckets') + '</button><p class="small">Manual action only. Resumes unscanned relevant length buckets in batches up to 3,000 rows. PASS only after all eligible buckets finish; not a full-database claim.</p></div>' : ''}
+          ${data.full_scope_active ? '<p class="small">Relevant bucket progress: ' + (data.stats?.scanned_candidates ?? 0) + ' / ' + (data.stats?.candidate_space ?? '?') + ' BP records. Keep this tab open.</p>' : ''}
                     <div class="match-grid">
             <div class="kv"><span>Weighted Threshold</span><strong>${data.threshold}</strong></div>
             <div class="kv"><span>Direct Reject</span><strong>${data.direct_reject_threshold ?? '-'}</strong></div>

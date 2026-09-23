@@ -10,7 +10,7 @@ import { createHash, createHmac, timingSafeEqual } from 'node:crypto';
   Browser never receives OAuth credential, refresh token, or raw database dump.
 */
 
-export const ENGINE_VERSION = '2026-09-23-complete-bucket-v5';
+export const ENGINE_VERSION = '2026-09-23-resumable-buckets-v6';
 const GOOGLE_TOKEN_URL = 'https://oauth2.googleapis.com/token';
 const TOKEN_TTL_SAFETY_SECONDS = 90;
 
@@ -150,6 +150,7 @@ export function configStatus(env) {
     max_candidates: Number(env.MAX_CANDIDATES || DEFAULT_MAX_CANDIDATES),
     oversized_scan_budget: Number(env.OVERSIZED_SCAN_BUDGET || DEFAULT_OVERSIZED_SCAN_BUDGET),
     full_scope_chunk_rows: FULL_SCOPE_MAX_ROWS_PER_REQUEST,
+    full_scope_strategy: 'RESUME_ALL_ELIGIBLE_LENGTH_BUCKETS',
     max_batch_rows: Number(env.MAX_BATCH_ROWS || DEFAULT_MAX_BATCH_ROWS),
     range_cache_seconds: Number(env.RANGE_CACHE_SECONDS || DEFAULT_RANGE_CACHE_SECONDS),
     rate_limit_per_min: Number(env.RATE_LIMIT_PER_MIN || DEFAULT_RATE_LIMIT_PER_MIN),
@@ -303,18 +304,9 @@ async function duplicateCheck(payload, env) {
   }
 
   const lenIndex = await getIndexMap(env, 'INDEX_LEN', 'len', meta);
-  const maxLenDiff = getMaxLenDiff(env, textLen);
-  const bucketIds = bucketRange(textLen, maxLenDiff);
-  const entries = bucketIds.filter(bucket => lenIndex.has(bucket));
-  const candidateSpace = entries.reduce((sum, bucket) => sum + lenIndex.get(bucket).count, 0);
-  const oversized = candidateSpace > maxCandidates;
-  // Complete the smaller relevant buckets first only when the search cannot
-  // fit in one normal check. This prevents one giant nearby bucket from
-  // consuming the entire budget while smaller relevant buckets are ignored.
-  const distance = bucket => Math.abs(Number(bucket) - Math.floor(textLen / 5));
-  const ordered = entries.sort((a, b) =>
-    (oversized ? lenIndex.get(a).count - lenIndex.get(b).count : 0)
-    || distance(a) - distance(b) || Number(a) - Number(b));
+  const plan = buildBucketPlan(env, lenIndex, textLen, maxCandidates);
+  const {maxLenDiff, ordered, candidateSpace, oversized} = plan;
+  const entries = ordered;
   const requestedOversizedBudget = Number(env.OVERSIZED_SCAN_BUDGET || DEFAULT_OVERSIZED_SCAN_BUDGET);
   const oversizedBudget = Number.isSafeInteger(requestedOversizedBudget) && requestedOversizedBudget > 0
     ? requestedOversizedBudget : DEFAULT_OVERSIZED_SCAN_BUDGET;
@@ -331,8 +323,11 @@ async function duplicateCheck(payload, env) {
   let skipped = 0;
   let batches = 0;
   let completedBuckets = 0;
+  let nextBucketPos = 0;
+  let nextBucketRow = 0;
 
-  for (const bucket of ordered) {
+  for (let pos = 0; pos < ordered.length; pos++) {
+    const bucket = ordered[pos];
     const info = lenIndex.get(String(bucket));
     if (!info) continue;
     let rowStart = info.row_start;
@@ -377,7 +372,15 @@ async function duplicateCheck(payload, env) {
       }
       rowStart = chunkEnd + 1;
     }
-    if (rowStart > info.row_end) completedBuckets++;
+    if (rowStart > info.row_end) {
+      completedBuckets++;
+      nextBucketPos = pos + 1;
+      nextBucketRow = nextBucketPos < ordered.length
+        ? lenIndex.get(ordered[nextBucketPos]).row_start : 0;
+    } else {
+      nextBucketPos = pos;
+      nextBucketRow = rowStart;
+    }
     if (scanned >= scanBudget) break;
   }
 
@@ -415,38 +418,62 @@ async function duplicateCheck(payload, env) {
     result.full_scope_available = true;
     result.full_scope_cursor = createFullScopeCursor({
       env, meta, name1, address, ktpInput, threshold, directRejectThreshold, weights,
-      nextRow: 2, scanned: 0, compared: 0, batches: 0
+      plan, bucketPos: nextBucketPos, nextRow: nextBucketRow,
+      scanned, compared, batches, completedBuckets
     });
   }
   return result;
 }
 
-// Full Scope uses a signed, stateless cursor. Only an INCONCLUSIVE capped normal
-// check can create the initial cursor. Every full-scope page covers EVERY BP row
-// (not just eligible length buckets) and deliberately bypasses quickPrefilter.
+// One deterministic plan is shared by the fast check AND the manual continuation.
+// INDEX_LEN is cached per Sheets sync_id; no additional Google Sheets index is needed.
+// A bucket is only read if it intersects the configured length tolerance.
+function buildBucketPlan(env, lenIndex, textLen, maxCandidates) {
+  const maxLenDiff = getMaxLenDiff(env, textLen);
+  const eligible = bucketRange(textLen, maxLenDiff).filter(bucket => lenIndex.has(bucket));
+  const candidateSpace = eligible.reduce((n, bucket) => n + lenIndex.get(bucket).count, 0);
+  const oversized = candidateSpace > maxCandidates;
+  const distance = bucket => Math.abs(Number(bucket) - Math.floor(textLen / 5));
+  const ordered = eligible.sort((a, b) =>
+    (oversized ? lenIndex.get(a).count - lenIndex.get(b).count : 0)
+    || distance(a) - distance(b) || Number(a) - Number(b));
+  const signature = createHash('sha256').update(JSON.stringify({
+    maxLenDiff, maxCandidates, ordered: ordered.map(bucket => {
+      const info = lenIndex.get(bucket);
+      return [bucket, info.row_start, info.row_end, info.count];
+    })
+  })).digest('hex');
+  return {ordered, candidateSpace, oversized, maxLenDiff, signature};
+}
+
 function fullScopeFingerprint({name1, address, ktpInput, threshold, directRejectThreshold, weights}) {
   return createHash('sha256').update(JSON.stringify({
     name: normalizeText(name1), address: normalizeText(address),
     ktp: ktpInput, threshold, directRejectThreshold, weights
   })).digest('hex');
 }
+
 function fullScopeKey(env) {
   const secret = String(env.GOOGLE_OAUTH_REFRESH_TOKEN || '').trim();
   if (!secret) throw httpError(503, 'Full scope requires configured backend OAuth.');
-  return createHmac('sha256', secret).update('bp-duplicate-checker/full-scope/v1').digest();
+  return createHmac('sha256', secret).update('bp-duplicate-checker/relevant-buckets/v2').digest();
 }
-function createFullScopeCursor({env, meta, name1, address, ktpInput, threshold, directRejectThreshold, weights, nextRow, scanned, compared, batches}) {
+
+function createFullScopeCursor({env, meta, name1, address, ktpInput, threshold, directRejectThreshold, weights,
+  plan, bucketPos, nextRow, scanned, compared, batches, completedBuckets}) {
   const state = {
-    v: 1, engine: ENGINE_VERSION, sync: meta.sync_id,
+    v: 2, engine: ENGINE_VERSION, sync: meta.sync_id,
     fingerprint: fullScopeFingerprint({name1, address, ktpInput, threshold, directRejectThreshold, weights}),
-    total: Number(meta.total_bp_rows), nextRow, scanned, compared, batches,
+    scope: plan.signature, total: plan.candidateSpace,
+    bucketPos, nextRow, scanned, compared, batches, completedBuckets,
     issuedAt: Date.now()
   };
   const raw = base64urlJson(state);
   const signature = createHmac('sha256', fullScopeKey(env)).update(raw).digest('base64url');
   return raw + '.' + signature;
 }
-function readFullScopeCursor(token, env, meta, query) {
+
+function readFullScopeCursor(token, env, meta, query, plan, lenIndex) {
   if (typeof token !== 'string' || token.length > 4096) throw httpError(400, 'Invalid full-scope cursor.');
   const pieces = token.split('.');
   if (pieces.length !== 2 || !pieces.every(Boolean)) throw httpError(400, 'Invalid full-scope cursor.');
@@ -463,28 +490,39 @@ function readFullScopeCursor(token, env, meta, query) {
   try { state = JSON.parse(Buffer.from(raw, 'base64url').toString('utf8')); } catch (_) {
     throw httpError(400, 'Invalid full-scope cursor.');
   }
-  const total = Number(meta.total_bp_rows);
-  if (state?.engine !== ENGINE_VERSION || state?.v !== 1 ||
+  if (state?.v !== 2 || state?.engine !== ENGINE_VERSION ||
       state?.fingerprint !== fullScopeFingerprint(query)) {
-    throw httpError(409, 'Full-scope inputs, engine or scoring configuration changed. Run a new normal check.');
+    throw httpError(409, 'Full-scope inputs or engine changed. Run a new normal check.');
   }
-  if (state.sync !== meta.sync_id || state.total !== total) {
-    throw httpError(409, 'Google Sheets snapshot changed. Restart with a normal duplicate check.');
+  if (state.sync !== meta.sync_id || state.scope !== plan.signature ||
+      state.total !== plan.candidateSpace) {
+    throw httpError(409, 'Sheet snapshot, bucket index or search configuration changed. Restart normal check.');
   }
   if (!Number.isSafeInteger(state.issuedAt) || state.issuedAt > Date.now() + 30000 ||
       Date.now() - state.issuedAt > FULL_SCOPE_CURSOR_TTL_MS) {
     throw httpError(409, 'Full-scope session expired. Run a new normal check.');
   }
-  if (!Number.isSafeInteger(total) || total < 1 ||
-      !Number.isSafeInteger(state.nextRow) || state.nextRow < 2 || state.nextRow > total + 1 ||
-      !Number.isSafeInteger(state.scanned) || state.scanned !== state.nextRow - 2 ||
+  const pos = state.bucketPos;
+  if (!Number.isSafeInteger(pos) || pos < 0 || pos >= plan.ordered.length ||
+      !Number.isSafeInteger(state.scanned) || state.scanned < 0 ||
       !Number.isSafeInteger(state.compared) || state.compared < 0 || state.compared > state.scanned ||
       !Number.isSafeInteger(state.batches) || state.batches < 0 || state.batches > state.scanned ||
-      state.nextRow > total + 1) {
+      !Number.isSafeInteger(state.completedBuckets) || state.completedBuckets !== pos) {
     throw httpError(400, 'Invalid or completed full-scope cursor.');
+  }
+  const info = lenIndex.get(plan.ordered[pos]);
+  if (!Number.isSafeInteger(state.nextRow) ||
+      state.nextRow < info.row_start || state.nextRow > info.row_end) {
+    throw httpError(400, 'Invalid full-scope row pointer.');
+  }
+  const preceding = plan.ordered.slice(0, pos).reduce(
+    (n, bucket) => n + lenIndex.get(bucket).count, 0);
+  if (state.scanned !== preceding + state.nextRow - info.row_start) {
+    throw httpError(400, 'Invalid full-scope scan count.');
   }
   return state;
 }
+
 async function fullScopeCheck(payload, env) {
   const started = Date.now();
   const name1 = String(payload?.name_1 || payload?.name1 || '').trim();
@@ -497,72 +535,107 @@ async function fullScopeCheck(payload, env) {
   const weights = getSimilarityWeights(env);
   const meta = await getMeta(env);
   requireReadyExactIndex(meta);
+  const lenIndex = await getIndexMap(env, 'INDEX_LEN', 'len', meta);
+  const maxCandidates = Math.max(1, Number(env.MAX_CANDIDATES || DEFAULT_MAX_CANDIDATES));
+  const plan = buildBucketPlan(env, lenIndex, queryText.length, maxCandidates);
   const query = {name1, address, ktpInput, threshold, directRejectThreshold, weights};
-  const state = readFullScopeCursor(payload.full_scope_cursor, env, meta, query);
-  const startRow = state.nextRow;
+  const state = readFullScopeCursor(payload.full_scope_cursor, env, meta, query, plan, lenIndex);
   const configuredRows = Number(env.FULL_SCOPE_CHUNK_ROWS || FULL_SCOPE_MAX_ROWS_PER_REQUEST);
   const rowsPerRequest = Number.isFinite(configuredRows)
     ? Math.max(1, Math.min(FULL_SCOPE_MAX_ROWS_PER_REQUEST, Math.floor(configuredRows)))
     : FULL_SCOPE_MAX_ROWS_PER_REQUEST;
-  const endRow = Math.min(startRow + rowsPerRequest - 1, state.total + 1);
-  const rows = await getSheetRange(env, 'BP_DATABASE!A' + startRow + ':H' + endRow, meta.sync_id);
-  if (rows.length !== endRow - startRow + 1) {
-    throw httpError(503, 'Full-scope BP_DATABASE range incomplete. No PASS can be issued.');
-  }
-  let compared = state.compared;
+  let budget = rowsPerRequest;
   let scanned = state.scanned;
-  for (const row of rows) {
-    assertSnapshotConsistency(meta.sync_id, String(row[7] || ''), 'FULL_SCOPE -> BP_DATABASE');
-    scanned++;
-    const candidate = bpRowFromSheet(row);
-    if (!candidate.norm_text) continue;
-    compared++;
-    const score = computeSimilarity(queryText, candidate.norm_text, weights, directRejectThreshold);
-    const displayedScore = score.direct_reject ? score.trigger_score : score.combined;
-    if (score.direct_reject || score.combined >= threshold) {
-      const entry = sanitizeBpRow(candidate, displayedScore, {
-        levenshtein: score.levenshtein, jaccard: score.jaccard,
-        numeric_weighted: score.numeric, combined_weighted: score.combined,
-        decision_rule: score.direct_reject ? 'DIRECT_REJECT' : 'WEIGHTED',
-        direct_reject_metric: score.direct_reject_metric,
-        weighted_skipped: score.weighted_skipped,
-        reason: score.direct_reject ? score.direct_reject_metric + ' Direct Reject' : 'Full Scope Weighted Similarity'
-      });
-      const finalMeta = await getMeta(env);
-      requireReadyExactIndex(finalMeta);
-      if (finalMeta.sync_id !== meta.sync_id) {
-        throw httpError(503, 'Snapshot changed during full-scope search; restart normal check.');
+  let compared = state.compared;
+  let batches = state.batches;
+  let pos = state.bucketPos;
+  let nextRow = state.nextRow;
+  let completedBuckets = state.completedBuckets;
+  let found = null;
+
+  while (pos < plan.ordered.length && budget > 0 && !found) {
+    const info = lenIndex.get(plan.ordered[pos]);
+    const endRow = Math.min(info.row_end, nextRow + budget - 1);
+    const rows = await getSheetRange(env, 'BP_DATABASE!A' + nextRow + ':H' + endRow, meta.sync_id);
+    if (rows.length !== endRow - nextRow + 1) {
+      throw httpError(503, 'Relevant-bucket range incomplete. No PASS can be issued.');
+    }
+    batches++;
+    for (const row of rows) {
+      assertSnapshotConsistency(meta.sync_id, String(row[7] || ''), 'FULL_SCOPE -> BP_DATABASE');
+      scanned++;
+      const candidate = bpRowFromSheet(row);
+      // Bucket boundaries span 5 characters; ignore boundary rows outside
+      // exact tolerance, but NEVER use heuristic token exclusions.
+      if (!candidate.norm_text ||
+          Math.abs(candidate.text_len - queryText.length) > plan.maxLenDiff) continue;
+      compared++;
+      const score = computeSimilarity(queryText, candidate.norm_text, weights, directRejectThreshold);
+      if (score.direct_reject || score.combined >= threshold) {
+        found = sanitizeBpRow(candidate, score.direct_reject ? score.trigger_score : score.combined, {
+          levenshtein: score.levenshtein, jaccard: score.jaccard,
+          numeric_weighted: score.numeric, combined_weighted: score.combined,
+          decision_rule: score.direct_reject ? 'DIRECT_REJECT' : 'WEIGHTED',
+          direct_reject_metric: score.direct_reject_metric,
+          weighted_skipped: score.weighted_skipped,
+          reason: score.direct_reject ? score.direct_reject_metric + ' Direct Reject' : 'Relevant-Bucket Weighted Similarity'
+        });
+        break;
       }
-      return {
-        ok: true, decision: 'FAIL', reason: 'Full-scope duplicate found. Search stopped on a definitive match.',
-        meta, threshold, direct_reject_threshold: directRejectThreshold,
-        similarity_match: entry, full_scope_active: true, full_scope_available: false, full_scope_cursor: null,
-        stats: {scanned_candidates: scanned, compared_candidates: compared,
-          candidate_space: state.total, batches_processed: state.batches + 1,
-          coverage_complete: false, scan_limit_reached: false, elapsed_ms: Date.now() - started}
-      };
+    }
+    const consumed = endRow - nextRow + 1;
+    budget -= consumed;
+    nextRow = endRow + 1;
+    if (nextRow > info.row_end) {
+      completedBuckets++;
+      pos++;
+      nextRow = pos < plan.ordered.length ? lenIndex.get(plan.ordered[pos]).row_start : 0;
     }
   }
-  const finished = endRow === state.total + 1;
+
+  // META is always fetched uncached and must still be READY on SAME sync.
   const finalMeta = await getMeta(env);
   requireReadyExactIndex(finalMeta);
   if (finalMeta.sync_id !== meta.sync_id) {
-    throw httpError(503, 'Snapshot changed during full-scope search; restart normal check.');
+    throw httpError(503, 'Sheet generation changed during full-scope search; restart normal check.');
   }
-  const nextRow = endRow + 1;
+  const finished = !found && pos === plan.ordered.length && scanned === plan.candidateSpace;
+  const stats = {
+    scanned_candidates: scanned, compared_candidates: compared,
+    candidate_space: plan.candidateSpace, batches_processed: batches,
+    skipped_by_prefilter: 0, coverage_complete: finished,
+    scan_limit_reached: !finished && !found,
+    elapsed_ms: Date.now() - started, bucket_count: plan.ordered.length,
+    completed_buckets: completedBuckets, search_scope: 'CONFIGURED_LENGTH_BUCKETS',
+    pass_basis: finished ? 'ALL_ELIGIBLE_BUCKET_ROWS_SCORED' : null,
+    resumed_from_normal_scan: state.scanned, full_scope_batch_rows: rowsPerRequest
+  };
+  if (found) {
+    return {
+      ok: true, decision: 'FAIL', reason: 'Relevant-bucket duplicate found; continuation stopped.',
+      meta, threshold, direct_reject_threshold: directRejectThreshold,
+      similarity_match: found, full_scope_active: true, full_scope_available: false,
+      full_scope_cursor: null, stats
+    };
+  }
+  if (finished) {
+    return {
+      ok: true, decision: 'PASS',
+      reason: 'No duplicate in the fully checked configured length buckets. Exact KTP/name+address were checked in the initial normal request. This is a scoped PASS, not a full-database scan.',
+      meta, threshold, direct_reject_threshold: directRejectThreshold,
+      full_scope_active: true, full_scope_available: false, full_scope_cursor: null, stats
+    };
+  }
   return {
-    ok: true, decision: finished ? 'PASS' : 'INCONCLUSIVE',
-    reason: finished ? 'No duplicate found after full-scope verification of every BP_DATABASE row.'
-      : 'Full-scope search running. This is NOT a PASS until the full database is checked.',
+    ok: true, decision: 'INCONCLUSIVE',
+    reason: 'Continuing relevant buckets without rescanning completed rows; no PASS until all eligible buckets finish.',
     meta, threshold, direct_reject_threshold: directRejectThreshold,
-    full_scope_active: true, full_scope_available: !finished,
-    full_scope_cursor: finished ? null : createFullScopeCursor({
-      env, meta, ...query, nextRow, scanned, compared, batches: state.batches + 1
+    full_scope_active: true, full_scope_available: true,
+    full_scope_cursor: createFullScopeCursor({
+      env, meta, ...query, plan, bucketPos: pos, nextRow,
+      scanned, compared, batches, completedBuckets
     }),
-    stats: {scanned_candidates: scanned, compared_candidates: compared,
-      candidate_space: state.total, batches_processed: state.batches + 1,
-      coverage_complete: finished, scan_limit_reached: !finished,
-      elapsed_ms: Date.now() - started}
+    stats
   };
 }
 

@@ -213,9 +213,9 @@ test('health and exact response disclose running engine and index readiness with
   const f=fixture([row('TEST-BP','Example Shop','A sample street address')]);
   const health = await handleHealth({env:f.env});
   const hb = await health.json();
-  assert.equal(hb.engine_version,'2026-09-23-complete-bucket-v5');
+  assert.equal(hb.engine_version,'2026-09-23-resumable-buckets-v6');
   assert.equal(hb.exact_index_ready,true);
-  assert.equal(health.headers.get('x-bp-checker-engine'),'2026-09-23-complete-bucket-v5');
+  assert.equal(health.headers.get('x-bp-checker-engine'),'2026-09-23-resumable-buckets-v6');
   const r=await run(f,{name_1:'Example Shop',address:'A sample street address'});
   assert.equal(r.body.decision,'FAIL');
   assert.equal(r.body.exact_lookup.attempted,true);
@@ -310,10 +310,10 @@ test('identity conflict beyond five duplicate source rows is detected and previe
   assert.equal(r.body.stats.scanned_candidates,0);
 });
 
-test('manual exhaustive search continues across all rows and finds late similar BP',async()=>{
+test('resumable relevant-bucket search avoids normal rescan and finds late match',async()=>{
   const input={name_1:NAME,address:ADDRESS};
   const unrelated=Array.from({length:9},(_,i)=>row('UNRELATED-'+i,'Unrelated '+i,'Completely different sample address and another remote place street'));
-  const f=fixture([...unrelated,row('BP-LATE',NAME,ADDRESS+' extraextraextraextraextraextraextraextraextra')],{env:{MAX_CANDIDATES:'1',FULL_SCOPE_CHUNK_ROWS:'1'}});
+  const f=fixture([...unrelated,row('BP-LATE',NAME,ADDRESS+' extension')],{env:{MAX_CANDIDATES:'1',FULL_SCOPE_CHUNK_ROWS:'1'}});
   const fast=await run(f,input);
   assert.equal(fast.body.decision,'INCONCLUSIVE');
   assert.equal(fast.body.full_scope_available,true);
@@ -325,7 +325,7 @@ test('manual exhaustive search continues across all rows and finds late similar 
   assert.equal(r.body.decision,'FAIL');
   assert.equal(r.body.similarity_match.bp_id,'BP-LATE');
 });
-test('manual exhaustive search cannot PASS until every row is checked',async()=>{
+test('manual relevant-bucket search cannot PASS until all eligible rows checked',async()=>{
   const input={name_1:NAME,address:ADDRESS};
   const f=fixture([
     row('BP-X','Unrelated X','Completely different sample address and another remote place street'),
@@ -334,11 +334,13 @@ test('manual exhaustive search cannot PASS until every row is checked',async()=>
   ],{env:{MAX_CANDIDATES:'1',FULL_SCOPE_CHUNK_ROWS:'1'}});
   let r=await run(f,input);
   assert.equal(r.body.decision,'INCONCLUSIVE');
-  for(let i=1;i<=3;i++){
+  assert.equal(r.body.stats.scanned_candidates,1);
+  for(let i=2;i<=3;i++){
     r=await run(f,{...input,full_scope_cursor:r.body.full_scope_cursor});
     assert.equal(r.status,200,r.body.error);
     assert.equal(r.body.stats.scanned_candidates,i);
     assert.equal(r.body.decision,i===3?'PASS':'INCONCLUSIVE');
+    assert.equal(r.body.stats.resumed_from_normal_scan,i-1);
   }
   assert.equal(r.body.stats.coverage_complete,true);
   assert.equal(r.body.full_scope_cursor,null);
@@ -399,4 +401,35 @@ test('normal score checks all in-tolerance candidates without quickPrefilter exc
   assert.equal(r.body.decision,'PASS');
   assert.equal(r.body.stats.compared_candidates,1);
   assert.equal(r.body.stats.skipped_by_prefilter,0);
+});
+
+test('full-scope continuation skips distant buckets and does not reread the normal-scan row',async()=>{
+  const input={name_1:NAME,address:ADDRESS};
+  const f=fixture([
+    row('NEAR-A','Unrelated 1','Completely different sample address and another remote place street'),
+    row('NEAR-B','Unrelated 2','Completely different sample address and another remote place street'),
+    row('FAR','Distant', 'x'.repeat(270))
+  ],{env:{MAX_CANDIDATES:'1',FULL_SCOPE_CHUNK_ROWS:'1'}});
+  let r=await run(f,input);
+  assert.equal(r.body.decision,'INCONCLUSIVE');
+  assert.equal(r.body.stats.candidate_space,2);
+  const fastRows=f.requests.filter(x=>x.startsWith('BP_DATABASE!'));
+  assert.equal(fastRows.length,1);
+  r=await run(f,{...input,full_scope_cursor:r.body.full_scope_cursor});
+  assert.equal(r.body.decision,'PASS');
+  assert.equal(r.body.stats.scanned_candidates,2);
+  assert.equal(r.body.stats.resumed_from_normal_scan,1);
+  const allRows=f.requests.filter(x=>x.startsWith('BP_DATABASE!'));
+  assert.equal(allRows.length,2);
+  assert.notEqual(allRows[0],allRows[1]);
+  assert.equal(r.body.stats.search_scope,'CONFIGURED_LENGTH_BUCKETS');
+  assert.equal(r.body.stats.pass_basis,'ALL_ELIGIBLE_BUCKET_ROWS_SCORED');
+});
+
+test('normal PASS does not mint Full Scope button cursor',async()=>{
+  const f=fixture([row('PASS-1','Unrelated 1','Completely different sample address and another remote place street')],{env:{MAX_CANDIDATES:'3'}});
+  const r=await run(f,{name_1:NAME,address:ADDRESS});
+  assert.equal(r.body.decision,'PASS');
+  assert.equal(r.body.full_scope_cursor,null);
+  assert.equal(r.body.full_scope_available,false);
 });
