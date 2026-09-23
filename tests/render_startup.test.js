@@ -32,7 +32,8 @@ test('Render yarn start boots, serves frontend and API without leaking private f
   const port = await availablePort();
   const cmd = process.platform === 'win32' ? 'yarn.cmd' : 'yarn';
   const child = spawn(cmd, ['start'], {
-    cwd: new URL('../', import.meta.url).pathname,
+    cwd: process.cwd(),
+    detached: process.platform !== 'win32',
     env: { ...process.env, PORT: String(port) },
     stdio: ['ignore', 'pipe', 'pipe']
   });
@@ -54,7 +55,8 @@ test('Render yarn start boots, serves frontend and API without leaking private f
     assert.equal(info.status, 200);
   } finally {
     if (child.exitCode === null && child.signalCode === null) {
-      child.kill();
+      if (process.platform !== 'win32') process.kill(-child.pid, 'SIGTERM');
+      else child.kill();
       await new Promise(resolve => child.once('exit', resolve));
     }
   }
