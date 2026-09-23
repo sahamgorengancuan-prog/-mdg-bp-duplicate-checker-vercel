@@ -3,3 +3,4 @@ psycopg2-binary>=2.9.9
 python-dotenv>=1.0.1
 gspread>=6.1.4
 google-auth>=2.35.0
+google-auth-oauthlib>=1.2.0

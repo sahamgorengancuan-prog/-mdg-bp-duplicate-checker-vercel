@@ -68,7 +68,8 @@ async function withSheets(t,fn,overrideA=null){
   const env={
     GOOGLE_OAUTH_CLIENT_ID:'fixture',GOOGLE_OAUTH_CLIENT_SECRET:'fixture',
     GOOGLE_OAUTH_REFRESH_TOKEN:'fixture-very-long-backend-refresh-token',
-    GSHEET_SNAPSHOT_MODE:'dual',SHEET_A_ID:'TEST_A',SHEET_B_ID:'TEST_B',
+    GSHEET_SNAPSHOT_MODE:'dual',SNAPSHOT_ENGINE:'keyed',
+    SHEET_A_ID:'TEST_A',SHEET_B_ID:'TEST_B',
     SHEET_A2_ID:'TEST_A2',SHEET_B2_ID:'TEST_B2',
     SHEET_CONTROL_ID:'TEST_CONTROL',SHEET_ID:'TEST_LEGACY',
     RATE_LIMIT_PER_MIN:'0',SHEETS_LOCAL_READ_BUDGET_PER_MINUTE:'0',

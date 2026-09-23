@@ -3,7 +3,7 @@ import { createServer } from 'node:http';
 import { readFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import { dirname, join, resolve } from 'node:path';
-import { handleCheck, handleHealth, handleOptions, json } from './_lib/duplicate.js';
+import { handleCheck, handleHealth, handleOptions, json, snapshotEngine } from './_lib/duplicate.js';
 
 const ROOT = dirname(fileURLToPath(import.meta.url));
 const BODY_LIMIT = 65536;
@@ -58,4 +58,12 @@ export async function respond(req, res) {
 if (process.argv[1] && fileURLToPath(import.meta.url) === resolve(process.argv[1])) {
   createServer(respond).listen(Number(process.env.PORT || 3000), '0.0.0.0', () =>
     console.log('BP Duplicate Checker Node service ready'));
+  // Dual mode: load the committed BP generation into RAM at boot and follow
+  // CONTROL in the background, so /api/check never waits on Google Sheets.
+  if (String(process.env.GSHEET_SNAPSHOT_MODE || '').toLowerCase() === 'dual' &&
+      snapshotEngine(process.env) === 'memory' && process.env.GOOGLE_OAUTH_REFRESH_TOKEN) {
+    import('./_lib/memory-engine.js')
+      .then(memory => memory.startSnapshotRefresher(process.env))
+      .catch(error => console.error('[memory-engine] refresher failed to start:', error?.message));
+  }
 }

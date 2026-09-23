@@ -1,3 +1,6 @@
+> v15 note: the Render engine now full-scans every BP in memory from the
+> PACKED_SNAPSHOT tab written by this same sync; see MEMORY_FULL_SCAN_V15.md.
+
 # V14 paired/packed Google Sheets — safe deployment and recovery
 
 **Status:** Five workbook IDs configured in GitHub. The Google Drive connector

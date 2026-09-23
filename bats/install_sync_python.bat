@@ -24,5 +24,6 @@ if not exist .env (
 
 echo.
 echo Installation complete.
-echo Put service_account.json in this folder and share the Google Sheet to the service account email.
+echo Google access uses the OAuth user token (oauth_token.json / client_secret_oauth.json).
+echo No service account is used. Run bats\sync_to_gsheet_now.bat once to test the sync.
 pause

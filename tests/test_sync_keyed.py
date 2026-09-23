@@ -1,4 +1,7 @@
 """Google Sheets-only A/B keyed sync, proven OAuth, no private PostgreSQL."""
+import base64
+import gzip
+import hashlib
 import importlib
 import json
 from pathlib import Path
@@ -71,7 +74,7 @@ class FakeWS:
 
 class FakeBook:
     def __init__(self,id):
-        self.id=id;self.sheets={}
+        self.id=id;self.sheets={};self.batch_requests=[];self.refuse_batch=False
     def worksheet(self,title):
         if title not in self.sheets:raise WorksheetNotFound(title)
         return self.sheets[title]
@@ -81,10 +84,23 @@ class FakeBook:
         return self.sheets[title]
     def fetch_sheet_metadata(self):
         return {"sheets":[{
-            "properties":{"title":title,
+            "properties":{"title":title,"sheetId":id(sheet),
                 "gridProperties":{"rowCount":sheet.row_count,
                                   "columnCount":sheet.col_count}}
             } for title,sheet in self.sheets.items()]}
+    def batch_update(self,body):
+        if self.refuse_batch:
+            raise RuntimeError("APIError: [400]: This document is too large to continue editing.")
+        for request in body["requests"]:
+            self.batch_requests.append(request)
+            if "deleteSheet" in request:
+                target=request["deleteSheet"]["sheetId"]
+                self.sheets={t:ws for t,ws in self.sheets.items() if id(ws)!=target}
+            elif "addSheet" in request:
+                props=request["addSheet"]["properties"]
+                self.add_worksheet(props["title"],100,2)
+            else:
+                raise AssertionError(request)
 
 class FakeGC:
     def __init__(self):
@@ -291,3 +307,133 @@ def test_new_index_book_is_not_published_if_metadata_write_fails(monkeypatch):
     with pytest.raises(RuntimeError,match='simulated staging'):
         keyed.sync_sheet(data0,'fail-secondary-meta')
     assert gc.books['CONTROL'].sheets=={}
+
+
+def unpack(book):
+    rows=book.worksheet("PACKED_SNAPSHOT").rows
+    assert rows[0]==["part_no","part_count","sync_id","data"]
+    text="".join(r[3] for r in rows[1:])
+    raw=gzip.decompress(base64.b64decode(text))
+    return rows,raw
+
+def control_of(gc):
+    return dict(r for r in gc.books["CONTROL"].worksheet("ACTIVE").get("A1:B20")[1:] if r and r[0])
+
+def test_packed_snapshot_round_trip_and_meta(monkeypatch):
+    gc=configured(monkeypatch)
+    monkeypatch.setattr(keyed,"PACKED_PART_CHARS",50)  # force many parts
+    src=keyed.make_records(data([
+        ['BP-B','ZB02','Beta\tTab','Street\n12','5678'],
+        ['BP-A','ZB03','Alpha','Street 10','']]))
+    result=keyed.sync_sheet(src,"gen-packed")
+    assert result["packed_parts"]>1
+    rows,raw=unpack(gc.books["A2"])
+    assert all(r[2]=="gen-packed" and r[1]==str(len(rows)-1) for r in rows[1:])
+    assert [r[0] for r in rows[1:]]==[str(n) for n in range(1,len(rows))]
+    lines=raw.decode("utf-8").split("\n")
+    assert lines[0]=="bp_id\tbp_type_id\tname_1\taddress\tktp_digits"
+    assert lines[1:]==["BP-A\tZB03\tAlpha\tStreet 10\t","BP-B\tZB02\tBeta Tab\tStreet 12\t5678"]
+    sha=hashlib.sha256(raw).hexdigest()
+    for book in ("A","A2"):
+        meta=dict(r for r in gc.books[book].worksheet("META").get("A2:B40") if r and r[0])
+        assert meta["packed_sha256"]==sha and meta["packed_snapshot_version"]=="1"
+        assert meta["packed_records"]=="2" and meta["packed_parts"]==str(len(rows)-1)
+    control=control_of(gc)
+    assert control["packed_sha256"]==sha and control["active_index_sheet_id"]=="A2"
+    assert "PACKED_SNAPSHOT" not in gc.books["A"].sheets
+
+def test_noop_only_when_active_pair_has_current_packed(monkeypatch):
+    gc=configured(monkeypatch)
+    src=keyed.make_records(data([['BP-1','ZB02','Alpha','Street 10','1234']]))
+    monkeypatch.setenv("GSHEET_PACKED_SNAPSHOT","off")
+    first=keyed.sync_sheet(src,"v14-style")
+    assert first["packed_parts"]==0 and "PACKED_SNAPSHOT" not in gc.books["A2"].sheets
+    assert keyed.sync_sheet(src,"still-noop")["sync_id"]=="v14-style"
+    monkeypatch.setenv("GSHEET_PACKED_SNAPSHOT","on")
+    upgraded=keyed.sync_sheet(src,"with-packed")
+    assert upgraded["sync_id"]=="with-packed" and upgraded["packed_parts"]>=1
+    assert control_of(gc)["active_sheet_id"]=="B"
+    assert "PACKED_SNAPSHOT" in gc.books["B2"].sheets
+    assert keyed.sync_sheet(src,"noop-again")["sync_id"]=="with-packed"
+
+def test_meta_block_clears_stale_keys(monkeypatch):
+    gc=configured(monkeypatch)
+    src=keyed.make_records(data([['BP-1','ZB02','Alpha','Street 10','1234']]))
+    keyed.sync_sheet(src,"packed-A")
+    changed=keyed.make_records(data([['BP-1','ZB02','Alpha 2','Street 10','1234']]))
+    keyed.sync_sheet(changed,"packed-B")
+    monkeypatch.setenv("GSHEET_PACKED_SNAPSHOT","off")
+    again=keyed.make_records(data([['BP-1','ZB02','Alpha 3','Street 10','1234']]))
+    keyed.sync_sheet(again,"plain-A")
+    meta=dict(r for r in gc.books["A2"].worksheet("META").get("A2:B40") if r and r[0])
+    assert meta["sync_id"]=="plain-A" and "packed_sha256" not in meta
+    assert control_of(gc)["packed_sha256"]==""
+
+def test_stale_v13_index_tabs_are_pruned_from_staging_primary_only(monkeypatch):
+    gc=configured(monkeypatch)
+    old_a=gc.books["A"]
+    bp=old_a.add_worksheet("BP_DATABASE",rows=100,cols=8)
+    src=keyed.make_records(data([['BP-1','ZB02','A','B','123']]))
+    bp.rows=[keyed.COLUMNS[:],keyed.sheet_row(src['BP-1'])]
+    for title in ("INDEX_LEN_TOKEN","KTP_INDEX","INDEX_LEN"):
+        old_a.add_worksheet(title,rows=100,cols=4).rows=[["stale"]]
+    first=keyed.sync_sheet(src,"first-B")        # A has old staging -> B+B2
+    assert first["sync_id"]=="first-B" and control_of(gc)["active_sheet_id"]=="B"
+    assert "INDEX_LEN_TOKEN" in old_a.sheets    # untouched while not staged
+    changed=keyed.make_records(data([['BP-1','ZB02','A changed','B','123']]))
+    keyed.sync_sheet(changed,"second-A")
+    assert set(old_a.sheets)=={"BP_DATABASE","META"}
+    assert old_a.worksheet("BP_DATABASE").row_values(2)[2]=="A changed"
+    assert control_of(gc)["active_sheet_id"]=="A"
+    assert all("deleteSheet" in r for r in old_a.batch_requests)
+    assert gc.books["B"].batch_requests==[]      # active pair never pruned
+
+def test_prune_refusal_keeps_active_pointer(monkeypatch):
+    gc=configured(monkeypatch)
+    src=keyed.make_records(data([['BP-1','ZB02','A','B','123']]))
+    keyed.sync_sheet(src,"live-A")
+    before=control_of(gc)
+    gc.books["B"].add_worksheet("EXACT_INDEX",rows=100,cols=3)
+    gc.books["B"].refuse_batch=True
+    changed=keyed.make_records(data([['BP-1','ZB02','A2','B','123']]))
+    with pytest.raises(RuntimeError,match="delete those tabs by hand"):
+        keyed.sync_sheet(changed,"blocked-B")
+    assert control_of(gc)==before
+
+def test_python_packed_payload_is_read_identically_by_node_engine(tmp_path):
+    """Cross-language contract: Python writes, the Render engine reads."""
+    import shutil,subprocess
+    node=shutil.which("node")
+    if not node:
+        pytest.skip("node not installed")
+    records=keyed.make_records(data([
+        ['110000001','ZB02','PT. Maju Jaya, Tbk','Jl. Raya No.12 RT 01/02','3171-2345-6789-0001'],
+        ['110000002','ZB03','Café Ñandú','Jl.\tMerdeka\n45 Kec. Ciledug',''],
+        ['110000003','ZB02','王小明 Store','Gg. Mawar 7',' 3674 0000 1111 2222 '],
+        ['110000004','ZB02','','','']]))
+    packed=keyed.build_packed(records)
+    payload=tmp_path/"packed.json"
+    payload.write_text(json.dumps({"parts":packed["parts"],"sha":packed["sha256"]}),encoding="utf-8")
+    script=f"""
+const fs=await import('node:fs');const zlib=await import('node:zlib');
+const crypto=await import('node:crypto');
+const m=await import({json.dumps((ROOT/'_lib'/'memory-engine.js').as_uri())});
+const d=await import({json.dumps((ROOT/'_lib'/'duplicate.js').as_uri())});
+const x=JSON.parse(fs.readFileSync({json.dumps(str(payload))},'utf8'));
+const raw=zlib.gunzipSync(Buffer.from(x.parts.join(''),'base64'));
+if(crypto.createHash('sha256').update(raw).digest('hex')!==x.sha)throw Error('sha');
+const s=await m.buildSnapshotIndex(raw,{{expectedRecords:{len(records)}}});
+const out={{}};
+for(let i=0;i<s.count;i++){{const r=s.record(i);
+  out[r.bp_id]={{norm:r.norm_text,exact:d.exactNameAddressHash(r.name_1,r.address),ktp:r.ktp,
+    found:s.findKtp(r.ktp).map(x=>x.bp_id)}};}}
+console.log(JSON.stringify(out));
+"""
+    got=json.loads(subprocess.run([node,"--input-type=module","-e",script],
+        capture_output=True,text=True,check=True,cwd=ROOT).stdout)
+    assert set(got)==set(records)
+    for key,rec in records.items():
+        assert got[key]["norm"]==rec["norm_text"]
+        assert got[key]["exact"]==rec["exact_hash"]
+        assert got[key]["ktp"]==rec["ktp_number"]
+        assert got[key]["found"]==([key] if rec["ktp_number"] else [])
