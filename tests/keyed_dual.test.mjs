@@ -264,3 +264,29 @@ test('wide batched continuation scans over 3k rows per request without skipping 
     assert.equal(done.stats.coverage_complete,true);
   },records);
 });
+
+test('Google oversized batch is split into smaller ordered requests without skipping eligible BP rows',async t=>{
+  const records=Array.from({length:1600},(_,i)=>
+    row('BP-'+String(i).padStart(5,'0'),'ZZZZZZZZZZZZZZ','RRRRRRRRRRRRRR'));
+  await withSheets(t,async f=>{
+    const normalFetch=globalThis.fetch;
+    let splitCount=0;
+    globalThis.fetch=async input=>{
+      if(String(input).includes('values:batchGet?')&&
+         new URL(String(input)).searchParams.getAll('ranges').length>1){
+        splitCount++;
+        return new Response('',{status:413});
+      }
+      return normalFetch(input);
+    };
+    const got=await f.check({
+      name_1:'AAAAAAAAAAAAAA',address:'BBBBBBBBBBBBBB'
+    });
+    assert.equal(got.status,200,JSON.stringify(got.body));
+    assert.equal(got.body.decision,'PASS');
+    assert.equal(got.body.stats.scanned_candidates,1600);
+    assert(got.body.stats.coverage_complete);
+    assert(splitCount>=1);
+    assert(f.batchCount()>=2);
+  },records);
+});

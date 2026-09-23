@@ -1164,6 +1164,14 @@ export async function getSheetRanges(env,ranges,syncId='') {
   for(const range of ranges)query.append('ranges',range);
   const url=`https://sheets.googleapis.com/v4/spreadsheets/${encodeURIComponent(sheetId)}/values:batchGet?${query.toString()}`;
   const res=await fetch(url,{headers:{Authorization:`Bearer ${token}`}});
+  // Oversized / timed-out Google batch: retry as smaller ordered batches.
+  // An incomplete successful response or upstream 429 must never be ignored.
+  if([413,502,504].includes(res.status)&&ranges.length>1){
+    const mid=Math.ceil(ranges.length/2);
+    const first=await getSheetRanges(env,ranges.slice(0,mid),syncId);
+    const second=await getSheetRanges(env,ranges.slice(mid),syncId);
+    return first.concat(second);
+  }
   if(res.status===429){
     const retryHeader=Number(res.headers.get('retry-after'));
     const wait=Number.isFinite(retryHeader)&&retryHeader>0

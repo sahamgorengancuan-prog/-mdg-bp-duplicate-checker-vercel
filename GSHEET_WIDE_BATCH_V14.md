@@ -13,6 +13,9 @@ even though group ranges were already indexed.
 - Up to eight indexed group slices of 1,500 rows are fetched in a single
   Google `values.batchGet` request. Every expected range, order and row count
   must match; a partial response fails closed.
+- If Google explicitly rejects a large batch (HTTP 413/502/504), the
+  reader splits it into smaller ordered batches, with the same per-range
+  integrity checks. Upstream 429 never gets bypassed.
 - The estimated 281,324 eligible candidates require about 24 candidate
   continuations instead of 94, if each completes its budget.
   This is an arithmetic ceiling estimate, **not a real Google/Render latency
