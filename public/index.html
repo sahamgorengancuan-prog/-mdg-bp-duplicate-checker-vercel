@@ -323,13 +323,16 @@
     const result = $('result');
     const btn = $('submitBtn');
     const API_BASE = location.origin;
-    const EXPECTED_ENGINE_VERSION = '2026-09-23-score-bounds-v9';
+    const EXPECTED_ENGINE_VERSION = '2026-09-23-bounded-normal-v10';
     // Move promptly when there is quota headroom; throttle only when the
     // backend reports pressure, rather than a fixed 12-second delay.
     const FULL_SCOPE_WAIT_MS = 200;
     const MAX_QUOTA_RETRIES = 8;
+    const MAX_NORMAL_QUOTA_RETRIES = 1;
+    const FULL_SCOPE_SESSION_MS = 175000;
     const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
     let lastCheckInput = null;
+    let lastRenderedResult = null;
     let fullScopeRunning = false;
     let fullScopeCancelled = false;
 
@@ -379,7 +382,7 @@
             if (!res.ok || !json.ok) throw new Error(json.error || 'Check failed');
             break;
           }
-          if (++quotaRetries > MAX_QUOTA_RETRIES) {
+          if (++quotaRetries > MAX_NORMAL_QUOTA_RETRIES) {
             throw new Error('Google Sheets read quota remains exhausted. No PASS issued. Please retry later when quota and sync traffic recover.');
           }
           const retrySeconds = Math.max(2, Math.min(120, Number(json.retry_after_seconds) || 70));
@@ -411,8 +414,12 @@
       const snapshot = { ...lastCheckInput };
       let nextCursor = cursor;
       let quotaRetries = 0;
+      const sessionStarted = Date.now();
+      let paused = false;
+      let lastKnown = lastRenderedResult;
       try {
         while (nextCursor && !fullScopeCancelled) {
+          if (Date.now() - sessionStarted >= FULL_SCOPE_SESSION_MS) { paused = true; break; }
           const response = await fetch(API_BASE + '/api/check', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
@@ -421,9 +428,7 @@
           const data = await response.json();
           if (response.status === 429) {
             quotaRetries++;
-            if (quotaRetries > MAX_QUOTA_RETRIES) {
-              throw new Error('Google Sheets remains rate-limited. Search NOT complete; retry the normal check after quota recovers.');
-            }
+            if (quotaRetries > MAX_QUOTA_RETRIES) { paused = true; break; }
             // Same cursor, same inputs: a failed HTTP request cannot advance
             // the search or produce PASS. Let the quota minute refill.
             const retrySeconds = Math.max(15, Math.min(120, Number(data.retry_after_seconds) || 70));
@@ -432,10 +437,11 @@
               result.insertAdjacentHTML('beforeend', '<p id="quotaWait" class="reason" role="status"></p>');
               waitBox = $('quotaWait');
             }
-            for (let left = retrySeconds; left > 0 && !fullScopeCancelled; left--) {
+            for (let left = retrySeconds; left > 0 && !fullScopeCancelled && Date.now() - sessionStarted < FULL_SCOPE_SESSION_MS; left--) {
               waitBox.textContent = 'Google Sheets read quota reached. Search paused at the last completed batch; retrying same cursor in ' + left + 's. No PASS issued.';
               await sleep(1000);
             }
+            if (Date.now() - sessionStarted >= FULL_SCOPE_SESSION_MS) { paused = true; break; }
             continue;
           }
           if (!response.ok || !data.ok) throw new Error(data.error || 'Full-scope chunk failed');
@@ -445,6 +451,7 @@
             throw new Error('Engine or Sheets snapshot changed during full-scope search.');
           }
           if (fullScopeCancelled) break;
+          lastKnown = data;
           renderResult(data);
           if (data.decision !== 'INCONCLUSIVE') break;
           nextCursor = data.full_scope_cursor;
@@ -456,13 +463,18 @@
               result.insertAdjacentHTML('beforeend', '<p id="quotaWait" class="reason" role="status"></p>');
               waitBox = $('quotaWait');
             }
-            for (let left = pause; left > 0 && !fullScopeCancelled; left--) {
+            for (let left = pause; left > 0 && !fullScopeCancelled && Date.now() - sessionStarted < FULL_SCOPE_SESSION_MS; left--) {
               waitBox.textContent = 'Quota headroom reserved. Continuing from the last unscanned BP in ' + left + 's.';
               await sleep(1000);
             }
           } else {
             await sleep(FULL_SCOPE_WAIT_MS);
           }
+        }
+        if (paused && !fullScopeCancelled && lastKnown?.full_scope_cursor) {
+          fullScopeRunning = false;
+          renderResult(lastKnown);
+          result.insertAdjacentHTML('beforeend', '<p class="reason" role="status">Long scan paused after a bounded session. Progress is preserved in the signed cursor; use the Full Scope button to continue. No PASS issued.</p>');
         }
       } catch (error) {
         if (!fullScopeCancelled) result.innerHTML = errorHtml(error.message || 'Full-scope search interrupted; no PASS issued.');
@@ -482,6 +494,7 @@
     }
 
     function renderResult(data) {
+      lastRenderedResult = data;
       const fail = data.decision === 'FAIL';
       const inconclusive = data.decision === 'INCONCLUSIVE';
       const badge = fail || inconclusive ? 'fail' : 'pass';

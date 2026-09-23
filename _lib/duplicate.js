@@ -10,7 +10,7 @@ import { createHash, createHmac, timingSafeEqual } from 'node:crypto';
   Browser never receives OAuth credential, refresh token, or raw database dump.
 */
 
-export const ENGINE_VERSION = '2026-09-23-score-bounds-v9';
+export const ENGINE_VERSION = '2026-09-23-bounded-normal-v10';
 const GOOGLE_TOKEN_URL = 'https://oauth2.googleapis.com/token';
 const TOKEN_TTL_SAFETY_SECONDS = 90;
 
@@ -18,6 +18,10 @@ const DEFAULT_SHEET_ID = '1ZtNDikRHklwQMYxWQ6hkL1clvdH6g_Xfd3ojr5APDjo';
 const DEFAULT_SIMILARITY_THRESHOLD = 92;
 const DEFAULT_SIMILARITY_DIRECT_REJECT_THRESHOLD = 80;
 const DEFAULT_MAX_CANDIDATES = 60000;
+// Bound per-request normal fuzzy work. Incomplete coverage => signed continuation.
+const NORMAL_MAX_ROWS_PER_REQUEST = 6000;
+const NORMAL_MAX_PROCESSING_MS = 20000;
+const NORMAL_MAX_BATCH_ROWS = 1000;
 // When the eligible bucket union exceeds the normal cap, cap the exploratory
 // work too: report INCONCLUSIVE quickly rather than wasting 60,000 reads.
 const DEFAULT_OVERSIZED_SCAN_BUDGET = 6000;
@@ -160,6 +164,9 @@ export function configStatus(env) {
     similarity_threshold: Number(env.SIMILARITY_THRESHOLD || DEFAULT_SIMILARITY_THRESHOLD),
     similarity_direct_reject_threshold: getSimilarityDirectRejectThreshold(env),
     max_candidates: Number(env.MAX_CANDIDATES || DEFAULT_MAX_CANDIDATES),
+    normal_max_rows_per_request: NORMAL_MAX_ROWS_PER_REQUEST,
+    normal_max_processing_ms: NORMAL_MAX_PROCESSING_MS,
+    normal_batch_rows: NORMAL_MAX_BATCH_ROWS,
     oversized_scan_budget: Number(env.OVERSIZED_SCAN_BUDGET || DEFAULT_OVERSIZED_SCAN_BUDGET),
     full_scope_chunk_rows: FULL_SCOPE_MAX_ROWS_PER_REQUEST,
     full_scope_strategy: 'RESUME_ALL_ELIGIBLE_LENGTH_BUCKETS',
@@ -237,7 +244,7 @@ async function duplicateCheck(payload, env) {
   const threshold = Number(env.SIMILARITY_THRESHOLD || DEFAULT_SIMILARITY_THRESHOLD);
   const directRejectThreshold = getSimilarityDirectRejectThreshold(env);
   const maxCandidates = Math.max(1, Number(env.MAX_CANDIDATES || DEFAULT_MAX_CANDIDATES));
-  const batchRows = Math.max(1, Number(env.MAX_BATCH_ROWS || DEFAULT_MAX_BATCH_ROWS));
+  const batchRows = Math.max(1, Math.min(NORMAL_MAX_BATCH_ROWS, Number(env.MAX_BATCH_ROWS || DEFAULT_MAX_BATCH_ROWS)));
   const weights = getSimilarityWeights(env);
   const meta = await getMeta(env);
   requireReadyExactIndex(meta);
@@ -326,7 +333,14 @@ async function duplicateCheck(payload, env) {
   const requestedOversizedBudget = Number(env.OVERSIZED_SCAN_BUDGET || DEFAULT_OVERSIZED_SCAN_BUDGET);
   const oversizedBudget = Number.isSafeInteger(requestedOversizedBudget) && requestedOversizedBudget > 0
     ? requestedOversizedBudget : DEFAULT_OVERSIZED_SCAN_BUDGET;
-  const scanBudget = oversized ? Math.min(maxCandidates, oversizedBudget) : maxCandidates;
+  // An operator may REDUCE, never raise, the per-request cap. This is useful
+  // for a slow Render instance or a deterministic regression fixture.
+  const configuredNormalRows = Number(env.NORMAL_MAX_ROWS_PER_REQUEST ?? NORMAL_MAX_ROWS_PER_REQUEST);
+  const normalRows = Number.isSafeInteger(configuredNormalRows) && configuredNormalRows > 0
+    ? Math.min(NORMAL_MAX_ROWS_PER_REQUEST, configuredNormalRows)
+    : NORMAL_MAX_ROWS_PER_REQUEST;
+  const scanBudget = Math.min(normalRows,
+    oversized ? Math.min(maxCandidates, oversizedBudget) : maxCandidates);
   result.stats.candidate_space = candidateSpace;
   result.stats.bucket_count = entries.length;
   result.stats.oversized_bucket_space = oversized;
@@ -342,7 +356,9 @@ async function duplicateCheck(payload, env) {
   let batches = 0;
   let completedBuckets = 0;
   let nextBucketPos = 0;
-  let nextBucketRow = 0;
+  let nextBucketRow = ordered.length ? searchIndex.get(ordered[0]).row_start : 0;
+  let stoppedForTime = false;
+  let stoppedForQuota = false;
 
   for (let pos = 0; pos < ordered.length; pos++) {
     const bucket = ordered[pos];
@@ -350,8 +366,22 @@ async function duplicateCheck(payload, env) {
     if (!info) continue;
     let rowStart = info.row_start;
     while (rowStart <= info.row_end && scanned < scanBudget) {
+      if (Date.now() - started >= NORMAL_MAX_PROCESSING_MS) {
+        stoppedForTime = true;
+        break;
+      }
       const chunkEnd = Math.min(rowStart + batchRows - 1, info.row_end, rowStart + scanBudget - scanned - 1);
-      const rows = await getSheetRange(env, `BP_DATABASE!A${rowStart}:H${chunkEnd}`, meta.sync_id);
+      let rows;
+      try {
+        rows = await getSheetRange(env, `BP_DATABASE!A${rowStart}:H${chunkEnd}`, meta.sync_id);
+      } catch (error) {
+        // Preserve completed normal rows instead of throwing away progress and
+        // resubmitting the entire 60k-candidate request after a quota error.
+        // Exact checks and the verified search plan already completed.
+        if (error?.status !== 429) throw error;
+        stoppedForQuota = true;
+        break;
+      }
       batches += 1;
       if (rows.length !== chunkEnd - rowStart + 1) {
         throw httpError(503, `Incomplete BP_DATABASE range ${rowStart}:${chunkEnd}; refusing a false PASS. Run a full sync.`);
@@ -399,7 +429,7 @@ async function duplicateCheck(payload, env) {
       nextBucketPos = pos;
       nextBucketRow = rowStart;
     }
-    if (scanned >= scanBudget) break;
+    if (scanned >= scanBudget || stoppedForTime || stoppedForQuota) break;
   }
 
   const complete = scanned === candidateSpace;
@@ -413,7 +443,10 @@ async function duplicateCheck(payload, env) {
     search_scope: meta.token_index_version === '1' ? 'SCORE_BOUND_INDEXED_LENGTH_BUCKETS' : 'CONFIGURED_LENGTH_BUCKETS',
     pass_basis: complete ? (meta.token_index_version === '1' ? 'ALL_RELEVANT_ROWS_SCORED_OR_SAFELY_PRUNED' : 'ALL_ELIGIBLE_BUCKET_ROWS_SCORED') : null,
     safely_pruned_candidates: plan.safelyPruned,
-    score_bound_index_used: meta.token_index_version === '1'
+    score_bound_index_used: meta.token_index_version === '1',
+    stopped_for_time_budget: stoppedForTime,
+    stopped_for_quota: stoppedForQuota,
+    normal_row_budget: normalRows
   };
   result.top_candidates = best;
   if (found) {
@@ -434,7 +467,7 @@ async function duplicateCheck(payload, env) {
     result.reason = `No duplicate under configured rules: scored ${scanned} rows in ${entries.length} search groups; safely eliminated ${plan.safelyPruned} additional rows using conservative score upper bounds. Exact indexes checked. This is a scoped PASS, not a full-database scan.`;
   } else {
     result.decision = 'INCONCLUSIVE';
-    result.reason = `Eligible buckets contain ${candidateSpace} records, exceeding the normal budget of ${maxCandidates}. Checked ${scanned} (including ${completedBuckets} completed smaller buckets); manual Full Scope is available. This is NOT a PASS.`;
+    result.reason = `Normal scan stopped safely after ${scanned} of ${candidateSpace} eligible rows (${stoppedForQuota ? 'Sheets read quota' : stoppedForTime ? 'processing-time budget' : 'bounded row budget'}). ${plan.safelyPruned} rows were excluded by safe score bounds. Continue remaining work with the manual Full Scope button; this is NOT a PASS.`;
     result.full_scope_available = true;
     result.full_scope_cursor = createFullScopeCursor({
       env, meta, name1, address, ktpInput, threshold, directRejectThreshold, weights,

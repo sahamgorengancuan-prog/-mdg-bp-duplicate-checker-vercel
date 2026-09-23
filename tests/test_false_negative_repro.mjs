@@ -225,9 +225,9 @@ test('health and exact response disclose running engine and index readiness with
   const f=fixture([row('TEST-BP','Example Shop','A sample street address')]);
   const health = await handleHealth({env:f.env});
   const hb = await health.json();
-  assert.equal(hb.engine_version,'2026-09-23-score-bounds-v9');
+  assert.equal(hb.engine_version,'2026-09-23-bounded-normal-v10');
   assert.equal(hb.exact_index_ready,true);
-  assert.equal(health.headers.get('x-bp-checker-engine'),'2026-09-23-score-bounds-v9');
+  assert.equal(health.headers.get('x-bp-checker-engine'),'2026-09-23-bounded-normal-v10');
   const r=await run(f,{name_1:'Example Shop',address:'A sample street address'});
   assert.equal(r.body.decision,'FAIL');
   assert.equal(r.body.exact_lookup.attempted,true);
@@ -526,4 +526,63 @@ test('score upper bounds provide fast PASS on complete, provably excluded group'
   assert.equal(r.body.stats.scanned_candidates,0);
   assert.equal(r.body.stats.coverage_complete,true);
   assert.equal(r.body.full_scope_cursor,null);
+});
+
+test('bounded normal check is incomplete, not PASS, and resumes without replay', async()=>{
+  const input={name_1:NAME,address:ADDRESS};
+  const f=fixture([
+    row('A','Unrelated A','Completely different sample address and another remote place street'),
+    row('B','Unrelated B','Completely different sample address and another remote place street'),
+    row('C','Unrelated C','Completely different sample address and another remote place street'),
+    row('D','Unrelated D','Completely different sample address and another remote place street'),
+  ],{env:{MAX_CANDIDATES:'20',NORMAL_MAX_ROWS_PER_REQUEST:'2',FULL_SCOPE_CHUNK_ROWS:'2'}});
+  let r=await run(f,input);
+  assert.equal(r.status,200,r.body.error);
+  assert.equal(r.body.decision,'INCONCLUSIVE');
+  assert.equal(r.body.stats.scanned_candidates,2);
+  assert.equal(r.body.stats.candidate_space,4);
+  assert.equal(r.body.stats.normal_row_budget,2);
+  assert.equal(r.body.stats.coverage_complete,false);
+  assert.equal(typeof r.body.full_scope_cursor,'string');
+  const initialRanges=f.requests.filter(x=>x.startsWith('BP_DATABASE!'));
+  r=await run(f,{...input,full_scope_cursor:r.body.full_scope_cursor});
+  assert.equal(r.status,200,r.body.error);
+  assert.equal(r.body.decision,'PASS');
+  assert.equal(r.body.stats.scanned_candidates,4);
+  assert.equal(r.body.stats.resumed_from_normal_scan,2);
+  const allRanges=f.requests.filter(x=>x.startsWith('BP_DATABASE!'));
+  assert(allRanges.length>initialRanges.length);
+  assert(!initialRanges.includes(allRanges.at(-1)));
+});
+
+test('normal scan preserves successful BP work if Sheets quota fails at the next range',async()=>{
+  const input={name_1:NAME,address:ADDRESS};
+  const f=fixture([
+    row('A','Unrelated A','Completely different sample address and another remote place street'),
+    row('B','Unrelated B','Completely different sample address and another remote place street'),
+    row('C','Unrelated C','Completely different sample address and another remote place street')
+  ],{env:{MAX_CANDIDATES:'10',MAX_BATCH_ROWS:'1'}});
+  const mock=globalThis.fetch;
+  let bpRangeCalls=0;
+  globalThis.fetch=async url=>{
+    if(decodeURIComponent(String(url)).includes('BP_DATABASE!')) {
+      bpRangeCalls++;
+      if(bpRangeCalls===2) return new Response('{}',{status:429});
+    }
+    return mock(url);
+  };
+  let first;
+  try { first=await run(f,input); } finally {globalThis.fetch=mock;}
+  assert.equal(first.status,200,first.body.error);
+  assert.equal(first.body.decision,'INCONCLUSIVE');
+  assert.equal(first.body.stats.scanned_candidates,1);
+  assert.equal(first.body.stats.stopped_for_quota,true);
+  assert.equal(first.body.stats.coverage_complete,false);
+  assert.equal(typeof first.body.full_scope_cursor,'string');
+  const continued=await run(f,{...input,full_scope_cursor:first.body.full_scope_cursor});
+  // A real backend may retain its 429 cooldown; never claim the interrupted
+  // request can PASS without a complete continuation.
+  assert([200,429].includes(continued.status));
+  if(continued.status===200) assert.equal(continued.body.stats.resumed_from_normal_scan,1);
+  else assert.equal(continued.body.ok,false);
 });
