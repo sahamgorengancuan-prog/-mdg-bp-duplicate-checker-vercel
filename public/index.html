@@ -423,7 +423,8 @@
       const out = {
         http: res?.status, client_ms: ms, engine: json?.engine_version,
         backend: json?.search_backend, memory_source: json?.memory_source || json?.memory?.source,
-        fallback_reason: json?.memory_fallback_reason || json?.memory?.fallback_reason,
+        server_mode: json?.config?.snapshot_mode, server_engine: json?.config?.snapshot_engine,
+        fallback_reason: json?.memory_fallback_reason || json?.memory_inactive_reason || json?.memory?.fallback_reason,
         decision: json?.decision, reason: json?.reason, error: json?.error || json?.sheet_error,
         request_id: json?.requestId, warming: json?.warming, retry_after_s: json?.retry_after_seconds,
         sync_id: json?.meta?.sync_id, last_sync_at: json?.meta?.last_sync_at,
@@ -582,8 +583,13 @@
           : `Exact index v${json.meta.exact_index_version}`;
         txt.textContent = `Ready · ${backend} · Sync ${json.meta?.last_sync_at || 'unknown'}`;
         if (json.search_backend !== 'MEMORY_FULL_SCAN') {
-          logEvent('warn', 'health.memory_engine_inactive', { backend: json.search_backend, reason: json.memory?.fallback_reason || json.memory?.last_error || 'unknown' });
-          txt.textContent += ' · Full-scan engine inactive: ' + (json.memory?.fallback_reason || 'see log');
+          const mode = json.config?.snapshot_mode;
+          const reason = json.memory_inactive_reason || json.memory?.fallback_reason || json.memory?.last_error ||
+            (mode && mode !== 'dual' ? 'GSHEET_SNAPSHOT_MODE=' + mode + ' on the server; set it to dual.' : 'unknown');
+          logEvent('warn', 'health.memory_engine_inactive', { backend: json.search_backend || 'LEGACY_SINGLE_SHEET', server_mode: mode, reason });
+          txt.textContent += mode && mode !== 'dual'
+            ? ' · Full-scan engine OFF: server GSHEET_SNAPSHOT_MODE=' + mode + ' (set dual)'
+            : ' · Full-scan engine inactive: ' + reason;
         }
       } catch (e) {
         dot.classList.remove('ok');

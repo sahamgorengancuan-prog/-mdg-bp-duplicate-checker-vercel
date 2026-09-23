@@ -227,6 +227,8 @@ test('health and exact response disclose running engine and index readiness with
   const hb = await health.json();
   assert.equal(hb.engine_version,'2026-09-24-memory-full-scan-v15');
   assert.equal(hb.exact_index_ready,true);
+  assert.equal(hb.search_backend,'LEGACY_SINGLE_SHEET');
+  assert.match(hb.memory_inactive_reason,/GSHEET_SNAPSHOT_MODE=legacy/);
   assert.equal(health.headers.get('x-bp-checker-engine'),'2026-09-24-memory-full-scan-v15');
   const r=await run(f,{name_1:'Example Shop',address:'A sample street address'});
   assert.equal(r.body.decision,'FAIL');

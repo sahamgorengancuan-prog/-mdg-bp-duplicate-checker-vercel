@@ -168,6 +168,8 @@ export async function handleCheck(context) {
         ? await fullScopeCheck(payload,context.env)
         : await duplicateCheck(payload,context.env);
       result.quota=currentSheetsQuotaState(context.env);
+      result.search_backend='LEGACY_SINGLE_SHEET';
+      result.memory_fallback_reason='GSHEET_SNAPSHOT_MODE=legacy on the server; set it to dual to enable the in-memory full scan.';
     } else throw httpError(503,'GSHEET_SNAPSHOT_MODE must be dual or legacy.');
     return json(result);
   } catch (err) {
@@ -250,6 +252,10 @@ export async function handleHealth(context) {
     ok: cfg.sheet_id_configured && cfg.oauth_configured && sheet_ok,
     engine_version: ENGINE_VERSION,
     exact_index_ready: sheet_ok,
+    // Legacy = one workbook (SHEET_ID), bucketed Sheets reads + Full Scope.
+    // The in-memory full scan needs GSHEET_SNAPSHOT_MODE=dual on the server.
+    search_backend: 'LEGACY_SINGLE_SHEET',
+    memory_inactive_reason: 'GSHEET_SNAPSHOT_MODE=legacy on the server; set it to dual to enable the in-memory full scan.',
     service: 'MDG BP Duplicate Checker API',
     config: cfg,
     sheet_ok,
