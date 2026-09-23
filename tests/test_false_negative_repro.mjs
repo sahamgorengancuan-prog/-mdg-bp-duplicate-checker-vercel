@@ -8,7 +8,7 @@ const ADDRESS = 'Kp Cisaat Lebak RT 013 RW 003 Kel Bolang Kec Malingping Stlh Sd
 const normalize = s => String(s || '').toLowerCase().normalize('NFKD').replace(/[\u0300-\u036f]/g, '').replace(/[^a-z0-9 ]+/g, ' ').replace(/\b(pt|cv|tbk|ud|toko|tk|jl|jalan|gg|gang|no|nomor)\b/g, ' ').replace(/\s+/g, ' ').trim();
 const hash = (n,a) => createHash('sha256').update(`${normalize(n)}\x1f${normalize(a)}`).digest('hex');
 const bucket = n => String(Math.floor(n / 5)).padStart(3,'0');
-const baseEnv = { GOOGLE_OAUTH_CLIENT_ID: 'fixture', GOOGLE_OAUTH_CLIENT_SECRET: 'fixture', GOOGLE_OAUTH_REFRESH_TOKEN: 'fixture', MAX_CANDIDATES: '5', MAX_BATCH_ROWS: '10', RANGE_CACHE_SECONDS: '0', RATE_LIMIT_PER_MIN: '0' };
+const baseEnv = { GOOGLE_OAUTH_CLIENT_ID: 'fixture', GOOGLE_OAUTH_CLIENT_SECRET: 'fixture', GOOGLE_OAUTH_REFRESH_TOKEN: 'fixture', MAX_CANDIDATES: '5', MAX_BATCH_ROWS: '10', RANGE_CACHE_SECONDS: '0', RATE_LIMIT_PER_MIN: '0', SHEETS_LOCAL_READ_BUDGET_PER_MINUTE: '0' };
 let counter = 0;
 const originalFetch = globalThis.fetch;
 

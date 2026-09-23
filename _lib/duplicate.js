@@ -825,7 +825,14 @@ async function getIndexMap(env, tabName, type, meta) {
 // fail-fast limiter (no server-side 60-second sleep that times out on Render).
 // It is per-process, not distributed; all instances/Windows sync share the
 // actual upstream user quota, so upstream 429 is still handled independently.
-function reserveSheetsReadSlot() {
+function reserveSheetsReadSlot(env) {
+  // Explicit zero is only useful for controlled fixture tests; keep the
+  // default production ceiling conservative and clamp positive overrides.
+  const requested = Number(env.SHEETS_LOCAL_READ_BUDGET_PER_MINUTE ?? SHEETS_LOCAL_READ_BUDGET_PER_MINUTE);
+  if (requested === 0) return;
+  const budget = Number.isFinite(requested) && requested > 0
+    ? Math.min(SHEETS_LOCAL_READ_BUDGET_PER_MINUTE, Math.floor(requested))
+    : SHEETS_LOCAL_READ_BUDGET_PER_MINUTE;
   const now = Date.now();
   if (now < sheetsCooldownUntil) {
     const err = httpError(429, 'Google Sheets read quota is cooling down. The duplicate check has not completed.');
@@ -833,7 +840,7 @@ function reserveSheetsReadSlot() {
     throw err;
   }
   while (sheetsReadTimes.length && sheetsReadTimes[0] <= now - 60000) sheetsReadTimes.shift();
-  if (sheetsReadTimes.length >= SHEETS_LOCAL_READ_BUDGET_PER_MINUTE) {
+  if (sheetsReadTimes.length >= budget) {
     const wait = Math.ceil((sheetsReadTimes[0] + 60000 - now) / 1000) + 2;
     const err = httpError(429, 'Local Google Sheets read budget reached; retry the same request after the indicated delay.');
     err.retry_after_seconds = Math.max(2, wait);
@@ -854,7 +861,7 @@ async function getSheetRange(env, rangeA1, syncId = '', fresh = false) {
   if (inFlightReads.has(cacheKey)) return inFlightReads.get(cacheKey);
   const pending = (async () => {
     const token = await getGoogleAccessToken(env);
-    reserveSheetsReadSlot();
+    reserveSheetsReadSlot(env);
     const url = `https://sheets.googleapis.com/v4/spreadsheets/${encodeURIComponent(sheetId)}/values/${encodeURIComponent(rangeA1)}?majorDimension=ROWS`;
     const res = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
     if (res.status === 429) {
