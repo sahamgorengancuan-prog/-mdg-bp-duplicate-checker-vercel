@@ -2,9 +2,10 @@
 # this file; verify the connected repository, branch and Root Directory in Render.
 # All five snapshot/control workbook IDs also exist in config/gsheet_snapshots.json and
 # are read server-side by the Node API. No OAuth credentials are stored in git.
-# Keep legacy mode until the first selected paired build completes and /api/health passes
-# in controlled dual mode. Set GSHEET_SNAPSHOT_MODE=dual in the Render service
-# environment ONLY after CONTROL ACTIVE is published.
+# Dual mode requires a published CONTROL ACTIVE pair (A/A2 or B/B2). v15 loads the
+# committed generation's PACKED_SNAPSHOT into memory and full-scans every BP; until the
+# Windows sync has written PACKED_SNAPSHOT it falls back to the keyed v14 engine.
+# See MEMORY_FULL_SCAN_V15.md. Free/0.1 CPU instances sleep and are ~10x slower.
 services:
   - type: web
     name: bp-duplicate-check-koyeb
@@ -18,7 +19,9 @@ services:
       - key: NODE_ENV
         value: production
       - key: GSHEET_SNAPSHOT_MODE
-        value: legacy
+        value: dual
+      - key: SNAPSHOT_ENGINE
+        value: memory
       - key: SHEET_A_ID
         value: 1vll0y7dO4bVTokeLbWctUUKjQvOV33V9TDp9iZfJPhA
       - key: SHEET_B_ID

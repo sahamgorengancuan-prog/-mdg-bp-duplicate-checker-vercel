@@ -2,7 +2,9 @@
 setlocal
 cd /d "%~dp0\.."
 set TASK_NAME=MDG_BP_GSheet_Indexed_Sync
-set SCRIPT_PATH=%CD%\bats\sync_to_gsheet_now.bat
+REM Scheduled runs MUST use the non-interactive wrapper: sync_to_gsheet_now.bat
+REM ends with PAUSE and would keep the task (and the sync lock) hanging forever.
+set SCRIPT_PATH=%CD%\bats\sync_to_gsheet_scheduled.bat
 
 schtasks /Delete /TN "%TASK_NAME%_0900" /F >nul 2>nul
 schtasks /Delete /TN "%TASK_NAME%_1500" /F >nul 2>nul
@@ -12,4 +14,5 @@ schtasks /Create /TN "%TASK_NAME%_1500" /SC DAILY /ST 15:00 /TR "\"%SCRIPT_PATH%
 
 echo.
 echo Scheduler created: 09:00 and 15:00 local Windows time.
+echo For a sync every 2 hours use bats\setup_windows_scheduler_every_2h.bat instead.
 pause

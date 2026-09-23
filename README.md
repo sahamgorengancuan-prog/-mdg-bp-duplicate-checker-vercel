@@ -1,5 +1,12 @@
 # MDG BP Duplicate Checker — Vercel Ready
 
+> **Status terkini (v15):** Render memakai engine **in-memory full scan**. Semua BP
+> dicek di setiap request, tanpa `MAX_CANDIDATES`, dengan 0 read Google Sheets per
+> check. Sync Windows menulis tab `PACKED_SNAPSHOT` di A2/B2. Arsitektur, rollout,
+> hasil benchmark, dan env var ada di **[MEMORY_FULL_SCAN_V15.md](MEMORY_FULL_SCAN_V15.md)**.
+> Bagian di bawah ini adalah dokumentasi awal (legacy mode) dan tetap berlaku untuk
+> `GSHEET_SNAPSHOT_MODE=legacy`.
+
 Versi ini adalah hasil port dari paket **Cloudflare Pages GitHub Import** ke **Vercel**.
 Dasar project ini merupakan port Cloudflare ke Vercel. Paket ini juga memuat patch direct reject Levenshtein/Jaccard yang dijelaskan pada bagian 3b.
 

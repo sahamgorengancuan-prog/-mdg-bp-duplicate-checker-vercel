@@ -8,9 +8,16 @@ changes; they are separate tabs and NEVER clear/repopulate BP_DATABASE.
 The INACTIVE snapshot META becomes IN_PROGRESS before its first changed cell.
 The currently ACTIVE Google workbook stays untouched and usable by the web
 app. READY and control-pointer publication follow keyed/index verification.
+
+v15 adds PACKED_SNAPSHOT to the paired index workbook (A2/B2): every live BP
+as one gzip+base64 TSV split over ~400 cells. The Render engine loads it once
+per sync_id and full-scans every BP in memory (no candidate cap). The v14
+index tabs stay as the engine's fallback. Old v12/v13 index tabs left inside a
+staging PRIMARY workbook (the cause of "This document is too large to
+continue editing") are deleted before that workbook is staged again.
 """
 from __future__ import annotations
-import hashlib, json, os, sys, time, uuid
+import base64, gzip, hashlib, json, os, sys, time, uuid
 from pathlib import Path
 from datetime import datetime
 from typing import Dict
@@ -24,6 +31,16 @@ COLUMNS=["bp_id","bp_type_id","name_1","address",
 LEGACY_COLUMNS=COLUMNS[:-1]+["sync_id"]
 READ_BATCH=5000
 INDEX_WRITE_BATCH=5000
+META_ROWS=40            # META is always rewritten as A1:B40 so stale keys vanish
+PACKED_TITLE="PACKED_SNAPSHOT"
+PACKED_VERSION="1"
+PACKED_HEADER=["bp_id","bp_type_id","name_1","address","ktp_digits"]
+PACKED_PART_CHARS=40000 # Google Sheets cell limit is 50,000 characters
+PACKED_WRITE_ROWS=25    # ~1 MB per values.update request
+PACKED_READ_ROWS=60
+# v12/v13 kept these in the PRIMARY workbook; v14+ keeps them only in A2/B2.
+STALE_PRIMARY_TABS=frozenset({"INDEX_LEN_TOKEN","INDEX_LEN","KTP_INDEX",
+    "INDEX_KTP_SHARD","EXACT_INDEX","INDEX_EXACT_SHARD",PACKED_TITLE})
 
 def make_records(source: pd.DataFrame) -> Dict[str, dict]:
     needed = ["bp_id", "bp_type_id", "name_1", "address", "ktp_number"]
@@ -150,6 +167,96 @@ def build_index_rows(records, positions, sync_id):
     assert sum(int(x[3]) for x in ktp_shards)==len(ktp)
     return tabs, len(ktp), len(groups)
 
+def packed_enabled():
+    return os.getenv("GSHEET_PACKED_SNAPSHOT","on").strip().lower() not in ("off","0","false","no")
+
+def build_packed(records):
+    """Deterministic gzip+base64 TSV of every live BP (sorted by BP ID).
+
+    The Render engine recomputes all normalized/derived fields itself, so only
+    the five source fields travel. SHA-256 covers the uncompressed TSV.
+    """
+    clean=lambda v:str(v).replace("\t"," ").replace("\r"," ").replace("\n"," ")
+    lines=["\t".join(PACKED_HEADER)]
+    for key in sorted(records):
+        rec=records[key]
+        lines.append("\t".join(clean(rec[f]) for f in
+            ("bp_id","bp_type_id","name_1","address","ktp_number")))
+    raw="\n".join(lines).encode("utf-8")
+    packed=gzip.compress(raw,compresslevel=9,mtime=0)
+    text=base64.b64encode(packed).decode("ascii")
+    parts=[text[i:i+PACKED_PART_CHARS] for i in range(0,len(text),PACKED_PART_CHARS)]
+    return {"parts":parts,"sha256":hashlib.sha256(raw).hexdigest(),
+            "records":len(records),"raw_bytes":len(raw),"gzip_bytes":len(packed)}
+
+def packed_rows(packed,sync_id):
+    total=str(len(packed["parts"]))
+    return [["part_no","part_count","sync_id","data"]]+[
+        [str(n),total,sync_id,part] for n,part in enumerate(packed["parts"],start=1)]
+
+def packed_meta(packed):
+    return [["packed_snapshot_version",PACKED_VERSION],
+            ["packed_parts",str(len(packed["parts"]))],
+            ["packed_records",str(packed["records"])],
+            ["packed_sha256",packed["sha256"]],
+            ["packed_gzip_bytes",str(packed["gzip_bytes"])]]
+
+def meta_block(rows):
+    if len(rows)>META_ROWS:raise ValueError("META grew beyond its fixed block.")
+    return [list(r) for r in rows]+[["",""]]*(META_ROWS-len(rows))
+
+def write_packed(sh,rows):
+    """Write + fully read back PACKED_SNAPSHOT; trailing old rows are removed."""
+    try:ws=sh.worksheet(PACKED_TITLE)
+    except Exception as exc:
+        if exc.__class__.__name__!="WorksheetNotFound":raise
+        ws=sh.add_worksheet(title=PACKED_TITLE,rows=len(rows),cols=4)
+    if ws.row_count<len(rows) or ws.col_count<4:
+        ws.resize(rows=max(ws.row_count,len(rows)),cols=4)
+    for start in range(0,len(rows),PACKED_WRITE_ROWS):
+        block=rows[start:start+PACKED_WRITE_ROWS]
+        a,b=start+1,start+len(block)
+        update_with_retry(lambda a=a,b=b,block=block:ws.update(
+            range_name=f"A{a}:D{b}",values=block,value_input_option="RAW"))
+        time.sleep(float(os.getenv("GSHEET_WRITE_SLEEP_SECONDS","0.2")))
+    for start in range(0,len(rows),PACKED_READ_ROWS):
+        block=rows[start:start+PACKED_READ_ROWS]
+        a,b=start+1,start+len(block)
+        got=update_with_retry(lambda a=a,b=b:ws.get(f"A{a}:D{b}"))
+        if [[str(v) for v in row] for row in got]!=block:
+            raise RuntimeError(f"{PACKED_TITLE} read-back mismatch at {a}:{b}. No publish.")
+    if ws.row_count!=len(rows) or ws.col_count!=4:
+        ws.resize(rows=len(rows),cols=4)
+    logging.info("%s WRITTEN+VERIFIED %s parts",PACKED_TITLE,f"{len(rows)-1:,}")
+    return ws
+
+def prune_stale_primary_tabs(sh,role):
+    """Delete old v12/v13 index tabs from the INACTIVE staging primary only.
+
+    Those tabs are never read in v14+ (indexes live in A2/B2) but they keep
+    the primary workbook above Google's size limit, so every later edit there
+    fails with "This document is too large to continue editing".
+    """
+    sheets=[s["properties"] for s in sh.fetch_sheet_metadata().get("sheets",[])]
+    stale=[p for p in sheets if p.get("title") in STALE_PRIMARY_TABS]
+    if not stale:return []
+    titles=[p["title"] for p in stale]
+    requests=[]
+    if len(stale)==len(sheets):  # a spreadsheet must keep one sheet
+        requests.append({"addSheet":{"properties":{"title":"META",
+            "gridProperties":{"rowCount":100,"columnCount":2}}}})
+    requests+=[{"deleteSheet":{"sheetId":p["sheetId"]}} for p in stale]
+    try:sh.batch_update({"requests":requests})
+    except Exception as exc:
+        raise RuntimeError(
+            f"{role} workbook still holds old index tabs {titles} and Google refused "
+            f"to delete them ({exc}). Open that workbook and delete those tabs by hand "
+            "(keep BP_DATABASE and META), or point its SHEET_*_ID to a new empty "
+            "spreadsheet. The ACTIVE snapshot is unchanged.") from exc
+    logging.warning("%s: deleted stale pre-v14 index tabs %s (unused; they kept the "
+                    "workbook above Google's size limit).",role,titles)
+    return titles
+
 def make_meta(sync_id,bp_count,ktp_count,group_count,state):
     data=[
         ["sync_id",sync_id],
@@ -163,7 +270,7 @@ def make_meta(sync_id,bp_count,ktp_count,group_count,state):
         ["token_index_groups",str(group_count)],
         ["sync_state",state],
         ["source","PostgreSQL MDG -> protected keyed Google Sheets"],
-        ["schema","KEYED_V14_SHARDED:BP_DATABASE:A:H primary; PACKED_INDEXES:A:B secondary"]
+        ["schema","KEYED_V14_SHARDED:BP_DATABASE:A:H primary; PACKED_INDEXES:A:B secondary; PACKED_SNAPSHOT:A:D secondary (v15 memory engine)"]
     ]
     return [["key","value"]]+data
 
@@ -342,6 +449,12 @@ def sync_sheet(records,sync_id):
                       active.get("active_index_sheet_id")!=book_pairs[active_id]):
         raise ValueError("Invalid committed PRIMARY+INDEX control pair; no fallback.")
     digest=source_digest(records)
+    use_packed=packed_enabled()
+    packed=build_packed(records) if use_packed else None
+    if packed:
+        logging.info("Packed snapshot: %s BP, %s MB raw -> %s MB gzip, %s parts",
+                     f"{packed['records']:,}",round(packed["raw_bytes"]/1048576,1),
+                     round(packed["gzip_bytes"]/1048576,1),len(packed["parts"]))
     if active_id:
         live=gc.open_by_key(active_id)
         live_meta=read_meta(live)
@@ -356,11 +469,18 @@ def sync_sheet(records,sync_id):
             for m in (live_meta,live_index_meta)
         ):
             raise ValueError("Active primary/index META does not match control.")
+        has_packed=(not packed or (
+            live_index_meta.get("packed_snapshot_version")==PACKED_VERSION and
+            live_index_meta.get("packed_sha256")==packed["sha256"] and
+            live_meta.get("packed_sha256")==packed["sha256"]))
         if active["source_digest"]==digest and int(active["total_bp_rows"])==len(records):
-            logging.info("NOOP: no changes to source BP keys/hashes. Active snapshot remains %s",
-                         active["sync_id"])
-            return {"updated":0,"appended":0,"tombstoned":0,
-                    "unchanged":len(records),"sync_id":active["sync_id"]}
+            if has_packed:
+                logging.info("NOOP: no changes to source BP keys/hashes. Active snapshot remains %s",
+                             active["sync_id"])
+                return {"updated":0,"appended":0,"tombstoned":0,
+                        "unchanged":len(records),"sync_id":active["sync_id"]}
+            logging.info("Source unchanged but the active pair has no current %s; "
+                         "publishing a new generation that includes it.",PACKED_TITLE)
     # A already contains a failed oversized v12/v13 staging run. Initial
     # publication uses fresh B+B2 instead of attempting to edit that document.
     # A/A2 can only be reused after B is active and A has been remediated.
@@ -383,6 +503,9 @@ def sync_sheet(records,sync_id):
                  "A" if stage_id==ids["SHEET_A_ID"] else "B")
     sh=gc.open_by_key(stage_id)
     ish=gc.open_by_key(stage_index_id)
+    if stage_id==active_id or stage_index_id==active.get("active_index_sheet_id"):
+        raise RuntimeError("Refusing to stage into the ACTIVE pair.")
+    prune_stale_primary_tabs(sh,"STAGING_PRIMARY")
     ws=safe_worksheet(sh,"BP_DATABASE",8)
     header=ws.row_values(1)[:8]
     if header and header not in (COLUMNS,LEGACY_COLUMNS):
@@ -415,20 +538,25 @@ def sync_sheet(records,sync_id):
     final_meta=make_meta(sync_id,len(records),ktp_count,group_count,"READY")
     final_meta.extend([["source_digest",digest],
                        ["physical_bp_rows",str(len(existing)+len(creates))]])
+    packed_tab=packed_rows(packed,sync_id) if packed else None
+    if packed:final_meta.extend(packed_meta(packed))
     pending_meta=[list(row) for row in final_meta]
     next(row for row in pending_meta if row[0]=="sync_state")[1]="IN_PROGRESS"
     # Both workbooks must pass BEFORE any BP or index values are written.
     preflight_capacity(sh,{"META":final_meta},len(existing)+len(creates)+1,
                        "STAGING_PRIMARY")
-    preflight_capacity(ish,{**tabs,"META":final_meta},1,"STAGING_INDEX")
+    index_plans={**tabs,"META":final_meta}
+    if packed_tab:index_plans[PACKED_TITLE]=packed_tab
+    preflight_capacity(ish,index_plans,1,"STAGING_INDEX")
     logging.info("Keyed delta: existing=%s changed=%s appended=%s tombstone=%s",
                  len(existing),len(changes),len(creates),len(tombstones))
     metadata=safe_worksheet(sh,"META",2)
     index_metadata=safe_worksheet(ish,"META",2)
     for marker in (metadata,index_metadata):
+        if marker.row_count<META_ROWS:marker.resize(rows=META_ROWS,cols=2)
         update_with_retry(lambda marker=marker:marker.update(
-            range_name=f"A1:B{len(pending_meta)}",
-            values=pending_meta,value_input_option="RAW"))
+            range_name=f"A1:B{META_ROWS}",
+            values=meta_block(pending_meta),value_input_option="RAW"))
     if not header:
         update_with_retry(lambda:ws.update(range_name="A1:H1",
                            values=[COLUMNS],value_input_option="RAW"))
@@ -495,24 +623,26 @@ def sync_sheet(records,sync_id):
                 sheet.get(f"A{last}:{chr(64+len(expected[0]))}{last}"))
             if not got or [str(v) for v in got[0]]!=expected[-1]:
                 raise RuntimeError(f"{title} index boundary mismatch; not READY.")
+    if packed_tab:write_packed(ish,packed_tab)
     # Both READY markers must be verified before CONTROL can reference this pair.
     for marker in (index_metadata,metadata):
         update_with_retry(lambda marker=marker:marker.update(
-            range_name=f"A1:B{len(final_meta)}",
-            values=final_meta,value_input_option="RAW"))
+            range_name=f"A1:B{META_ROWS}",
+            values=meta_block(final_meta),value_input_option="RAW"))
     for book in (sh,ish):
         staged=read_meta(book)
         if (staged.get("sync_id")!=sync_id or
             staged.get("sync_state")!="READY" or
             staged.get("total_bp_rows")!=str(len(records)) or
             staged.get("source_digest")!=digest or
-            staged.get("keyed_index_version")!="14"):
+            staged.get("keyed_index_version")!="14" or
+            (packed and (staged.get("packed_sha256")!=packed["sha256"] or
+                         staged.get("packed_parts")!=str(len(packed["parts"]))))):
             raise RuntimeError("Primary/index READY marker mismatch; no publish.")
     # A final conservative cell cap check before publishing the pair.
     preflight_capacity(sh,{"META":final_meta},len(existing)+len(creates)+1,
                        "STAGING_PRIMARY_FINAL")
-    preflight_capacity(ish,{**tabs,"META":final_meta},1,
-                       "STAGING_INDEX_FINAL")
+    preflight_capacity(ish,index_plans,1,"STAGING_INDEX_FINAL")
     # Check control has not changed before the SINGLE control-pointer write.
     current=control_active(control)
     if (current.get("active_sheet_id","")!=active_id or
@@ -528,19 +658,23 @@ def sync_sheet(records,sync_id):
             ["total_bp_rows",str(len(records))],
             ["source_digest",digest],
             ["sync_state","READY"],
-            ["last_sync_at",datetime.now().isoformat(timespec="seconds")]]
+            ["last_sync_at",datetime.now().isoformat(timespec="seconds")],
+            ["packed_snapshot_version",PACKED_VERSION if packed else ""],
+            ["packed_sha256",packed["sha256"] if packed else ""]]
     update_with_retry(lambda:pointer.update(
-        range_name="A1:B8",values=values,value_input_option="RAW"))
+        range_name="A1:B10",values=values,value_input_option="RAW"))
     verified=control_active(control)
     if (verified.get("active_sheet_id")!=stage_id or
         verified.get("active_index_sheet_id")!=stage_index_id or
         verified.get("sync_id")!=sync_id or
-        verified.get("sync_state")!="READY"):
+        verified.get("sync_state")!="READY" or
+        verified.get("packed_sha256","")!=(packed["sha256"] if packed else "")):
         raise RuntimeError("Control publish verification failed; check ACTIVE sheet.")
     logging.info("PUBLISHED snapshot %s: updated=%s appended=%s tombstones=%s",
                  sync_id,len(changes),len(creates),len(tombstones))
     return {"updated":len(changes),"appended":len(creates),
-            "tombstoned":len(tombstones),"sync_id":sync_id}
+            "tombstoned":len(tombstones),"sync_id":sync_id,
+            "packed_parts":len(packed["parts"]) if packed else 0}
 
 def main():
     read_env()

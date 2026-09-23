@@ -27,4 +27,8 @@ CI runs `yarn smoke` and checks that `yarn start` binds to PORT, serves
 the frontend, returns the engine fingerprint from /api/health without real
 credentials, and does not expose .env. CI does not access the live company
 spreadsheet. After deploying, visit the actual service hostname's /api/health;
-require engine_version 2026-09-23-identity-v3 and sheet_ok true.
+require engine_version 2026-09-24-memory-full-scan-v15 and sheet_ok true.
+In dual mode also require `search_backend: MEMORY_FULL_SCAN` and `memory.records`
+equal to the BP count (see MEMORY_FULL_SCAN_V15.md). Right after boot the health
+check answers 503 `warming` until the snapshot is in memory; Render keeps the
+previous instance serving until it turns 200.

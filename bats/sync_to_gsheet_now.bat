@@ -43,8 +43,10 @@ if errorlevel 1 (
 )
 echo [3/3] Starting keyed delta sync with local .env and existing OAuth token...
 echo [INFO] Google Sheets ONLY: GSHEET_SNAPSHOT_MODE=dual.
-echo [INFO] Requires approved, separate SHEET_A_ID / SHEET_B_ID / SHEET_CONTROL_ID.
-echo [INFO] Active snapshot stays unchanged while staging sync runs.
+echo [INFO] Pairs A+A2 / B+B2 and CONTROL come from config\gsheet_snapshots.json or .env.
+echo [INFO] Active snapshot stays unchanged while the standby pair is staged.
+echo [INFO] v15: also writes PACKED_SNAPSHOT to A2/B2 for the in-memory full-scan engine.
+echo [INFO] Old v12/v13 index tabs in the STANDBY primary are deleted (size-limit fix).
 python -u "scripts\sync_bp_keyed.py"
 set "SYNC_RC=%ERRORLEVEL%"
 

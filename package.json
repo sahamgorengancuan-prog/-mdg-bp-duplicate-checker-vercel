@@ -3,13 +3,13 @@
   "version": "1.0.0",
   "private": true,
   "type": "module",
-  "description": "MDG BP duplicate checker: OAuth A/A2 and B/B2 paired Sheets, packed two-column indexed search with fail-closed cutover.",
+  "description": "MDG BP duplicate checker: OAuth A/A2 and B/B2 paired Sheets with an in-memory full-scan engine (every BP, no candidate cap) and fail-closed cutover.",
   "engines": {
     "node": ">=20"
   },
   "scripts": {
     "start": "node server.js",
-    "check": "node --check server.js && node --check _lib/duplicate.js && node --check api/index.js && node --check api/health.js && node --check api/check.js && node --check _lib/keyed-sheets.js",
+    "check": "node --check server.js && node --check _lib/duplicate.js && node --check api/index.js && node --check api/health.js && node --check api/check.js && node --check _lib/keyed-sheets.js && node --check _lib/memory-engine.js",
     "test": "node --test tests/*.mjs",
     "smoke": "node --test tests/render_startup.test.js"
   },

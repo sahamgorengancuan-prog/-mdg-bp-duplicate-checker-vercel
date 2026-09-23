@@ -12,7 +12,7 @@ const SNAPSHOT_WORKBOOKS=JSON.parse(readFileSync(new URL('../config/gsheet_snaps
   Browser never receives OAuth credential, refresh token, or raw database dump.
 */
 
-export const ENGINE_VERSION = '2026-09-23-gsheet-dual-v14-wide-batch';
+export const ENGINE_VERSION = '2026-09-24-memory-full-scan-v15';
 const GOOGLE_TOKEN_URL = 'https://oauth2.googleapis.com/token';
 const TOKEN_TTL_SAFETY_SECONDS = 90;
 
@@ -89,7 +89,7 @@ function dualIds(env) {
     throw httpError(503,'Configure SIX distinct OAuth-accessible legacy/A/A2/B/B2/CONTROL workbooks. No partial fallback.');
   return {a,b,a2,b2,c};
 }
-async function readDualControl(env) {
+export async function readDualControl(env) {
   const ids=dualIds(env);
   const rows=await getSheetRange({...env,SHEET_ID:ids.c},'ACTIVE!A1:B20','',true);
   const out={};
@@ -103,7 +103,7 @@ async function readDualControl(env) {
     throw httpError(503,'Primary/index CONTROL pair not READY or mismatched. No decision issued.');
   return out;
 }
-async function readDualSnapshot(env) {
+export async function readDualSnapshot(env) {
   const control=await readDualControl(env);
   const scopedEnv={...env,SHEET_ID:control.active_sheet_id,
                    INDEX_SHEET_ID:control.active_index_sheet_id};
@@ -118,7 +118,7 @@ async function readDualSnapshot(env) {
        m.keyed_index_version!=='14')
       throw httpError(503,'Primary/index META differs from committed CONTROL. No PASS.');
   }
-  return {control,scopedEnv,meta};
+  return {control,scopedEnv,meta,indexMeta};
 }
 
 export async function handleCheck(context) {
@@ -131,15 +131,29 @@ export async function handleCheck(context) {
       throw httpError(503,'Private PostgreSQL mode is retired. Use Google Sheets dual snapshots.');
     let result;
     if (mode==='dual') {
-      const {control,scopedEnv,meta}=await readDualSnapshot(context.env);
-      result=await (await import('./keyed-sheets.js')).keyedCheck(payload,scopedEnv,meta);
-      const current=await readDualControl(context.env);
-      result.quota=currentSheetsQuotaState(context.env);
-      if(current.active_sheet_id!==control.active_sheet_id||
-          current.active_index_sheet_id!==control.active_index_sheet_id||
-         current.sync_id!==control.sync_id||
-         current.source_digest!==control.source_digest)
-        throw httpError(503,'Active Google Sheets generation changed during check. No decision issued; retry.');
+      // v15: the committed generation is held in RAM and every BP is scanned.
+      // The v14 keyed Sheets engine remains the fallback until the Windows
+      // sync has published PACKED_SNAPSHOT (or when SNAPSHOT_ENGINE=keyed).
+      let fallback='SNAPSHOT_ENGINE=keyed';
+      if (snapshotEngine(context.env)==='memory') {
+        const memory=await import('./memory-engine.js');
+        const snapshot=await memory.acquireSnapshot(context.env);
+        if (!snapshot.fallback) result=memory.memoryCheck(payload,context.env,snapshot);
+        else fallback=snapshot.fallback;
+      }
+      if (!result) {
+        const {control,scopedEnv,meta}=await readDualSnapshot(context.env);
+        result=await (await import('./keyed-sheets.js')).keyedCheck(payload,scopedEnv,meta);
+        const current=await readDualControl(context.env);
+        result.quota=currentSheetsQuotaState(context.env);
+        if(current.active_sheet_id!==control.active_sheet_id||
+            current.active_index_sheet_id!==control.active_index_sheet_id||
+           current.sync_id!==control.sync_id||
+           current.source_digest!==control.source_digest)
+          throw httpError(503,'Active Google Sheets generation changed during check. No decision issued; retry.');
+        result.search_backend='KEYED_GOOGLE_SHEETS_DUAL';
+        result.memory_fallback_reason=fallback;
+      }
     } else if(mode==='legacy') {
       result=payload?.full_scope_cursor
         ? await fullScopeCheck(payload,context.env)
@@ -153,6 +167,7 @@ export async function handleCheck(context) {
       error: err?.message || 'Unexpected error',
       hint: configHint(err?.message),
       ...(err?.status === 429 ? { retry_after_seconds: Math.max(1, Number(err.retry_after_seconds || SHEETS_UPSTREAM_RETRY_SECONDS)) } : {}),
+      ...(err?.warming ? { warming: true, retry_after_seconds: Math.max(1, Number(err.retry_after_seconds || 5)) } : {}),
       requestId: crypto.randomUUID()
     }, err?.status || 500);
   }
@@ -161,12 +176,34 @@ export async function handleCheck(context) {
 export async function handleHealth(context) {
   const mode=String(context.env.GSHEET_SNAPSHOT_MODE || 'legacy').toLowerCase();
   if (mode==='dual') {
+    let memoryStatus=null;
+    if (snapshotEngine(context.env)==='memory') {
+      const memory=await import('./memory-engine.js');
+      try {
+        // Health never waits long and normally costs zero Google reads:
+        // the background refresher keeps CONTROL verification current.
+        const snapshot=await memory.acquireSnapshot(context.env,{waitMs:1500});
+        memoryStatus=memory.memorySnapshotStatus();
+        if (!snapshot.fallback) {
+          return json({ok:true,engine_version:ENGINE_VERSION,exact_index_ready:true,
+            sheet_ok:true,search_backend:'MEMORY_FULL_SCAN',
+            config:configStatus(context.env),memory:memoryStatus,meta:{
+              ...snapshot.meta,active_generation:snapshot.control.sync_id}});
+        }
+        memoryStatus.fallback_reason=snapshot.fallback;
+      } catch (error) {
+        return json({ok:false,engine_version:ENGINE_VERSION,exact_index_ready:false,
+          sheet_ok:false,search_backend:'MEMORY_FULL_SCAN',warming:Boolean(error?.warming),
+          sheet_error:error?.message||'Snapshot unavailable',
+          memory:memory.memorySnapshotStatus(),config:configStatus(context.env)},503);
+      }
+    }
     try {
       const {control,scopedEnv,meta}=await readDualSnapshot(context.env);
       await (await import('./keyed-sheets.js')).keyedHealth(scopedEnv,meta);
       return json({ok:true,engine_version:ENGINE_VERSION,exact_index_ready:true,
         sheet_ok:true,search_backend:'KEYED_GOOGLE_SHEETS_DUAL',
-        config:configStatus(context.env),meta:{
+        config:configStatus(context.env),memory:memoryStatus,meta:{
           ...meta,active_generation:control.sync_id
         }});
     } catch (error) {
@@ -174,7 +211,7 @@ export async function handleHealth(context) {
         exact_index_ready:false,sheet_ok:false,
         search_backend:'KEYED_GOOGLE_SHEETS_DUAL',
         sheet_error:error?.message||'Snapshot unavailable',
-        config:configStatus(context.env)},503);
+        memory:memoryStatus,config:configStatus(context.env)},503);
     }
   }
   if(mode!=='legacy'||String(context.env.PRIVATE_INDEX_MODE||'off').toLowerCase()==='required')
@@ -212,6 +249,10 @@ export async function handleHealth(context) {
   }, !(cfg.sheet_id_configured && cfg.oauth_configured) ? 500 : sheet_ok ? 200 : 503);
 }
 
+export function snapshotEngine(env) {
+  return String(env.SNAPSHOT_ENGINE || 'memory').toLowerCase()==='keyed' ? 'keyed' : 'memory';
+}
+
 export function handleOptions() {
   return new Response(null, { status: 204, headers: corsHeaders() });
 }
@@ -245,6 +286,7 @@ export function configStatus(env) {
     using_default_sheet_id: false,
     snapshot_ids_from_repo: true,
     snapshot_mode: String(env.GSHEET_SNAPSHOT_MODE || 'legacy').toLowerCase(),
+    snapshot_engine: snapshotEngine(env),
     dual_snapshot_configured: Boolean(
       (env.SHEET_A_ID||SNAPSHOT_WORKBOOKS.sheet_a_id)&&
       (env.SHEET_B_ID||SNAPSHOT_WORKBOOKS.sheet_b_id)&&
@@ -1202,7 +1244,7 @@ function getSheetId(env) {
   return String(env.SHEET_ID || DEFAULT_SHEET_ID || '').trim();
 }
 
-async function getGoogleAccessToken(env) {
+export async function getGoogleAccessToken(env) {
   const now = Math.floor(Date.now() / 1000);
   if (tokenCache.token && tokenCache.exp - TOKEN_TTL_SAFETY_SECONDS > now) return tokenCache.token;
 
