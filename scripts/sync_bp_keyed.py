@@ -104,8 +104,11 @@ def build_index_rows(records, positions, sync_id):
             raise ValueError("Missing stable BP row position; no index may publish.")
         source.append((rec,position))
     source.sort(key=lambda t:(t[0]["len_bucket"],t[0]["token_count"],t[0]["bp_id"]))
-    fuzzy=[[rec["len_bucket"],str(rec["token_count"]),str(row),
-            rec["norm_text"],rec["bp_id"],rec["row_hash"]] for rec,row in source]
+    # Compact four-column postings: stable group + normalized text + physical
+    # row navigation + immutable BP key. The reader verifies BP ID and text
+    # against BP_DATABASE on a match, rather than storing duplicate row_hash.
+    fuzzy=[[rec["len_bucket"]+":"+str(rec["token_count"]),
+            rec["norm_text"],str(row),rec["bp_id"]] for rec,row in source]
     groups=[]
     for index,(rec,row) in enumerate(source):
         key=rec["len_bucket"]+":"+str(rec["token_count"])
@@ -114,10 +117,10 @@ def build_index_rows(records, positions, sync_id):
             groups[-1][3]=str(int(groups[-1][3])+1)
         else: groups.append([key,str(index+2),str(index+2),"1",sync_id])
     exact=sorted(
-        [[rec["exact_hash"],str(row),rec["bp_id"],rec["row_hash"]]
+        [[rec["exact_hash"],str(row),rec["bp_id"]]
          for rec,row in source],key=lambda x:(x[0],x[2]))
     ktp=sorted(
-        [[rec["ktp_number"],str(row),rec["bp_id"],rec["row_hash"]]
+        [[rec["ktp_number"],str(row),rec["bp_id"]]
          for rec,row in source if rec["ktp_number"]],
         key=lambda x:(x[0][-2:],x[0],x[2]))
     def shards(items,keyer):
@@ -132,11 +135,11 @@ def build_index_rows(records, positions, sync_id):
     exact_shards=shards(exact,lambda x:x[0][:2])
     ktp_shards=shards(ktp,lambda x:x[0][-2:].zfill(2))
     tabs={
-      "INDEX_LEN_TOKEN":[["len_bucket","token_count","bp_db_row","norm_text","bp_id","row_hash"]]+fuzzy,
+      "INDEX_LEN_TOKEN":[["len_token_key","norm_text","bp_db_row","bp_id"]]+fuzzy,
       "INDEX_LEN":[["len_token_key","row_start","row_end","count","sync_id"]]+groups,
-      "KTP_INDEX":[["ktp_digits","bp_db_row","bp_id","row_hash"]]+ktp,
+      "KTP_INDEX":[["ktp_digits","bp_db_row","bp_id"]]+ktp,
       "INDEX_KTP_SHARD":[["ktp_shard","row_start","row_end","count","sync_id"]]+ktp_shards,
-      "EXACT_INDEX":[["exact_hash","bp_db_row","bp_id","row_hash"]]+exact,
+      "EXACT_INDEX":[["exact_hash","bp_db_row","bp_id"]]+exact,
       "INDEX_EXACT_SHARD":[["exact_shard","row_start","row_end","count","sync_id"]]+exact_shards
     }
     assert sum(int(x[3]) for x in groups)==len(records)
@@ -152,12 +155,12 @@ def make_meta(sync_id,bp_count,ktp_count,group_count,state):
         ["total_ktp_index_rows",str(ktp_count)],
         ["total_exact_index_rows",str(bp_count)],
         ["exact_index_version","1"],
-        ["keyed_index_version","12"],
+        ["keyed_index_version","13"],
         ["token_index_version","1"],
         ["token_index_groups",str(group_count)],
         ["sync_state",state],
         ["source","PostgreSQL MDG -> protected keyed Google Sheets"],
-        ["schema","KEYED_V12:BP_DATABASE:A:H; INDEX_LEN_TOKEN:A:F; INDEX_LEN:A:E"]
+        ["schema","KEYED_V13_COMPACT:BP_DATABASE:A:H; INDEX_LEN_TOKEN:A:D; KTP_INDEX:A:C; EXACT_INDEX:A:C"]
     ]
     return [["key","value"]]+data
 
@@ -178,8 +181,15 @@ def preflight_capacity(sh,plans,new_bp_rows):
     for title,rows in plans.items():
         if title not in existing:
             result+=max(len(rows),100)*len(rows[0])
-    limit=int(os.getenv("GSHEET_MAX_CELLS","10000000"))
-    logging.info("Preflight required Google Sheets cells: %s / %s",
+    # Headroom prevents a failed add_worksheet near a legacy 10M-cell cap.
+    # Some Google Workspace domains may already have the 20M-cell rollout;
+    # only raise this deliberately after verifying that workbook's entitlement.
+    limit=int(os.getenv("GSHEET_MAX_CELLS","9500000"))
+    for title,grid in existing.items():
+        logging.info("Google allocated grid %s: %s rows x %s columns = %s cells",
+                     title,grid.get("rowCount",0),grid.get("columnCount",0),
+                     int(grid.get("rowCount",0))*int(grid.get("columnCount",0)))
+    logging.info("Preflight COMPACT expected allocated cells: %s / %s",
                  f"{result:,}",f"{limit:,}")
     if result>limit:raise ValueError(
         f"Google Sheets cell capacity {result:,}>{limit:,}; no BP writes attempted."

@@ -12,7 +12,7 @@ const SNAPSHOT_WORKBOOKS=JSON.parse(readFileSync(new URL('../config/gsheet_snaps
   Browser never receives OAuth credential, refresh token, or raw database dump.
 */
 
-export const ENGINE_VERSION = '2026-09-23-gsheet-dual-v12';
+export const ENGINE_VERSION = '2026-09-23-gsheet-dual-v13-compact';
 const GOOGLE_TOKEN_URL = 'https://oauth2.googleapis.com/token';
 const TOKEN_TTL_SAFETY_SECONDS = 90;
 
@@ -107,7 +107,7 @@ async function readDualSnapshot(env) {
   if(meta.sync_state!=='READY'||meta.sync_id!==control.sync_id||
       meta.source_digest!==control.source_digest||
       meta.total_bp_rows!==control.total_bp_rows||
-      meta.keyed_index_version!=='12')
+      meta.keyed_index_version!=='13')
     throw httpError(503,'Active Google Sheets snapshot META/control mismatch. No PASS.');
   return {control,scopedEnv,meta};
 }

@@ -20,17 +20,17 @@ function makeFixture(records){
   for(const r of source) bp.push([r.id,'ZB02',r.name,r.address,r.norm,'',
     String(r.norm.length),r.digest]);
   const at=new Map(source.map((r,i)=>[r.id,i+2]));
-  const fuzzy=source.map(r=>[r.bucket,String(r.tokens),String(at.get(r.id)),r.norm,r.id,r.digest])
-    .sort((a,b)=>a[0].localeCompare(b[0])||Number(a[1])-Number(b[1])||a[4].localeCompare(b[4]));
-  const groups=[],index=[['len_bucket','token_count','bp_db_row','norm_text','bp_id','row_hash'],...fuzzy];
+  const fuzzy=source.map(r=>[r.bucket+':'+r.tokens,r.norm,String(at.get(r.id)),r.id])
+    .sort((a,b)=>a[0].localeCompare(b[0])||a[3].localeCompare(b[3]));
+  const groups=[],index=[['len_token_key','norm_text','bp_db_row','bp_id'],...fuzzy];
   for(let i=0;i<fuzzy.length;i++){
-    const r=fuzzy[i],key=r[0]+':'+r[1],last=groups.at(-1);
+    const r=fuzzy[i],key=r[0],last=groups.at(-1);
     if(last&&last[0]===key){last[2]=String(i+2);last[3]=String(Number(last[3])+1);}
     else groups.push([key,String(i+2),String(i+2),'1',sync]);
   }
-  const e=source.map(r=>[exact(r.name,r.address),String(at.get(r.id)),r.id,r.digest])
+  const e=source.map(r=>[exact(r.name,r.address),String(at.get(r.id)),r.id])
     .sort((a,b)=>a[0].localeCompare(b[0]));
-  const k=source.filter(r=>r.ktp).map(r=>[r.ktp,String(at.get(r.id)),r.id,r.digest])
+  const k=source.filter(r=>r.ktp).map(r=>[r.ktp,String(at.get(r.id)),r.id])
     .sort((a,b)=>a[0].slice(-2).localeCompare(b[0].slice(-2))||a[0].localeCompare(b[0]));
   const shards=(rows,key)=>{
     const out=[];
@@ -42,7 +42,7 @@ function makeFixture(records){
     return out;
   };
   const metadata={
-    sync_id:sync,sync_state:'READY',keyed_index_version:'12',
+    sync_id:sync,sync_state:'READY',keyed_index_version:'13',
     exact_index_version:'1',token_index_version:'1',
     total_bp_rows:String(source.length),
     total_exact_index_rows:String(e.length),
@@ -53,8 +53,8 @@ function makeFixture(records){
   return {sync,metadata,data:new Map([
     ['META',meta],['BP_DATABASE',bp],['INDEX_LEN_TOKEN',index],
     ['INDEX_LEN',[['len_token_key','row_start','row_end','count','sync_id'],...groups]],
-    ['EXACT_INDEX',[['exact_hash','bp_db_row','bp_id','row_hash'],...e]],
-    ['KTP_INDEX',[['ktp_digits','bp_db_row','bp_id','row_hash'],...k]],
+    ['EXACT_INDEX',[['exact_hash','bp_db_row','bp_id'],...e]],
+    ['KTP_INDEX',[['ktp_digits','bp_db_row','bp_id'],...k]],
     ['INDEX_EXACT_SHARD',[['exact_shard','row_start','row_end','count','sync_id'],
       ...shards(e,r=>r[0].slice(0,2))]],
     ['INDEX_KTP_SHARD',[['ktp_shard','row_start','row_end','count','sync_id'],
@@ -161,7 +161,7 @@ test('dual mode: corrupt keyed posting refuses a false FAIL or PASS',async t=>{
   await withSheets(t,async f=>{
     // Corrupt every fuzzy posting key-hash without modifying source BP.
     for(const posting of f.a.data.get('INDEX_LEN_TOKEN').slice(1))
-      posting[5]='f'.repeat(64);
+      posting[3]='WRONG_BP_ID';
     const result=await f.check({name_1:'Alpha Shoppe',address:'Mawar Street 10'});
     assert.equal(result.status,503);
     assert.equal(result.body.decision,undefined);

@@ -44,7 +44,7 @@ test('Render yarn start boots, serves frontend and API without leaking private f
     const root = await poll('http://127.0.0.1:' + port + '/', child);
     assert.equal(root.status, 200, output);
     const html = await root.text();
-    assert.match(html, /EXPECTED_ENGINE_VERSION = '2026-09-23-gsheet-dual-v12'/);
+    assert.match(html, /EXPECTED_ENGINE_VERSION = '2026-09-23-gsheet-dual-v13-compact'/);
     assert.match(html, /FULL_SCOPE_WAIT_MS = 200/);
     assert.match(html, /MAX_NORMAL_QUOTA_RETRIES = 1/);
     assert.match(html, /FULL_SCOPE_SESSION_MS = 175000/);
@@ -52,7 +52,7 @@ test('Render yarn start boots, serves frontend and API without leaking private f
     assert.match(html, /if \(res\.status !== 429\)/);
     const health = await fetch('http://127.0.0.1:' + port + '/api/health');
     const body = await health.json();
-    assert.equal(body.engine_version, '2026-09-23-gsheet-dual-v12');
+    assert.equal(body.engine_version, '2026-09-23-gsheet-dual-v13-compact');
     assert.equal(body.ok, false, 'CI must not have production OAuth credentials');
     const privateFile = await fetch('http://127.0.0.1:' + port + '/.env');
     assert.equal(privateFile.status, 404);

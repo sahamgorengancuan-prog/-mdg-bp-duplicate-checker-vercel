@@ -1,6 +1,6 @@
 // Google Sheets-only keyed snapshot verifier.
-// All candidate postings carry stable BP ID + source row hash. Physical row
-// numbers are navigation hints, not the identity of a BP record.
+// Compact candidate postings carry stable BP ID and row position.
+// BP row identity, normalized text and hash format verified on matching candidates.
 import {createHash,createHmac,timingSafeEqual} from 'node:crypto';
 import {
   ENGINE_VERSION,getMeta,getIndexMap,getSheetRange,
@@ -17,15 +17,15 @@ const int=x=>Number.isSafeInteger(Number(x))&&Number(x)>=0?Number(x):NaN;
 
 function ready(m){
   const bp=int(m.total_bp_rows),exact=int(m.total_exact_index_rows);
-  if(m.sync_state!=='READY'||m.keyed_index_version!=='12'||
+  if(m.sync_state!=='READY'||m.keyed_index_version!=='13'||
      m.exact_index_version!=='1'||!m.sync_id||bp<1||exact!==bp)
-    throw fail(503,'Keyed Google Sheets v12 snapshot is not READY or index counts differ. No PASS.');
+    throw fail(503,'Keyed Google Sheets v13 snapshot is not READY or index counts differ. No PASS.');
   return m;
 }
 function hashKey(env){
   const secret=String(env.GOOGLE_OAUTH_REFRESH_TOKEN||'');
   if(secret.length<16)throw fail(503,'Configured server OAuth required for signed resume.');
-  return createHmac('sha256',secret).update('bp-keyed-gsheet-v12/cursor').digest();
+  return createHmac('sha256',secret).update('bp-keyed-gsheet-v13/cursor').digest();
 }
 function sign(state,env){
   const body=Buffer.from(JSON.stringify(state)).toString('base64url');
@@ -43,7 +43,7 @@ function restore(token,env,meta,queryHash,plan){
   let state;
   try{state=JSON.parse(Buffer.from(pair[0],'base64url').toString('utf8'));}
   catch(_){throw fail(400,'Invalid keyed cursor payload.');}
-  if(state.v!==12||state.engine!==ENGINE_VERSION||state.sync!==meta.sync_id||
+  if(state.v!==13||state.engine!==ENGINE_VERSION||state.sync!==meta.sync_id||
      state.queryHash!==queryHash||state.plan!==plan.signature||
      !Number.isSafeInteger(state.issuedAt)||state.issuedAt>Date.now()+30000||
      Date.now()-state.issuedAt>3600000)
@@ -62,38 +62,39 @@ function restore(token,env,meta,queryHash,plan){
     throw fail(400,'Cursor would skip or repeat BP candidates.');
   return state;
 }
-function ensureIndexedPosting(row,info,meta) {
-  if(row.length<6)throw fail(503,'Incomplete indexed BP posting. No PASS.');
-  const [bucket,tok,position,norm,bp,hash]=row.map(x=>String(x||''));
+function ensureIndexedPosting(row,info) {
+  if(row.length<4)throw fail(503,'Incomplete compact BP posting. No PASS.');
+  const [key,norm,position,bp]=row.map(x=>String(x||''));
   const rowNo=Number(position);
-  if(bucket!==info.bucket||Number(tok)!==info.token_count||
-     Math.floor(norm.length/5)!==Number(bucket)||
+  if(key!==info.bucket+':'+info.token_count||
+     Math.floor(norm.length/5)!==Number(info.bucket)||
      tokens(norm).size!==info.token_count||
-     !bp||!Number.isSafeInteger(rowNo)||rowNo<2||
-     !/^[a-f0-9]{64}$/.test(hash))
-    throw fail(503,'Keyed fuzzy posting integrity mismatch. No PASS.');
-  return {bpRow:rowNo,norm,bp,hash};
+     !bp||!Number.isSafeInteger(rowNo)||rowNo<2)
+    throw fail(503,'Keyed compact posting integrity mismatch. No PASS.');
+  return {bpRow:rowNo,norm,bp};
 }
 async function verifiedBp(env,meta,posting) {
   const rows=await getSheetRange(env,
     'BP_DATABASE!A'+posting.bpRow+':H'+posting.bpRow,meta.sync_id);
   const row=rows[0];
-  if(!row||String(row[0])!==posting.bp||String(row[7]||'')!==posting.hash||
+  if(!row||String(row[0])!==posting.bp||
+     !/^[a-f0-9]{64}$/.test(String(row[7]||''))||
      String(row[4]||'')!==posting.norm||
-     Number(row[6])!==posting.norm.length)
+     Number(row[6])!==posting.norm.length||
+     normalizeText(String(row[2]||'')+' '+String(row[3]||''))!==posting.norm)
     throw fail(503,'Keyed pointer does not match source BP key/hash/text. No PASS.');
   return {bp_id:String(row[0]),bp_type_id:String(row[1]||''),
     name_1:String(row[2]||''),address:String(row[3]||''),
     norm_text:String(row[4]||''),text_len:Number(row[6])};
 }
 async function readExactBp(env,meta,row,expectedHash){
-  const bpRow=int(row[1]),bp=String(row[2]||''),hash=String(row[3]||'');
-  if(!Number.isSafeInteger(bpRow)||bpRow<2||!bp||
-     !/^[a-f0-9]{64}$/.test(hash))
+  const bpRow=int(row[1]),bp=String(row[2]||'');
+  if(!Number.isSafeInteger(bpRow)||bpRow<2||!bp)
     throw fail(503,'Invalid exact keyed posting. NO PASS.');
   const rows=await getSheetRange(env,'BP_DATABASE!A'+bpRow+':H'+bpRow,meta.sync_id);
   const source=rows[0];
-  if(!source||String(source[0])!==bp||String(source[7])!==hash||
+  if(!source||String(source[0])!==bp||
+     !/^[a-f0-9]{64}$/.test(String(source[7]||''))||
      exactNameAddressHash(source[2],source[3])!==expectedHash||
      normalizeText(String(source[2]||'')+' '+String(source[3]||''))!==String(source[4]||''))
     throw fail(503,'Exact keyed pointer/hash mismatch. NO PASS.');
@@ -111,7 +112,7 @@ async function findExact(name,address,env,meta){
   const shard=map.get(hash.slice(0,2));
   if(!shard)return empty;
   const rows=await getSheetRange(env,
-    'EXACT_INDEX!A'+shard.row_start+':D'+shard.row_end,meta.sync_id);
+    'EXACT_INDEX!A'+shard.row_start+':C'+shard.row_end,meta.sync_id);
   if(rows.length!==shard.count)throw fail(503,'Exact shard range incomplete.');
   const pointer=[];
   for(const row of rows){
@@ -135,20 +136,21 @@ async function findKtp(ktp,env,meta){
   const shard=shards.get(ktp.slice(-2).padStart(2,'0'));
   if(!shard)return null;
   const rows=await getSheetRange(env,
-    'KTP_INDEX!A'+shard.row_start+':D'+shard.row_end,meta.sync_id);
+    'KTP_INDEX!A'+shard.row_start+':C'+shard.row_end,meta.sync_id);
   if(rows.length!==shard.count)throw fail(503,'KTP shard incomplete.');
   for(const row of rows){
     if(String(row[0]||'').slice(-2).padStart(2,'0')!==
        ktp.slice(-2).padStart(2,'0'))
       throw fail(503,'KTP shard sorting invalid.');
     if(normalizeDigits(row[0])===ktp){
-      const bpRow=int(row[1]),bp=String(row[2]||''),hash=String(row[3]||'');
-      if(!Number.isSafeInteger(bpRow)||bpRow<2||!bp||!/^[a-f0-9]{64}$/.test(hash))
+      const bpRow=int(row[1]),bp=String(row[2]||'');
+      if(!Number.isSafeInteger(bpRow)||bpRow<2||!bp)
         throw fail(503,'Invalid KTP keyed posting.');
       const result=await getSheetRange(env,
         'BP_DATABASE!A'+bpRow+':H'+bpRow,meta.sync_id);
       const source=result[0];
-      if(!source||String(source[0])!==bp||String(source[7])!==hash||
+      if(!source||String(source[0])!==bp||
+     !/^[a-f0-9]{64}$/.test(String(source[7]||''))||
          normalizeText(String(source[2]||'')+' '+String(source[3]||''))!==String(source[4]||''))
         throw fail(503,'KTP key/hash mismatch; NO PASS.');
       return {bp_id:bp,bp_type_id:String(source[1]||''),
@@ -274,7 +276,7 @@ export async function keyedCheck(payload,env,providedMeta=null){
   const plan=await makePlan(env,m,qtext,threshold,direct,weights);
   const state=payload?.full_scope_cursor
     ?restore(payload.full_scope_cursor,env,m,fp,plan)
-    :{v:12,engine:ENGINE_VERSION,sync:m.sync_id,queryHash:fp,
+    :{v:13,engine:ENGINE_VERSION,sync:m.sync_id,queryHash:fp,
        plan:plan.signature,pos:0,next:plan.ordered.length
          ?plan.map.get(plan.ordered[0]).row_start:0,
        scanned:0,compared:0,issuedAt:Date.now()};
@@ -289,7 +291,7 @@ export async function keyedCheck(payload,env,providedMeta=null){
     let rows;
     try{
       rows=await getSheetRange(env,
-        'INDEX_LEN_TOKEN!A'+state.next+':F'+last,m.sync_id);
+        'INDEX_LEN_TOKEN!A'+state.next+':D'+last,m.sync_id);
     }catch(e){
       // A previously completed range can never be silently recounted or PASS.
       if(e?.status!==429||processed===0)throw e;

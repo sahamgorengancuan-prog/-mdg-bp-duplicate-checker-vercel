@@ -135,8 +135,13 @@ def test_index_postings_use_stable_bp_key_and_source_hash():
     assert n_ktp==2 and n_groups>=1
     assert len(tabs['INDEX_LEN_TOKEN'])==3
     for row in tabs['INDEX_LEN_TOKEN'][1:]:
-        assert row[4] in records
-        assert row[5]==records[row[4]]['row_hash']
+        assert len(row)==4
+        assert row[3] in records
+        assert row[1]==records[row[3]]['norm_text']
+        assert row[0]==records[row[3]]['len_bucket']+':'+str(
+            records[row[3]]['token_count'])
+    assert all(len(row)==3 for row in tabs['EXACT_INDEX'][1:])
+    assert all(len(row)==3 for row in tabs['KTP_INDEX'][1:])
     assert {row[2] for row in tabs['EXACT_INDEX'][1:]}==set(records)
     assert {row[2] for row in tabs['KTP_INDEX'][1:]}==set(records)
 
@@ -196,6 +201,7 @@ def test_proven_oauth_bat_and_no_private_database():
     assert 'pause' in bat.lower()
     assert 'taskkill' not in bat.lower()
     assert 'private PostgreSQL search index' not in bat
+    assert 'KEYED_V13_COMPACT' in (ROOT/'scripts'/'sync_bp_keyed.py').read_text()
     code=(ROOT/'scripts'/'sync_bp_keyed.py').read_text()
     assert 'sync_private(' not in code
     assert 'PRIVATE_INDEX_DATABASE_URL' not in code
