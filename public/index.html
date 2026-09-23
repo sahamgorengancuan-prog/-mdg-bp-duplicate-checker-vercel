@@ -339,15 +339,38 @@
     let fullScopeRunning = false;
     let fullScopeCancelled = false;
 
+    // A deploy while this tab stayed open changes the server engine. Reload the
+    // matching page ONCE (per server version) and re-run the same input, instead
+    // of refusing every result. A mismatched page never issues PASS either way.
+    const PENDING_CHECK_KEY = 'bp-pending-check';
+    function reloadForNewEngine(serverVersion, pendingInput) {
+      if (!serverVersion || serverVersion === EXPECTED_ENGINE_VERSION) return false;
+      try {
+        const key = 'bp-engine-reload:' + serverVersion;
+        if (sessionStorage.getItem(key)) return false;
+        sessionStorage.setItem(key, '1');
+        if (pendingInput) sessionStorage.setItem(PENDING_CHECK_KEY, JSON.stringify(pendingInput));
+      } catch (_) { return false; }
+      location.reload();
+      return true;
+    }
+    function versionMismatchError(serverVersion) {
+      return new Error('This page (' + EXPECTED_ENGINE_VERSION + ') does not match the server (' + (serverVersion || 'unknown') + '). Reload the page with Ctrl+F5. No PASS issued.');
+    }
+
     async function checkHealth() {
       const dot = $('healthDot');
       const txt = $('healthText');
       try {
         const res = await fetch(API_BASE + '/api/health', { cache: 'no-store' });
         const json = await res.json();
+        if (json.engine_version !== EXPECTED_ENGINE_VERSION) {
+          if (reloadForNewEngine(json.engine_version)) return;
+          throw versionMismatchError(json.engine_version);
+        }
         if (!json.ok) throw new Error(json.sheet_error || json.error || 'API unhealthy');
-        if (json.engine_version !== EXPECTED_ENGINE_VERSION || json.meta?.exact_index_version !== '1' || json.meta?.sync_state !== 'READY' || !json.exact_index_ready) {
-          throw new Error('API/snapshot mismatch: deploy exact-index API and run patched full sync.');
+        if (json.meta?.exact_index_version !== '1' || json.meta?.sync_state !== 'READY' || !json.exact_index_ready) {
+          throw new Error('Google Sheets snapshot is not READY (exact index / sync state). Run the sync BAT.');
         }
         dot.classList.add('ok');
         const backend = json.search_backend === 'MEMORY_FULL_SCAN'
@@ -406,8 +429,15 @@
             await sleep(1000);
           }
         }
-        if (json.engine_version !== EXPECTED_ENGINE_VERSION || json.meta?.exact_index_version !== '1' || json.meta?.sync_state !== 'READY') {
-          throw new Error('Backend version or exact index is outdated; result cannot be treated as PASS.');
+        if (json.engine_version !== EXPECTED_ENGINE_VERSION) {
+          if (reloadForNewEngine(json.engine_version, submittedInput)) {
+            result.innerHTML = '<p class="reason" role="status">The checker was just updated. Reloading this page and re-running the same input. No PASS issued yet.</p>';
+            return;
+          }
+          throw versionMismatchError(json.engine_version);
+        }
+        if (json.meta?.exact_index_version !== '1' || json.meta?.sync_state !== 'READY') {
+          throw new Error('Google Sheets snapshot is not READY (exact index / sync state); result cannot be treated as PASS. Run the sync BAT.');
         }
         lastCheckInput = submittedInput;
         renderResult(json);
@@ -583,6 +613,16 @@
     }
 
     checkHealth();
+    try {
+      const pending = JSON.parse(sessionStorage.getItem(PENDING_CHECK_KEY) || 'null');
+      sessionStorage.removeItem(PENDING_CHECK_KEY);
+      if (pending) {
+        $('name1').value = pending.name_1 || '';
+        $('address').value = pending.address || '';
+        $('ktp').value = pending.ktp_number || '';
+        $('checkForm').requestSubmit();
+      }
+    } catch (_) { /* storage unavailable: the user simply re-runs the check */ }
   </script>
 </body>
 </html>
