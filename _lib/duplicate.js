@@ -1,4 +1,4 @@
-import { createHash } from 'node:crypto';
+import { createHash, createHmac, timingSafeEqual } from 'node:crypto';
 
 /*
   MDG BP Duplicate Checker - shared duplicate-check engine (Vercel Functions, Node.js runtime)
@@ -10,7 +10,7 @@ import { createHash } from 'node:crypto';
   Browser never receives OAuth credential, refresh token, or raw database dump.
 */
 
-export const ENGINE_VERSION = '2026-09-23-identity-v3';
+export const ENGINE_VERSION = '2026-09-23-full-scope-v4';
 const GOOGLE_TOKEN_URL = 'https://oauth2.googleapis.com/token';
 const TOKEN_TTL_SAFETY_SECONDS = 90;
 
@@ -18,6 +18,8 @@ const DEFAULT_SHEET_ID = '1ZtNDikRHklwQMYxWQ6hkL1clvdH6g_Xfd3ojr5APDjo';
 const DEFAULT_SIMILARITY_THRESHOLD = 92;
 const DEFAULT_SIMILARITY_DIRECT_REJECT_THRESHOLD = 80;
 const DEFAULT_MAX_CANDIDATES = 60000;
+const FULL_SCOPE_MAX_ROWS_PER_REQUEST = 3000;
+const FULL_SCOPE_CURSOR_TTL_MS = 60 * 60 * 1000;
 const DEFAULT_RANGE_CACHE_SECONDS = 300;
 const DEFAULT_MAX_BATCH_ROWS = 10000;
 const DEFAULT_RATE_LIMIT_PER_MIN = 60;
@@ -64,7 +66,9 @@ export async function handleCheck(context) {
     await enforceRateLimit(context.request, context.env);
     await enforceOptionalAccessCode(context.request, context.env);
     const payload = await safeJson(context.request);
-    const result = await duplicateCheck(payload, context.env);
+    const result = payload?.full_scope_cursor
+      ? await fullScopeCheck(payload, context.env)
+      : await duplicateCheck(payload, context.env);
     return json(result);
   } catch (err) {
     return json({
@@ -141,6 +145,7 @@ export function configStatus(env) {
     similarity_threshold: Number(env.SIMILARITY_THRESHOLD || DEFAULT_SIMILARITY_THRESHOLD),
     similarity_direct_reject_threshold: getSimilarityDirectRejectThreshold(env),
     max_candidates: Number(env.MAX_CANDIDATES || DEFAULT_MAX_CANDIDATES),
+    full_scope_chunk_rows: FULL_SCOPE_MAX_ROWS_PER_REQUEST,
     max_batch_rows: Number(env.MAX_BATCH_ROWS || DEFAULT_MAX_BATCH_ROWS),
     range_cache_seconds: Number(env.RANGE_CACHE_SECONDS || DEFAULT_RANGE_CACHE_SECONDS),
     rate_limit_per_min: Number(env.RATE_LIMIT_PER_MIN || DEFAULT_RATE_LIMIT_PER_MIN),
@@ -230,6 +235,9 @@ async function duplicateCheck(payload, env) {
     identity_conflict: false,
     exact_lookup: { attempted: false, index_version: meta.exact_index_version, shard_present: null, shard_rows: 0, matching_index_rows: 0, verified_matches: 0 },
     similarity_match: null,
+    full_scope_cursor: null,
+    full_scope_available: false,
+    full_scope_active: false,
     top_candidates: [],
     stats: {
       scanned_candidates: 0, compared_candidates: 0, skipped_by_prefilter: 0,
@@ -372,8 +380,158 @@ async function duplicateCheck(payload, env) {
   } else {
     result.decision = 'INCONCLUSIVE';
     result.reason = `No match in ${scanned} of ${candidateSpace} indexed candidates; scan limit reached. This is NOT a PASS.`;
+    result.full_scope_available = true;
+    result.full_scope_cursor = createFullScopeCursor({
+      env, meta, name1, address, ktpInput, threshold, directRejectThreshold, weights,
+      nextRow: 2, scanned: 0, compared: 0, batches: 0
+    });
   }
   return result;
+}
+
+// Full Scope uses a signed, stateless cursor. Only an INCONCLUSIVE capped normal
+// check can create the initial cursor. Every full-scope page covers EVERY BP row
+// (not just eligible length buckets) and deliberately bypasses quickPrefilter.
+function fullScopeFingerprint({name1, address, ktpInput, threshold, directRejectThreshold, weights}) {
+  return createHash('sha256').update(JSON.stringify({
+    name: normalizeText(name1), address: normalizeText(address),
+    ktp: ktpInput, threshold, directRejectThreshold, weights
+  })).digest('hex');
+}
+function fullScopeKey(env) {
+  const secret = String(env.GOOGLE_OAUTH_REFRESH_TOKEN || '').trim();
+  if (!secret) throw httpError(503, 'Full scope requires configured backend OAuth.');
+  return createHmac('sha256', secret).update('bp-duplicate-checker/full-scope/v1').digest();
+}
+function createFullScopeCursor({env, meta, name1, address, ktpInput, threshold, directRejectThreshold, weights, nextRow, scanned, compared, batches}) {
+  const state = {
+    v: 1, engine: ENGINE_VERSION, sync: meta.sync_id,
+    fingerprint: fullScopeFingerprint({name1, address, ktpInput, threshold, directRejectThreshold, weights}),
+    total: Number(meta.total_bp_rows), nextRow, scanned, compared, batches,
+    issuedAt: Date.now()
+  };
+  const raw = base64urlJson(state);
+  const signature = createHmac('sha256', fullScopeKey(env)).update(raw).digest('base64url');
+  return raw + '.' + signature;
+}
+function readFullScopeCursor(token, env, meta, query) {
+  if (typeof token !== 'string' || token.length > 4096) throw httpError(400, 'Invalid full-scope cursor.');
+  const pieces = token.split('.');
+  if (pieces.length !== 2 || !pieces.every(Boolean)) throw httpError(400, 'Invalid full-scope cursor.');
+  const [raw, signature] = pieces;
+  const expected = createHmac('sha256', fullScopeKey(env)).update(raw).digest();
+  let got;
+  try { got = Buffer.from(signature, 'base64url'); } catch (_) {
+    throw httpError(400, 'Invalid full-scope cursor.');
+  }
+  if (got.length !== expected.length || !timingSafeEqual(expected, got)) {
+    throw httpError(400, 'Invalid full-scope cursor signature.');
+  }
+  let state;
+  try { state = JSON.parse(Buffer.from(raw, 'base64url').toString('utf8')); } catch (_) {
+    throw httpError(400, 'Invalid full-scope cursor.');
+  }
+  const total = Number(meta.total_bp_rows);
+  if (state?.engine !== ENGINE_VERSION || state?.v !== 1 ||
+      state?.fingerprint !== fullScopeFingerprint(query)) {
+    throw httpError(409, 'Full-scope inputs, engine or scoring configuration changed. Run a new normal check.');
+  }
+  if (state.sync !== meta.sync_id || state.total !== total) {
+    throw httpError(409, 'Google Sheets snapshot changed. Restart with a normal duplicate check.');
+  }
+  if (!Number.isSafeInteger(state.issuedAt) || state.issuedAt > Date.now() + 30000 ||
+      Date.now() - state.issuedAt > FULL_SCOPE_CURSOR_TTL_MS) {
+    throw httpError(409, 'Full-scope session expired. Run a new normal check.');
+  }
+  if (!Number.isSafeInteger(total) || total < 1 ||
+      !Number.isSafeInteger(state.nextRow) || state.nextRow < 2 || state.nextRow > total + 1 ||
+      !Number.isSafeInteger(state.scanned) || state.scanned !== state.nextRow - 2 ||
+      !Number.isSafeInteger(state.compared) || state.compared < 0 || state.compared > state.scanned ||
+      !Number.isSafeInteger(state.batches) || state.batches < 0 || state.batches > state.scanned ||
+      state.nextRow === total + 1) {
+    throw httpError(400, 'Invalid or completed full-scope cursor.');
+  }
+  return state;
+}
+async function fullScopeCheck(payload, env) {
+  const started = Date.now();
+  const name1 = String(payload?.name_1 || payload?.name1 || '').trim();
+  const address = String(payload?.address || '').trim();
+  const ktpInput = normalizeDigits(payload?.ktp_number || payload?.ktp || '');
+  const queryText = normalizeText(name1 + ' ' + address);
+  if (queryText.length < 3) throw httpError(400, 'Full scope requires sufficient Name 1 or Address text.');
+  const threshold = Number(env.SIMILARITY_THRESHOLD || DEFAULT_SIMILARITY_THRESHOLD);
+  const directRejectThreshold = getSimilarityDirectRejectThreshold(env);
+  const weights = getSimilarityWeights(env);
+  const meta = await getMeta(env);
+  requireReadyExactIndex(meta);
+  const query = {name1, address, ktpInput, threshold, directRejectThreshold, weights};
+  const state = readFullScopeCursor(payload.full_scope_cursor, env, meta, query);
+  const startRow = state.nextRow;
+  const configuredRows = Number(env.FULL_SCOPE_CHUNK_ROWS || FULL_SCOPE_MAX_ROWS_PER_REQUEST);
+  const rowsPerRequest = Number.isFinite(configuredRows)
+    ? Math.max(1, Math.min(FULL_SCOPE_MAX_ROWS_PER_REQUEST, Math.floor(configuredRows)))
+    : FULL_SCOPE_MAX_ROWS_PER_REQUEST;
+  const endRow = Math.min(startRow + rowsPerRequest - 1, state.total + 1);
+  const rows = await getSheetRange(env, 'BP_DATABASE!A' + startRow + ':H' + endRow, meta.sync_id);
+  if (rows.length !== endRow - startRow + 1) {
+    throw httpError(503, 'Full-scope BP_DATABASE range incomplete. No PASS can be issued.');
+  }
+  let compared = state.compared;
+  let scanned = state.scanned;
+  for (const row of rows) {
+    assertSnapshotConsistency(meta.sync_id, String(row[7] || ''), 'FULL_SCOPE -> BP_DATABASE');
+    scanned++;
+    const candidate = bpRowFromSheet(row);
+    if (!candidate.norm_text) continue;
+    compared++;
+    const score = computeSimilarity(queryText, candidate.norm_text, weights, directRejectThreshold);
+    const displayedScore = score.direct_reject ? score.trigger_score : score.combined;
+    if (score.direct_reject || score.combined >= threshold) {
+      const entry = sanitizeBpRow(candidate, displayedScore, {
+        levenshtein: score.levenshtein, jaccard: score.jaccard,
+        numeric_weighted: score.numeric, combined_weighted: score.combined,
+        decision_rule: score.direct_reject ? 'DIRECT_REJECT' : 'WEIGHTED',
+        direct_reject_metric: score.direct_reject_metric,
+        weighted_skipped: score.weighted_skipped,
+        reason: score.direct_reject ? score.direct_reject_metric + ' Direct Reject' : 'Full Scope Weighted Similarity'
+      });
+      const finalMeta = await getMeta(env);
+      requireReadyExactIndex(finalMeta);
+      if (finalMeta.sync_id !== meta.sync_id) {
+        throw httpError(503, 'Snapshot changed during full-scope search; restart normal check.');
+      }
+      return {
+        ok: true, decision: 'FAIL', reason: 'Full-scope duplicate found. Search stopped on a definitive match.',
+        meta, threshold, direct_reject_threshold: directRejectThreshold,
+        similarity_match: entry, full_scope_active: true, full_scope_available: false, full_scope_cursor: null,
+        stats: {scanned_candidates: scanned, compared_candidates: compared,
+          candidate_space: state.total, batches_processed: state.batches + 1,
+          coverage_complete: false, scan_limit_reached: false, elapsed_ms: Date.now() - started}
+      };
+    }
+  }
+  const finished = endRow === state.total + 1;
+  const finalMeta = await getMeta(env);
+  requireReadyExactIndex(finalMeta);
+  if (finalMeta.sync_id !== meta.sync_id) {
+    throw httpError(503, 'Snapshot changed during full-scope search; restart normal check.');
+  }
+  const nextRow = endRow + 1;
+  return {
+    ok: true, decision: finished ? 'PASS' : 'INCONCLUSIVE',
+    reason: finished ? 'No duplicate found after full-scope verification of every BP_DATABASE row.'
+      : 'Full-scope search running. This is NOT a PASS until the full database is checked.',
+    meta, threshold, direct_reject_threshold: directRejectThreshold,
+    full_scope_active: true, full_scope_available: !finished,
+    full_scope_cursor: finished ? null : createFullScopeCursor({
+      env, meta, ...query, nextRow, scanned, compared, batches: state.batches + 1
+    }),
+    stats: {scanned_candidates: scanned, compared_candidates: compared,
+      candidate_space: state.total, batches_processed: state.batches + 1,
+      coverage_complete: finished, scan_limit_reached: !finished,
+      elapsed_ms: Date.now() - started}
+  };
 }
 
 function requireReadyExactIndex(meta) {

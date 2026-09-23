@@ -323,7 +323,11 @@
     const result = $('result');
     const btn = $('submitBtn');
     const API_BASE = location.origin;
-    const EXPECTED_ENGINE_VERSION = '2026-09-23-identity-v3';
+    const EXPECTED_ENGINE_VERSION = '2026-09-23-full-scope-v4';
+    const FULL_SCOPE_WAIT_MS = 1300;
+    let lastCheckInput = null;
+    let fullScopeRunning = false;
+    let fullScopeCancelled = false;
 
     async function checkHealth() {
       const dot = $('healthDot');
@@ -347,25 +351,30 @@
       e.preventDefault();
       result.className = 'card result show';
       result.innerHTML = loadingHtml();
+      fullScopeCancelled = true;
+      fullScopeRunning = false;
+      lastCheckInput = null;
       btn.disabled = true;
       btn.textContent = 'Checking...';
       try {
+        const submittedInput = {
+          name_1: $('name1').value,
+          address: $('address').value,
+          ktp_number: $('ktp').value
+        };
         const res = await fetch(API_BASE + '/api/check', {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json'
           },
-          body: JSON.stringify({
-            name_1: $('name1').value,
-            address: $('address').value,
-            ktp_number: $('ktp').value
-          })
+          body: JSON.stringify(submittedInput)
         });
         const json = await res.json();
         if (!res.ok || !json.ok) throw new Error(json.error || 'Check failed');
         if (json.engine_version !== EXPECTED_ENGINE_VERSION || json.meta?.exact_index_version !== '1' || json.meta?.sync_state !== 'READY') {
           throw new Error('Backend version or exact index is outdated; result cannot be treated as PASS.');
         }
+        lastCheckInput = submittedInput;
         renderResult(json);
       } catch (err) {
         result.innerHTML = errorHtml(err.message || 'Unexpected error');
@@ -376,6 +385,43 @@
     });
 
 
+    // Only a user click on INCONCLUSIVE starts full scope. Each HTTP request
+    // scans at most 3,000 rows and uses a server-signed continuation cursor.
+    async function runFullScope(cursor) {
+      if (fullScopeRunning || !lastCheckInput || !cursor) return;
+      fullScopeRunning = true;
+      fullScopeCancelled = false;
+      const snapshot = { ...lastCheckInput };
+      let nextCursor = cursor;
+      try {
+        while (nextCursor && !fullScopeCancelled) {
+          const response = await fetch(API_BASE + '/api/check', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ ...snapshot, full_scope_cursor: nextCursor })
+          });
+          const data = await response.json();
+          if (!response.ok || !data.ok) throw new Error(data.error || 'Full-scope chunk failed');
+          if (data.engine_version !== EXPECTED_ENGINE_VERSION ||
+              data.meta?.sync_state !== 'READY') {
+            throw new Error('Engine or Sheets snapshot changed during full-scope search.');
+          }
+          if (fullScopeCancelled) break;
+          renderResult(data);
+          if (data.decision !== 'INCONCLUSIVE') break;
+          nextCursor = data.full_scope_cursor;
+          if (!nextCursor) throw new Error('Full-scope continuation missing; refusing PASS.');
+          await new Promise(resolve => setTimeout(resolve, FULL_SCOPE_WAIT_MS));
+        }
+      } catch (error) {
+        if (!fullScopeCancelled) result.innerHTML = errorHtml(error.message || 'Full-scope search interrupted; no PASS issued.');
+      } finally {
+        fullScopeRunning = false;
+        if (fullScopeCancelled) {
+          result.innerHTML = errorHtml('Full-scope search cancelled. No PASS issued; run a new normal check.');
+        }
+      }
+    }
     function loadingHtml() {
       return `<div class="result-head"><div class="status">Scanning indexed database...</div><span class="badge">PROCESSING</span></div><div class="result-body"><p class="reason">Worker is checking KTP shard first, then exact Name+Address index, then nearest length buckets for fuzzy matching.</p></div>`;
     }
@@ -401,7 +447,9 @@
           ${match ? matchHtml(match) : ''}
           ${otherExact ? '<p class="reason"><strong>Different BP found by name and address:</strong></p>' + matchHtml(otherExact) : ''}
           ${topCandidatesHtml(data.top_candidates || [])}
-          <div class="match-grid">
+          ${inconclusive && data.full_scope_cursor && lastCheckInput ? '<div class="settings"><button id="fullScopeButton" type="button" ' + (fullScopeRunning ? 'disabled' : '') + '>' + (data.full_scope_active ? 'Full Scope Search Running...' : 'Full Scope Search — Check All BP') + '</button><p class="small">Manual action only; checks every BP in chunks of up to 3,000 rows. This can take minutes. PASS is impossible until the full scan completes.</p></div>' : ''}
+          ${data.full_scope_active ? '<p class="small">Full-scope progress: ' + (data.stats?.scanned_candidates ?? 0) + ' / ' + (data.stats?.candidate_space ?? '?') + ' BP records. Keep this tab open.</p>' : ''}
+                    <div class="match-grid">
             <div class="kv"><span>Weighted Threshold</span><strong>${data.threshold}</strong></div>
             <div class="kv"><span>Direct Reject</span><strong>${data.direct_reject_threshold ?? '-'}</strong></div>
             <div class="kv"><span>Scanned</span><strong>${data.stats?.scanned_candidates ?? 0}</strong></div>
@@ -413,6 +461,10 @@
           </div>
           <p class="footer-note">Result only returns relevant match previews. Full protected Google Sheet data is not exposed to the browser.</p>
         </div>`;
+      if (inconclusive && data.full_scope_cursor && lastCheckInput) {
+        const fullButton = $('fullScopeButton');
+        if (fullButton) fullButton.addEventListener('click', () => runFullScope(data.full_scope_cursor));
+      }
     }
 
     function matchHtml(m) {

@@ -213,9 +213,9 @@ test('health and exact response disclose running engine and index readiness with
   const f=fixture([row('TEST-BP','Example Shop','A sample street address')]);
   const health = await handleHealth({env:f.env});
   const hb = await health.json();
-  assert.equal(hb.engine_version,'2026-09-23-identity-v3');
+  assert.equal(hb.engine_version,'2026-09-23-full-scope-v4');
   assert.equal(hb.exact_index_ready,true);
-  assert.equal(health.headers.get('x-bp-checker-engine'),'2026-09-23-identity-v3');
+  assert.equal(health.headers.get('x-bp-checker-engine'),'2026-09-23-full-scope-v4');
   const r=await run(f,{name_1:'Example Shop',address:'A sample street address'});
   assert.equal(r.body.decision,'FAIL');
   assert.equal(r.body.exact_lookup.attempted,true);
@@ -308,4 +308,62 @@ test('identity conflict beyond five duplicate source rows is detected and previe
   assert.equal(r.body.exact_name_address_match?.bp_id,'BP-A');
   assert(r.body.top_candidates.some(x=>x.bp_id==='BP-B'));
   assert.equal(r.body.stats.scanned_candidates,0);
+});
+
+test('manual exhaustive search continues in chunks and finds later similar BP',async()=>{
+  const input={name_1:'Tk Adit',address:'Kp Pasir Kalong RT 001 RW 004 Ds Batujajar Kec Cigudeg'};
+  const f=fixture([
+    row('BP-X','Unrelated One','Other location unrelated completely'),
+    row('BP-Y','Unrelated Two','Other location unrelated completely'),
+    row('BP-LATE',input.name_1,input.address+' extraextraextraextraextraextraextra')
+  ],{env:{MAX_CANDIDATES:'1',FULL_SCOPE_CHUNK_ROWS:'1'}});
+  const fast=await run(f,input);
+  assert.equal(fast.body.decision,'INCONCLUSIVE');
+  assert.equal(fast.body.full_scope_available,true);
+  let r=fast;
+  for(let i=0;i<4 && r.body.full_scope_cursor;i++){
+    r=await run(f,{...input,full_scope_cursor:r.body.full_scope_cursor});
+    assert.equal(r.status,200,r.body.error);
+  }
+  assert.equal(r.body.decision,'FAIL');
+  assert.equal(r.body.similarity_match.bp_id,'BP-LATE');
+});
+
+test('manual exhaustive search cannot PASS until every row is checked',async()=>{
+  const input={name_1:NAME,address:ADDRESS};
+  const f=fixture([
+    row('BP-X','Unrelated X','Other location unrelated completely'),
+    row('BP-Y','Unrelated Y','Other location unrelated completely'),
+    row('BP-Z','Unrelated Z','Other location unrelated completely')
+  ],{env:{MAX_CANDIDATES:'1',FULL_SCOPE_CHUNK_ROWS:'1'}});
+  let r=await run(f,input);
+  assert.equal(r.body.decision,'INCONCLUSIVE');
+  for(let i=1;i<=3;i++){
+    r=await run(f,{...input,full_scope_cursor:r.body.full_scope_cursor});
+    assert.equal(r.status,200,r.body.error);
+    assert.equal(r.body.stats.scanned_candidates,i);
+    assert.equal(r.body.decision,i===3?'PASS':'INCONCLUSIVE');
+  }
+  assert.equal(r.body.stats.coverage_complete,true);
+  assert.equal(r.body.full_scope_cursor,null);
+});
+
+test('manual search cursor rejects changed input and changed snapshot',async()=>{
+  const input={name_1:NAME,address:ADDRESS};
+  const f=fixture([
+    row('BP-X','Unrelated X','Other location unrelated completely'),
+    row('BP-Y','Unrelated Y','Other location unrelated completely')
+  ],{env:{MAX_CANDIDATES:'1',FULL_SCOPE_CHUNK_ROWS:'1'}});
+  const fast=await run(f,input);
+  const token=fast.body.full_scope_cursor;
+  assert.equal(typeof token,'string');
+  const changed=await run(f,{...input,address:'Other address',full_scope_cursor:token});
+  assert.equal(changed.status,409);
+  const pieces=token.split('.');
+  pieces[1]=pieces[1].slice(0,-3)+'abc';
+  const invalid=await run(f,{...input,full_scope_cursor:pieces.join('.')});
+  assert.equal(invalid.status,400);
+  f.data.get('META').find(r=>r[0]==='sync_id')[1]='later-snapshot';
+  const stale=await run(f,{...input,full_scope_cursor:token});
+  assert.equal(stale.status,409);
 });
