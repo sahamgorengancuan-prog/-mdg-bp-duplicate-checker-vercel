@@ -521,6 +521,7 @@ test('score upper bounds provide fast PASS on complete, provably excluded group'
   assert.equal(r.body.decision,'PASS');
   assert.equal(r.body.stats.score_bound_index_used,true);
   assert.equal(r.body.stats.safely_pruned_candidates,1);
+  assert.equal(r.body.stats.pass_basis,'ALL_RELEVANT_ROWS_SCORED_OR_SAFELY_PRUNED');
   assert.equal(r.body.stats.candidate_space,0);
   assert.equal(r.body.stats.scanned_candidates,0);
   assert.equal(r.body.stats.coverage_complete,true);

@@ -493,8 +493,8 @@
             <div class="kv"><span>Scanned</span><strong>${data.stats?.scanned_candidates ?? 0}</strong></div>
             <div class="kv"><span>Compared</span><strong>${data.stats?.compared_candidates ?? 0}</strong></div>
             <div class="kv"><span>Coverage</span><strong>${data.exact_ktp_match || data.exact_name_address_match ? "Exact verified" : data.stats?.coverage_complete ? "Complete" : "Partial / not PASS"}</strong></div>
-            ${data.stats?.search_scope ? '<div class="kv"><span>Bucket coverage</span><strong>' + (data.stats.completed_buckets ?? 0) + ' / ' + (data.stats.bucket_count ?? 0) + '</strong></div>' : ''}
-            ${data.stats?.pass_basis ? '<div class="kv"><span>PASS basis</span><strong>All eligible buckets completed and scored</strong></div>' : ''}
+            ${data.stats?.search_scope ? '<div class="kv"><span>Search groups completed</span><strong>' + (data.stats.completed_buckets ?? 0) + ' / ' + (data.stats.bucket_count ?? 0) + '</strong></div>' : ''}
+            ${data.stats?.pass_basis ? '<div class="kv"><span>PASS basis</span><strong>' + (data.stats?.score_bound_index_used ? 'Relevant rows scored or mathematically excluded' : 'All eligible buckets completed and scored') + '</strong></div>' : ''}
             <div class="kv"><span>Exact lookup</span><strong>${data.exact_lookup?.attempted ? `Shard ${data.exact_lookup.shard_present ? "present" : "absent"}; matches ${data.exact_lookup.matching_index_rows}` : "Not requested"}</strong></div>
             <div class="kv"><span>Engine</span><strong>${escapeHtml(data.engine_version || "unknown")}</strong></div>
             <div class="kv"><span>Elapsed</span><strong>${data.stats?.elapsed_ms ?? 0} ms</strong></div>

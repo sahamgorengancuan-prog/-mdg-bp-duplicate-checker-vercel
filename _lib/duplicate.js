@@ -411,7 +411,7 @@ async function duplicateCheck(payload, env) {
     bucket_count: entries.length, completed_buckets: completedBuckets,
     oversized_bucket_space: oversized, scan_budget: scanBudget,
     search_scope: meta.token_index_version === '1' ? 'SCORE_BOUND_INDEXED_LENGTH_BUCKETS' : 'CONFIGURED_LENGTH_BUCKETS',
-    pass_basis: complete ? 'ALL_ELIGIBLE_BUCKET_ROWS_SCORED' : null,
+    pass_basis: complete ? (meta.token_index_version === '1' ? 'ALL_RELEVANT_ROWS_SCORED_OR_SAFELY_PRUNED' : 'ALL_ELIGIBLE_BUCKET_ROWS_SCORED') : null,
     safely_pruned_candidates: plan.safelyPruned,
     score_bound_index_used: meta.token_index_version === '1'
   };
@@ -431,7 +431,7 @@ async function duplicateCheck(payload, env) {
       throw httpError(503, 'Sheet generation changed before PASS; run a new duplicate check.');
     }
     result.decision = 'PASS';
-    result.reason = `No duplicate under the configured similarity rules. Fully examined ${scanned} records across ${entries.length} eligible length buckets; exact indexes checked. This is a scoped PASS, not a full-database scan.`;
+    result.reason = `No duplicate under configured rules: scored ${scanned} rows in ${entries.length} search groups; safely eliminated ${plan.safelyPruned} additional rows using conservative score upper bounds. Exact indexes checked. This is a scoped PASS, not a full-database scan.`;
   } else {
     result.decision = 'INCONCLUSIVE';
     result.reason = `Eligible buckets contain ${candidateSpace} records, exceeding the normal budget of ${maxCandidates}. Checked ${scanned} (including ${completedBuckets} completed smaller buckets); manual Full Scope is available. This is NOT a PASS.`;
@@ -666,7 +666,7 @@ async function fullScopeCheck(payload, env) {
     elapsed_ms: Date.now() - started, bucket_count: plan.ordered.length,
     completed_buckets: completedBuckets,
     search_scope: meta.token_index_version === '1' ? 'SCORE_BOUND_INDEXED_LENGTH_BUCKETS' : 'CONFIGURED_LENGTH_BUCKETS',
-    pass_basis: finished ? 'ALL_ELIGIBLE_BUCKET_ROWS_SCORED' : null,
+    pass_basis: finished ? (meta.token_index_version === '1' ? 'ALL_RELEVANT_ROWS_SCORED_OR_SAFELY_PRUNED' : 'ALL_ELIGIBLE_BUCKET_ROWS_SCORED') : null,
     safely_pruned_candidates: plan.safelyPruned,
     score_bound_index_used: meta.token_index_version === '1',
     resumed_from_normal_scan: state.scanned, full_scope_batch_rows: rowsPerRequest
