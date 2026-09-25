@@ -26,8 +26,9 @@ sys.path.insert(0,str(ROOT/'scripts'))
 keyed=importlib.import_module('sync_bp_keyed')
 
 def data(rows):
-    return pd.DataFrame(rows,columns=[
-        'bp_id','bp_type_id','name_1','address','ktp_number'])
+    normalized=[list(r)+([''] if len(r)==5 else []) for r in rows]
+    return pd.DataFrame(normalized,columns=[
+        'bp_id','bp_type_id','name_1','address','ktp_number','npwp_number'])
 
 class WorksheetNotFound(Exception):
     pass
@@ -148,9 +149,9 @@ def test_index_postings_use_stable_bp_key_and_source_hash():
     records=keyed.make_records(data([
         ['BP-A','ZB02','Alpha','Street 10','1234'],
         ['BP-B','ZB02','Beta','Street 12','5678']]))
-    tabs,n_ktp,n_groups=keyed.build_index_rows(
+    tabs,n_ktp,n_npwp,n_groups=keyed.build_index_rows(
         records,{'BP-A':17,'BP-B':2},'test-sync')
-    assert n_ktp==2 and n_groups>=1
+    assert n_ktp==2 and n_npwp==0 and n_groups>=1
     assert len(tabs['INDEX_LEN_TOKEN'])==3
     for row in tabs['INDEX_LEN_TOKEN'][1:]:
         assert len(row)==2
@@ -160,8 +161,25 @@ def test_index_postings_use_stable_bp_key_and_source_hash():
         assert row[0]==records[bp]['len_bucket']+':'+str(records[bp]['token_count'])
     assert all(len(row)==2 for row in tabs['EXACT_INDEX'][1:])
     assert all(len(row)==2 for row in tabs['KTP_INDEX'][1:])
+    assert tabs['NPWP_INDEX']==[['npwp_digits','posting_json']]
     assert {json.loads(row[1])[1] for row in tabs['EXACT_INDEX'][1:]}==set(records)
     assert {json.loads(row[1])[1] for row in tabs['KTP_INDEX'][1:]}==set(records)
+    assert all(len(json.loads(row[1]))==4 for row in tabs['KTP_INDEX'][1:])
+
+def test_npwp_index_is_separate_from_ktp_universe():
+    records=keyed.make_records(data([
+        ['BP-A','ZB02','Alpha','Street 10','1234567890123456','9876543210123456'],
+        ['BP-B','ZB02','Beta','Street 12','9876543210123456','1111222233334444']]))
+    tabs,n_ktp,n_npwp,n_groups=keyed.build_index_rows(
+        records,{'BP-A':2,'BP-B':3},'npwp-sync')
+    assert n_ktp==2 and n_npwp==2 and n_groups>=1
+    ktp_values={row[0] for row in tabs['KTP_INDEX'][1:]}
+    npwp_values={row[0] for row in tabs['NPWP_INDEX'][1:]}
+    assert '1234567890123456' in ktp_values
+    assert '1234567890123456' not in npwp_values
+    assert '1111222233334444' in npwp_values
+    assert all(len(json.loads(row[1]))==4 for row in tabs['NPWP_INDEX'][1:])
+
 
 def test_initial_then_keyed_update_preserves_active_snapshot(monkeypatch):
     gc=configured(monkeypatch)
@@ -331,12 +349,12 @@ def test_packed_snapshot_round_trip_and_meta(monkeypatch):
     assert all(r[2]=="gen-packed" and r[1]==str(len(rows)-1) for r in rows[1:])
     assert [r[0] for r in rows[1:]]==[str(n) for n in range(1,len(rows))]
     lines=raw.decode("utf-8").split("\n")
-    assert lines[0]=="bp_id\tbp_type_id\tname_1\taddress\tktp_digits"
-    assert lines[1:]==["BP-A\tZB03\tAlpha\tStreet 10\t","BP-B\tZB02\tBeta Tab\tStreet 12\t5678"]
+    assert lines[0]=="bp_id\tbp_type_id\tname_1\taddress\tktp_digits\tnpwp_digits"
+    assert lines[1:]==["BP-A\tZB03\tAlpha\tStreet 10\t\t","BP-B\tZB02\tBeta Tab\tStreet 12\t5678\t"]
     sha=hashlib.sha256(raw).hexdigest()
     for book in ("A","A2"):
         meta=dict(r for r in gc.books[book].worksheet("META").get("A2:B40") if r and r[0])
-        assert meta["packed_sha256"]==sha and meta["packed_snapshot_version"]=="1"
+        assert meta["packed_sha256"]==sha and meta["packed_snapshot_version"]=="2"
         assert meta["packed_records"]=="2" and meta["packed_parts"]==str(len(rows)-1)
     control=control_of(gc)
     assert control["packed_sha256"]==sha and control["active_index_sheet_id"]=="A2"
