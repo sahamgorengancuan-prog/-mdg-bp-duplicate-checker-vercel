@@ -147,33 +147,52 @@ async function findExact(name,address,env,meta){
     attempted:true,index_version:'1',shard_present:true,shard_rows:rows.length,
     matching_index_rows:pointer.length,verified_matches:matches.length}};
 }
-async function findKtp(ktp,env,meta){
-  if(!ktp)return null;
-  const shards=await getIndexMap(env,'INDEX_KTP_SHARD','ktp',meta);
-  const shard=shards.get(ktp.slice(-2).padStart(2,'0'));
+async function findIdentity(kind,value,env,meta){
+  if(!value)return null;
+  const isNpwp=kind==='NPWP';
+  const v2=String(meta.identity_index_version||'')==='2';
+  if(isNpwp&&!v2)
+    throw fail(503,'NPWP index is not available in the active snapshot yet. No PASS.');
+  const shardTab=isNpwp?'INDEX_NPWP_SHARD':'INDEX_KTP_SHARD';
+  const indexTab=isNpwp?'NPWP_INDEX':'KTP_INDEX';
+  const mapKind=isNpwp?'npwp':'ktp';
+  const shards=await getIndexMap(env,shardTab,mapKind,meta);
+  const shard=shards.get(value.slice(-2).padStart(2,'0'));
   if(!shard)return null;
   const rows=await getSheetRange(env,
-    'KTP_INDEX!A'+shard.row_start+':B'+shard.row_end,meta.sync_id);
-  if(rows.length!==shard.count)throw fail(503,'KTP shard incomplete.');
+    indexTab+'!A'+shard.row_start+':B'+shard.row_end,meta.sync_id);
+  if(rows.length!==shard.count)throw fail(503,kind+' shard incomplete.');
   for(const row of rows){
     if(String(row[0]||'').slice(-2).padStart(2,'0')!==
-       ktp.slice(-2).padStart(2,'0'))
-      throw fail(503,'KTP shard sorting invalid.');
-    if(normalizeDigits(row[0])===ktp){
-      const [pointer,bp]=packed(row,2,'KTP');
+       value.slice(-2).padStart(2,'0'))
+      throw fail(503,kind+' shard sorting invalid.');
+    if(normalizeDigits(row[0])===value){
+      const posting=packed(row,v2?4:2,kind);
+      const pointer=posting[0],bp=posting[1];
       const bpRow=int(pointer);
       if(!Number.isSafeInteger(bpRow)||bpRow<2||typeof bp!=='string'||!bp)
-        throw fail(503,'Invalid KTP keyed posting.');
+        throw fail(503,'Invalid '+kind+' keyed posting.');
       const result=await getSheetRange(env,
         'BP_DATABASE!A'+bpRow+':H'+bpRow,meta.sync_id);
       const source=result[0];
-      const expectedRowHash=sha(JSON.stringify([
-        String(source?.[0]||''),String(source?.[1]||''),
-        String(source?.[2]||''),String(source?.[3]||''),ktp]));
+      let expectedRowHash;
+      if(v2){
+        const ktp=normalizeDigits(posting[2]||'');
+        const npwp=normalizeDigits(posting[3]||'');
+        if((isNpwp?npwp:ktp)!==value)
+          throw fail(503,kind+' posting identity payload mismatch. No PASS.');
+        expectedRowHash=sha(JSON.stringify([
+          String(source?.[0]||''),String(source?.[1]||''),
+          String(source?.[2]||''),String(source?.[3]||''),ktp,npwp]));
+      }else{
+        expectedRowHash=sha(JSON.stringify([
+          String(source?.[0]||''),String(source?.[1]||''),
+          String(source?.[2]||''),String(source?.[3]||''),value]));
+      }
       if(!source||String(source[0])!==bp||
          String(source[7]||'')!==expectedRowHash||
          normalizeText(String(source[2]||'')+' '+String(source[3]||''))!==String(source[4]||''))
-        throw fail(503,'KTP posting not bound to authoritative BP row/hash. NO PASS.');
+        throw fail(503,kind+' posting not bound to authoritative BP row/hash. NO PASS.');
       return {bp_id:bp,bp_type_id:String(source[1]||''),
         name_1:String(source[2]||''),address:String(source[3]||''),
         norm_text:String(source[4]||''),text_len:Number(source[6])};
@@ -181,6 +200,8 @@ async function findKtp(ktp,env,meta){
   }
   return null;
 }
+const findKtp=(ktp,env,meta)=>findIdentity('KTP',ktp,env,meta);
+const findNpwp=(npwp,env,meta)=>findIdentity('NPWP',npwp,env,meta);
 async function keyedGroups(env,meta) {
   const rows=await getSheetRange(env,'INDEX_LEN!A2:E10000',meta.sync_id);
   const map=new Map();
@@ -243,6 +264,8 @@ export async function keyedHealth(env,meta=null){
     throw fail(503,'Keyed fuzzy group count is incomplete.');
   await getIndexMap(env,'INDEX_EXACT_SHARD','exact',m);
   await getIndexMap(env,'INDEX_KTP_SHARD','ktp',m);
+  if(String(m.identity_index_version||'')==='2')
+    await getIndexMap(env,'INDEX_NPWP_SHARD','npwp',m);
   return m;
 }
 export async function keyedCheck(payload,env,providedMeta=null){
@@ -251,29 +274,36 @@ export async function keyedCheck(payload,env,providedMeta=null){
   const name=String(payload?.name_1||payload?.name1||'').trim();
   const address=String(payload?.address||'').trim();
   const ktp=normalizeDigits(payload?.ktp_number||payload?.ktp||'');
-  if(!name&&!address&&!ktp)throw fail(400,'Provide Name 1, Address or KTP.');
+  const npwp=normalizeDigits(payload?.npwp_number||payload?.npwp||'');
+  if(!name&&!address&&!ktp&&!npwp)throw fail(400,'Provide Name 1, Address, KTP or NPWP.');
+  if(npwp&&String(m.identity_index_version||'')!=='2')
+    throw fail(503,'NPWP index is not available in the active snapshot yet. No PASS.');
   const qtext=normalizeText(name+' '+address);
   const threshold=Number(env.SIMILARITY_THRESHOLD||92);
   const direct=getSimilarityDirectRejectThreshold(env);
   const weights=getSimilarityWeights(env);
   const fp=sha(JSON.stringify([normalizeText(name),normalizeText(address),
-    ktp,threshold,direct,weights]));
+    ktp,npwp,threshold,direct,weights]));
   let exact={matches:[],count:0,bpIds:[],diagnostics:{
     attempted:false,index_version:'1',shard_present:null,
     shard_rows:0,matching_index_rows:0,verified_matches:0}};
-  let exactKtp=null;
+  let exactKtp=null,exactNpwp=null;
   if(!payload?.full_scope_cursor){
     exactKtp=await findKtp(ktp,env,m);
+    exactNpwp=await findNpwp(npwp,env,m);
     exact=await findExact(name,address,env,m);
-    if(exactKtp||exact.count){
-      const conflict=Boolean(exactKtp&&exact.bpIds.some(x=>x!==exactKtp.bp_id));
+    if(exactKtp||exactNpwp||exact.count){
+      const identityIds=[exactKtp?.bp_id,exactNpwp?.bp_id].filter(Boolean);
+      const allIds=[...identityIds,...exact.bpIds];
+      const conflict=new Set(allIds.map(String)).size>1;
       const fin=ready(await getMeta(env));
       if(fin.sync_id!==m.sync_id)throw fail(503,'Snapshot changed during exact search.');
       return {ok:true,decision:'FAIL',reason:conflict
-        ?'IDENTITY CONFLICT: KTP and exact name/address identify different BP IDs.'
+        ?'IDENTITY CONFLICT: KTP/NPWP/name-address exact checks identify different BP IDs.'
         :'Precomputed exact duplicate found.',
         threshold,direct_reject_threshold:direct,meta:m,identity_conflict:conflict,
         exact_ktp_match:exactKtp?sanitizeBpRow(exactKtp,100,{reason:'KTP Exact Match'}):null,
+        exact_npwp_match:exactNpwp?sanitizeBpRow(exactNpwp,100,{reason:'NPWP Exact Match'}):null,
         exact_name_address_match:exact.matches[0]?
           sanitizeBpRow(exact.matches[0],100,{reason:'Exact Name 1 + Address'}):null,
         exact_match_count:exact.count,exact_lookup:exact.diagnostics,
@@ -283,13 +313,15 @@ export async function keyedCheck(payload,env,providedMeta=null){
           search_scope:'KEYED_GOOGLE_SHEETS_V14',elapsed_ms:Date.now()-started}};
     }
     if(qtext.length<3){
-      return {ok:true,decision:ktp?'PASS':'INCONCLUSIVE',
-        reason:ktp?'No exact KTP match; insufficient text to check fuzzy.':
+      const identityProvided=Boolean(ktp||npwp);
+      return {ok:true,decision:identityProvided?'PASS':'INCONCLUSIVE',
+        reason:identityProvided?'No exact KTP/NPWP match; insufficient text to check fuzzy.':
           'Provide more name/address for fuzzy search.',
         threshold,direct_reject_threshold:direct,meta:m,
         exact_lookup:exact.diagnostics,full_scope_cursor:null,
         full_scope_available:false,top_candidates:[],
-        stats:{coverage_complete:Boolean(ktp),scanned_candidates:0,
+        exact_ktp_match:null,exact_npwp_match:null,
+        stats:{coverage_complete:identityProvided,scanned_candidates:0,
           search_scope:'KEYED_GOOGLE_SHEETS_V14',elapsed_ms:Date.now()-started}};
     }
   }
