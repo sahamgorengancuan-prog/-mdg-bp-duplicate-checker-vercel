@@ -1164,7 +1164,7 @@ async function getSearchIndexMap(env, meta, lenIndex) {
 
 export async function getSheetRange(env, rangeA1, syncId = '', fresh = false) {
   const cacheSeconds = Number(env.RANGE_CACHE_SECONDS || DEFAULT_RANGE_CACHE_SECONDS);
-  const indexTab=/^(INDEX_LEN_TOKEN|INDEX_LEN|KTP_INDEX|EXACT_INDEX|INDEX_EXACT_SHARD|INDEX_KTP_SHARD)!/.test(rangeA1);
+  const indexTab=/^(INDEX_LEN_TOKEN|INDEX_LEN|KTP_INDEX|NPWP_INDEX|EXACT_INDEX|INDEX_EXACT_SHARD|INDEX_KTP_SHARD|INDEX_NPWP_SHARD)!/.test(rangeA1);
   const sheetId=indexTab&&env.INDEX_SHEET_ID
     ? String(env.INDEX_SHEET_ID).trim():getSheetId(env);
   if (!sheetId) throw httpError(503, 'Primary/index SHEET_ID is not configured.');
