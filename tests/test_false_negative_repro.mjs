@@ -225,9 +225,9 @@ test('health and exact response disclose running engine and index readiness with
   const f=fixture([row('TEST-BP','Example Shop','A sample street address')]);
   const health = await handleHealth({env:f.env});
   const hb = await health.json();
-  assert.equal(hb.engine_version,'2026-09-24-memory-full-scan-v15');
+  assert.equal(hb.engine_version,'2026-09-25-npwp-identity-v16');
   assert.equal(hb.exact_index_ready,true);
-  assert.equal(health.headers.get('x-bp-checker-engine'),'2026-09-24-memory-full-scan-v15');
+  assert.equal(health.headers.get('x-bp-checker-engine'),'2026-09-25-npwp-identity-v16');
   const r=await run(f,{name_1:'Example Shop',address:'A sample street address'});
   assert.equal(r.body.decision,'FAIL');
   assert.equal(r.body.exact_lookup.attempted,true);
