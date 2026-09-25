@@ -29,10 +29,11 @@ from sync_gsheet_indexed import (
 COLUMNS=["bp_id","bp_type_id","name_1","address",
          "norm_text","norm_digits","text_len","row_hash"]
 LEGACY_COLUMNS=COLUMNS[:-1]+["sync_id"]
-READ_BATCH=5000
-INDEX_WRITE_BATCH=5000
-IDENTITY_INDEX_WRITE_BATCH=10000
+READ_BATCH=10000
+INDEX_WRITE_BATCH=20000
+IDENTITY_INDEX_WRITE_BATCH=20000
 HASH_ONLY_WRITE_BATCH=20000
+HASH_BULK_THRESHOLD=1000
 META_ROWS=40            # META is always rewritten as A1:B40 so stale keys vanish
 PACKED_TITLE="PACKED_SNAPSHOT"
 PACKED_VERSION="2"
@@ -118,42 +119,61 @@ def partition_hash_only_changes(changes, existing):
     return data_changes,hash_only
 
 def write_hash_only(ws,items):
-    """Write contiguous hash-only runs with large single-range updates."""
+    """Small hash-only delta: batch many sparse H cells into one API request."""
     if not items:return
     ordered=sorted(items,key=lambda x:x[0])
-    runs=[]
-    start=prev=ordered[0][0]
-    values=[ordered[0][1]]
-    for row,value in ordered[1:]:
-        if row==prev+1:
-            values.append(value)
-        else:
-            runs.append((start,prev,values))
-            start=row;values=[value]
-        prev=row
-    runs.append((start,prev,values))
-    for run_start,run_end,run_values in runs:
-        offset=0
-        while offset<len(run_values):
-            block=run_values[offset:offset+HASH_ONLY_WRITE_BATCH]
-            a=run_start+offset
-            b=a+len(block)-1
-            update_with_retry(lambda a=a,b=b,block=block:ws.update(
-                range_name=f"H{a}:H{b}",
-                values=[[x] for x in block],value_input_option="RAW"))
-            logging.info("HASH-ONLY WRITTEN rows %s-%s",f"{a:,}",f"{b:,}")
-            offset+=len(block)
-            time.sleep(float(os.getenv("GSHEET_WRITE_SLEEP_SECONDS","0.2")))
+    # Sparse runs are intentionally grouped into one values.batchUpdate request.
+    # This avoids one HTTP request for every 1-10 row run.
+    for start in range(0,len(ordered),500):
+        batch=ordered[start:start+500]
+        update_with_retry(lambda batch=batch:ws.batch_update([
+            {"range":f"H{row}:H{row}","values":[[value]]}
+            for row,value in batch],value_input_option="RAW"))
+        logging.info("HASH-SPARSE WRITTEN %s cells (%s-%s)",
+                     f"{len(batch):,}",f"{batch[0][0]:,}",f"{batch[-1][0]:,}")
+        time.sleep(float(os.getenv("GSHEET_WRITE_SLEEP_SECONDS","0.2")))
+
+def write_hash_column_bulk(ws,records,existing):
+    """Rewrite the complete existing H column in large contiguous blocks.
+
+    Used only for large schema/hash migrations. Every existing physical row has
+    one deterministic final value: the source record hash, or DELETED for a
+    tombstoned key. Later full keyed read-back verifies every row before publish.
+    """
+    if not existing:return
+    by_row={v["row"]:key for key,v in existing.items()}
+    first=2
+    last=len(existing)+1
+    for a in range(first,last+1,HASH_ONLY_WRITE_BATCH):
+        b=min(last,a+HASH_ONLY_WRITE_BATCH-1)
+        values=[]
+        for row in range(a,b+1):
+            key=by_row.get(row)
+            if key is None:
+                raise ValueError(f"BP_DATABASE physical key gap at row {row}; no publish.")
+            values.append([records[key]["row_hash"] if key in records else "DELETED"])
+        update_with_retry(lambda a=a,b=b,values=values:ws.update(
+            range_name=f"H{a}:H{b}",values=values,value_input_option="RAW"))
+        logging.info("HASH-BULK WRITTEN rows %s-%s",f"{a:,}",f"{b:,}")
+        time.sleep(float(os.getenv("GSHEET_WRITE_SLEEP_SECONDS","0.2")))
 
 
 def update_with_retry(action):
-    for attempt in range(5):
+    for attempt in range(6):
         try:return action()
         except Exception as exc:
             status=getattr(getattr(exc,"response",None),"status_code",None)
-            if status not in (429,500,502,503,504) or attempt==4:raise
-            delay=min(90,4*(2**attempt))
-            logging.warning("Sheets temporary HTTP %s; retry in %ss",status,delay)
+            # gspread/requests transport failures often have no HTTP status
+            # (RemoteDisconnected / ConnectionError). They are safe to retry
+            # because all writes in this sync are idempotent staging writes.
+            transport=exc.__class__.__name__ in (
+                "ConnectionError","ProtocolError","RemoteDisconnected",
+                "ReadTimeout","ConnectTimeout")
+            if (status not in (429,500,502,503,504) and not transport) or attempt==5:
+                raise
+            delay=min(32,2*(2**attempt))
+            logging.warning("Sheets temporary %s; retry in %ss",
+                            f"HTTP {status}" if status else exc.__class__.__name__,delay)
             time.sleep(delay)
 
 
@@ -651,7 +671,12 @@ def sync_sheet(records,sync_id):
         update_with_retry(lambda batch=batch:ws.batch_update([
             {"range":f"A{row}:H{row}","values":[sheet_row(rec)]}
             for row,rec in batch],value_input_option="RAW"))
-    write_hash_only(ws,hash_only_changes)
+    if len(hash_only_changes)>=HASH_BULK_THRESHOLD:
+        logging.info("Large hash migration detected: %s hash-only rows; using full H-column bulk rewrite.",
+                     f"{len(hash_only_changes):,}")
+        write_hash_column_bulk(ws,records,existing)
+    else:
+        write_hash_only(ws,hash_only_changes)
     if not legacy:
         for start in range(0,len(tombstones),100):
             batch=tombstones[start:start+100]
