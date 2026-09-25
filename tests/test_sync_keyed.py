@@ -133,6 +133,24 @@ def test_source_keys_and_change_hash():
             ['BP-1','ZB02','Alpha','Address A','1111'],
             ['BP-1','ZB02','Beta','Address B','2222']]))
 
+def test_npwp_hash_schema_upgrade_is_partitioned_as_hash_only():
+    old=keyed.make_records(data([['BP-1','ZB02','Alpha','Address A','1111','']]))
+    new=keyed.make_records(data([['BP-1','ZB02','Alpha','Address A','1111','999999999999999']]))
+    existing={'BP-1':{'row':2,'hash':old['BP-1']['row_hash'],
+                     'old':keyed.sheet_row(old['BP-1'])[:7]}}
+    changes,creates,tombstones=keyed.keyed_delta(new,existing)
+    data_changes,hash_only=keyed.partition_hash_only_changes(changes,existing)
+    assert creates==[] and tombstones==[] and data_changes==[]
+    assert hash_only==[(2,new['BP-1']['row_hash'])]
+
+def test_hash_only_writer_collapses_contiguous_rows():
+    ws=FakeWS('BP_DATABASE',rows=100,cols=8)
+    items=[(2,'a'),(3,'b'),(4,'c'),(9,'z')]
+    keyed.write_hash_only(ws,items)
+    assert 'H2:H4' in ws.writes and 'H9:H9' in ws.writes
+    assert ws.row_values(2)[7]=='a' and ws.row_values(4)[7]=='c'
+    assert ws.row_values(9)[7]=='z'
+
 def test_dual_ids_fails_before_writing(monkeypatch):
     monkeypatch.setenv("GSHEET_SNAPSHOT_MODE","legacy")
     with pytest.raises(ValueError,match='GSHEET_SNAPSHOT_MODE=dual'):
