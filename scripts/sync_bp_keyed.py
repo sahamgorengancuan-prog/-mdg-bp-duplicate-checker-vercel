@@ -31,6 +31,8 @@ COLUMNS=["bp_id","bp_type_id","name_1","address",
 LEGACY_COLUMNS=COLUMNS[:-1]+["sync_id"]
 READ_BATCH=5000
 INDEX_WRITE_BATCH=5000
+IDENTITY_INDEX_WRITE_BATCH=10000
+HASH_ONLY_WRITE_BATCH=20000
 META_ROWS=40            # META is always rewritten as A1:B40 so stale keys vanish
 PACKED_TITLE="PACKED_SNAPSHOT"
 PACKED_VERSION="2"
@@ -95,6 +97,53 @@ def keyed_delta(records: Dict[str,dict], existing: Dict[str,dict]):
         if key not in records and prior["hash"] != "DELETED":
             tombstones.append(prior["row"])
     return changes,creates,tombstones
+
+def partition_hash_only_changes(changes, existing):
+    """Split real A:G edits from row-hash-only migrations.
+
+    Identity-schema upgrades (for example adding NPWP to row_hash) can change
+    every H value even when the visible/keyed BP payload A:G is identical.
+    Those hashes are safe to rewrite as contiguous H-column blocks instead of
+    thousands of one-row batchUpdate requests.
+    """
+    by_row={v["row"]:v for v in existing.values()}
+    data_changes=[]
+    hash_only=[]
+    for row,record in changes:
+        prior=by_row.get(row)
+        if prior and prior["old"]==sheet_row(record)[:7]:
+            hash_only.append((row,record["row_hash"]))
+        else:
+            data_changes.append((row,record))
+    return data_changes,hash_only
+
+def write_hash_only(ws,items):
+    """Write contiguous hash-only runs with large single-range updates."""
+    if not items:return
+    ordered=sorted(items,key=lambda x:x[0])
+    runs=[]
+    start=prev=ordered[0][0]
+    values=[ordered[0][1]]
+    for row,value in ordered[1:]:
+        if row==prev+1:
+            values.append(value)
+        else:
+            runs.append((start,prev,values))
+            start=row;values=[value]
+        prev=row
+    runs.append((start,prev,values))
+    for run_start,run_end,run_values in runs:
+        offset=0
+        while offset<len(run_values):
+            block=run_values[offset:offset+HASH_ONLY_WRITE_BATCH]
+            a=run_start+offset
+            b=a+len(block)-1
+            update_with_retry(lambda a=a,b=b,block=block:ws.update(
+                range_name=f"H{a}:H{b}",
+                values=[[x] for x in block],value_input_option="RAW"))
+            logging.info("HASH-ONLY WRITTEN rows %s-%s",f"{a:,}",f"{b:,}")
+            offset+=len(block)
+            time.sleep(float(os.getenv("GSHEET_WRITE_SLEEP_SECONDS","0.2")))
 
 
 def update_with_retry(action):
@@ -336,8 +385,10 @@ def write_index(sh,title,rows):
     if ws.row_count<need or ws.col_count<len(rows[0]):
         ws.resize(rows=max(ws.row_count,need),cols=len(rows[0]))
     col=chr(ord("A")+len(rows[0])-1)
-    for start in range(0,len(rows),INDEX_WRITE_BATCH):
-        block=rows[start:start+INDEX_WRITE_BATCH]
+    batch_size=(IDENTITY_INDEX_WRITE_BATCH if title in ("KTP_INDEX","NPWP_INDEX")
+                else INDEX_WRITE_BATCH)
+    for start in range(0,len(rows),batch_size):
+        block=rows[start:start+batch_size]
         a,b=start+1,start+len(block)
         # Resume failed staging efficiently: if a complete block is already
         # identical, its readback serves as verification (no duplicate write).
@@ -560,8 +611,10 @@ def sync_sheet(records,sync_id):
     index_plans={**tabs,"META":final_meta}
     if packed_tab:index_plans[PACKED_TITLE]=packed_tab
     preflight_capacity(ish,index_plans,1,"STAGING_INDEX")
-    logging.info("Keyed delta: existing=%s changed=%s appended=%s tombstone=%s",
-                 len(existing),len(changes),len(creates),len(tombstones))
+    data_changes,hash_only_changes=partition_hash_only_changes(changes,existing)
+    logging.info("Keyed delta: existing=%s changed=%s (data=%s hash-only=%s) appended=%s tombstone=%s",
+                 len(existing),len(changes),len(data_changes),len(hash_only_changes),
+                 len(creates),len(tombstones))
     metadata=safe_worksheet(sh,"META",2)
     index_metadata=safe_worksheet(ish,"META",2)
     for marker in (metadata,index_metadata):
@@ -590,11 +643,15 @@ def sync_sheet(records,sync_id):
     required=max(100,len(existing)+len(creates)+1)
     if ws.row_count<required:
         ws.resize(rows=required,cols=8)
-    for start in range(0,len(changes),100):
-        batch=changes[start:start+100]
+    # Real payload edits remain keyed row updates. Hash-only schema migrations
+    # use contiguous H-column writes so a 397k-row identity upgrade does not
+    # create ~4,000 API requests and hit Google Sheets write quotas.
+    for start in range(0,len(data_changes),100):
+        batch=data_changes[start:start+100]
         update_with_retry(lambda batch=batch:ws.batch_update([
             {"range":f"A{row}:H{row}","values":[sheet_row(rec)]}
             for row,rec in batch],value_input_option="RAW"))
+    write_hash_only(ws,hash_only_changes)
     if not legacy:
         for start in range(0,len(tombstones),100):
             batch=tombstones[start:start+100]
