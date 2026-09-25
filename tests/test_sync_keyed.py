@@ -143,13 +143,33 @@ def test_npwp_hash_schema_upgrade_is_partitioned_as_hash_only():
     assert creates==[] and tombstones==[] and data_changes==[]
     assert hash_only==[(2,new['BP-1']['row_hash'])]
 
-def test_hash_only_writer_collapses_contiguous_rows():
+def test_hash_only_writer_batches_sparse_cells():
     ws=FakeWS('BP_DATABASE',rows=100,cols=8)
     items=[(2,'a'),(3,'b'),(4,'c'),(9,'z')]
     keyed.write_hash_only(ws,items)
-    assert 'H2:H4' in ws.writes and 'H9:H9' in ws.writes
+    assert {'H2:H2','H3:H3','H4:H4','H9:H9'}.issubset(set(ws.writes))
     assert ws.row_values(2)[7]=='a' and ws.row_values(4)[7]=='c'
     assert ws.row_values(9)[7]=='z'
+
+def test_hash_bulk_writer_rewrites_existing_column_in_large_blocks(monkeypatch):
+    monkeypatch.setattr(keyed,'HASH_ONLY_WRITE_BATCH',3)
+    ws=FakeWS('BP_DATABASE',rows=100,cols=8)
+    records=keyed.make_records(data([
+        ['BP-1','ZB02','Alpha','A','111','999'],
+        ['BP-2','ZB02','Beta','B','222','888'],
+        ['BP-4','ZB02','Delta','D','444','777']]))
+    existing={
+        'BP-1':{'row':2,'hash':'old1','old':keyed.sheet_row(records['BP-1'])[:7]},
+        'BP-2':{'row':3,'hash':'old2','old':keyed.sheet_row(records['BP-2'])[:7]},
+        'BP-3':{'row':4,'hash':'old3','old':['','','','','','','']},
+        'BP-4':{'row':5,'hash':'old4','old':keyed.sheet_row(records['BP-4'])[:7]},
+    }
+    keyed.write_hash_column_bulk(ws,records,existing)
+    assert 'H2:H4' in ws.writes and 'H5:H5' in ws.writes
+    assert ws.row_values(2)[7]==records['BP-1']['row_hash']
+    assert ws.row_values(3)[7]==records['BP-2']['row_hash']
+    assert ws.row_values(4)[7]=='DELETED'
+    assert ws.row_values(5)[7]==records['BP-4']['row_hash']
 
 def test_dual_ids_fails_before_writing(monkeypatch):
     monkeypatch.setenv("GSHEET_SNAPSHOT_MODE","legacy")
