@@ -20,7 +20,8 @@ spec.loader.exec_module(mod)
 
 
 def _df(rows):
-    return pd.DataFrame(rows, columns=['bp_id', 'bp_type_id', 'name_1', 'address', 'ktp_number'])
+    normalized=[list(r)+([''] if len(r)==5 else []) for r in rows]
+    return pd.DataFrame(normalized, columns=['bp_id', 'bp_type_id', 'name_1', 'address', 'ktp_number', 'npwp_number'])
 
 
 def test_ktp_index_maps_each_source_row_not_first_duplicate_bp_id():
@@ -41,18 +42,34 @@ def test_ktp_index_maps_each_source_row_not_first_duplicate_bp_id():
     assert ktp_to_row['3673011202760004'] != ktp_to_row['3204063011820001']
 
 
+
+def test_npwp_index_maps_source_rows_and_stays_separate_from_ktp():
+    src = _df([
+        ['BP-A', 'ZB02', 'Alpha', 'Address A', '1111222233334444', '9999000011112222'],
+        ['BP-B', 'ZB02', 'Beta', 'Address B', '9999000011112222', '5555666677778888'],
+    ])
+    bp, ktp, npwp, _, _, idx_npwp, *_ = mod.prepare_indexes(src)
+    by_bp={row.bp_id:n for n,row in enumerate(bp.itertuples(index=False),start=2)}
+    assert dict(zip(npwp['npwp_digits'],npwp['bp_db_row']))['9999000011112222']==by_bp['BP-A']
+    assert set(ktp['ktp_digits'])=={'1111222233334444','9999000011112222'}
+    assert set(npwp['npwp_digits'])=={'9999000011112222','5555666677778888'}
+    assert sum(idx_npwp['count'])==2
+
+
 def test_indexes_carry_snapshot_identity_for_cross_tab_consistency():
     src = _df([
         ['110645467', 'ZB02', 'Tk Madura Abel', 'Perum Puspa No 1', '3204063011820001'],
         ['110646122', 'ZB02', 'Target BP', 'Some address', '3673011202760004'],
     ])
 
-    bp_out, ktp_out, idx_len, idx_ktp, exact_out, idx_exact, idx_token, meta = mod.prepare_indexes(src)
+    bp_out, ktp_out, npwp_out, idx_len, idx_ktp, idx_npwp, exact_out, idx_exact, idx_token, meta = mod.prepare_indexes(src)
 
     assert 'sync_id' in bp_out.columns
     assert {'bp_id', 'sync_id'}.issubset(ktp_out.columns)
+    assert {'bp_id', 'sync_id'}.issubset(npwp_out.columns)
     assert 'sync_id' in idx_len.columns
     assert 'sync_id' in idx_ktp.columns
+    assert 'sync_id' in idx_npwp.columns
     meta_map = dict(zip(meta['key'], meta['value']))
     assert meta_map.get('sync_id')
     assert set(bp_out['sync_id']) == {meta_map['sync_id']}
@@ -67,7 +84,7 @@ def test_exact_index_is_complete_and_points_to_original_bp_rows():
         ['DIFFERENT', 'ZB02', 'Wr Santi', 'Different address', ''],
         ['SAME', 'ZB02', 'Wr Santi', 'Kp Cisaat Lebak RT 013 RW 003 Kel Bolang Kec Malingping Stlh Sdn 3 Bolang', ''],
     ])
-    bp, ktp, ilen, iktp, exact, shards, idx_token, meta = mod.prepare_indexes(src)
+    bp, ktp, npwp, ilen, iktp, inpwp, exact, shards, idx_token, meta = mod.prepare_indexes(src)
     assert len(exact) == len(bp) == 3
     assert sum(shards['count']) == len(bp)
     assert dict(zip(meta['key'], meta['value']))['exact_index_version'] == '1'
@@ -105,7 +122,7 @@ def test_capacity_preflight_accounts_for_actual_columns_and_unrelated_tabs(monke
 def test_full_12000_row_fixture_all_exact_hashes_and_row_pointers_complete():
     src = _df([[str(i).zfill(9), 'ZB02', f'Customer {i}',
                 f'Jl Sudirman No {i % 1000} Jakarta', ''] for i in range(12000)])
-    bp, _, _, _, exact, shards, idx_token, meta = mod.prepare_indexes(src)
+    bp, _, _, _, _, _, exact, shards, idx_token, meta = mod.prepare_indexes(src)
     assert len(bp) == len(exact) == 12000
     assert sum(shards['count']) == 12000
     assert all(int(a) + int(c) - 1 == int(b)
@@ -143,7 +160,7 @@ def test_token_groups_cover_every_bp_once_and_match_node_tokenization():
         ['BP3', 'ZB02', 'S', 'A 1 B', ''],
         ['BP4', 'ZB02', 'A B', 'CV Jalan 1', ''],
     ])
-    bp, _, idx_len, _, _, _, idx_token, meta = mod.prepare_indexes(src)
+    bp, _, _, idx_len, _, _, _, _, idx_token, meta = mod.prepare_indexes(src)
     assert dict(zip(meta['key'], meta['value']))['token_index_version'] == '1'
     assert sum(idx_token['count']) == len(bp)
     assert list(idx_token['row_start'])[0] == 2
