@@ -965,39 +965,49 @@ async function findExactNameAddress(name, address, env, meta) {
   return { matches, count: pointers.length, bpIds, diagnostics: { attempted: true, index_version: meta.exact_index_version, shard_present: true, shard_rows: rows.length, matching_index_rows: pointers.length, verified_matches: matches.length } }; 
 }
 
-async function findExactKtp(ktpDigits, env, activeMeta) {
+async function findExactIdentity(kind, digits, env, activeMeta) {
+  const isNpwp = kind === 'NPWP';
+  if (isNpwp && String(activeMeta.identity_index_version || '') !== '2') {
+    throw httpError(503, 'NPWP index is not available in the active snapshot yet. No PASS.');
+  }
   const activeSyncId = activeMeta.sync_id;
-  const ktpShardMap = await getIndexMap(env, 'INDEX_KTP_SHARD', 'ktp', activeMeta);
-  const shard = ktpDigits.slice(-2).padStart(2, '0');
-  const info = ktpShardMap.get(shard);
+  const shardTab = isNpwp ? 'INDEX_NPWP_SHARD' : 'INDEX_KTP_SHARD';
+  const indexTab = isNpwp ? 'NPWP_INDEX' : 'KTP_INDEX';
+  const indexType = isNpwp ? 'npwp' : 'ktp';
+  const shardMap = await getIndexMap(env, shardTab, indexType, activeMeta);
+  const shard = digits.slice(-2).padStart(2, '0');
+  const info = shardMap.get(shard);
   if (!info) return null;
 
-  assertSnapshotConsistency(activeSyncId, info.sync_id, 'META -> INDEX_KTP_SHARD');
-  const rows = await getSheetRange(env, `KTP_INDEX!A${info.row_start}:D${info.row_end}`, activeSyncId);
+  assertSnapshotConsistency(activeSyncId, info.sync_id, `META -> ${shardTab}`);
+  const rows = await getSheetRange(env, `${indexTab}!A${info.row_start}:D${info.row_end}`, activeSyncId);
   if (rows.length !== info.count) {
-    throw httpError(503, `INDEX_KTP_SHARD points to an empty KTP_INDEX range ${info.row_start}:${info.row_end}. Run a full sync.`);
+    throw httpError(503, `${shardTab} points to an incomplete ${indexTab} range ${info.row_start}:${info.row_end}. Run a full sync.`);
   }
   for (const row of rows) {
     const candidateSyncId = String(row[3] || '');
-    assertSnapshotConsistency(activeSyncId, candidateSyncId, 'META -> KTP_INDEX');
-    const candidateKtp = normalizeDigits(row[0] || '');
-    if (candidateKtp === ktpDigits) {
+    assertSnapshotConsistency(activeSyncId, candidateSyncId, `META -> ${indexTab}`);
+    const candidate = normalizeDigits(row[0] || '');
+    if (candidate === digits) {
       const bpDbRow = Number(row[1] || 0);
       const expectedBpId = String(row[2] || '').trim();
-      if (!bpDbRow) throw httpError(503, 'KTP index contains an invalid BP_DATABASE row pointer. Run a full sync.');
+      if (!bpDbRow) throw httpError(503, `${kind} index contains an invalid BP_DATABASE row pointer. Run a full sync.`);
       const bpRows = await getSheetRange(env, `BP_DATABASE!A${bpDbRow}:H${bpDbRow}`, activeSyncId);
-      if (!bpRows?.[0]) throw httpError(503, 'KTP index points to a missing BP_DATABASE row. Run a full sync.');
+      if (!bpRows?.[0]) throw httpError(503, `${kind} index points to a missing BP_DATABASE row. Run a full sync.`);
       const bpRow = bpRows[0];
-      assertSnapshotConsistency(activeSyncId, String(bpRow[7] || ''), 'KTP_INDEX -> BP_DATABASE');
+      assertSnapshotConsistency(activeSyncId, String(bpRow[7] || ''), `${indexTab} -> BP_DATABASE`);
       const actualBpId = String(bpRow[0] || '').trim();
       if (expectedBpId && actualBpId !== expectedBpId) {
-        throw httpError(503, `KTP index integrity mismatch: expected BP ${expectedBpId}, found ${actualBpId || '(blank)'}. Run a full sync.`);
+        throw httpError(503, `${kind} index integrity mismatch: expected BP ${expectedBpId}, found ${actualBpId || '(blank)'}. Run a full sync.`);
       }
       return bpRowFromSheet(bpRow);
     }
   }
   return null;
 }
+
+const findExactKtp = (digits, env, meta) => findExactIdentity('KTP', digits, env, meta);
+const findExactNpwp = (digits, env, meta) => findExactIdentity('NPWP', digits, env, meta);
 
 export function assertSnapshotConsistency(expectedSyncId, actualSyncId, boundary = 'indexed sheet read') {
   const expected = String(expectedSyncId || '').trim();
