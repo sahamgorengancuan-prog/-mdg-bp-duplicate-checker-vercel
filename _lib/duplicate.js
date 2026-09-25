@@ -12,7 +12,7 @@ const SNAPSHOT_WORKBOOKS=JSON.parse(readFileSync(new URL('../config/gsheet_snaps
   Browser never receives OAuth credential, refresh token, or raw database dump.
 */
 
-export const ENGINE_VERSION = '2026-09-24-memory-full-scan-v15';
+export const ENGINE_VERSION = '2026-09-25-npwp-identity-v16';
 const GOOGLE_TOKEN_URL = 'https://oauth2.googleapis.com/token';
 const TOKEN_TTL_SAFETY_SECONDS = 90;
 
