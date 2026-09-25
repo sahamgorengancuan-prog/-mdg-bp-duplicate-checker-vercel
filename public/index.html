@@ -335,7 +335,7 @@
       <div class="card intro">
         <div class="eyebrow">Secure Master Data Validation</div>
         <h2>Prevent duplicate BP before it reaches <span>MDG.</span></h2>
-        <p class="sub">Input Name 1, Address, and KTP Number only. The checker compares against every BP in the protected database: KTP exact match, exact Name+Address, then a full in-memory Name+Address similarity scan.</p>
+        <p class="sub">Input Name 1, Address, and KTP Number and/or NPWP Number. KTP is checked only against the KTP universe, NPWP only against the NPWP universe, while Name+Address uses exact and in-memory similarity checks across BP records.</p>
         <div class="metrics">
           <div class="metric"><strong>Protected</strong><span>Sheet stays private</span></div>
           <div class="metric"><strong>Full scan</strong><span>Every BP, no candidate cap</span></div>
@@ -364,6 +364,10 @@
           <div class="field">
             <label for="ktp">KTP Number</label>
             <input id="ktp" name="ktp" placeholder="16 digit KTP" inputmode="numeric" autocomplete="off" />
+          </div>
+          <div class="field">
+            <label for="npwp">NPWP Number</label>
+            <input id="npwp" name="npwp" placeholder="NPWP Number" inputmode="numeric" autocomplete="off" />
           </div>
           <button id="submitBtn" type="submit">Run Duplicate Check</button>
         </form>
@@ -396,7 +400,7 @@
 
     // ---- Activity log: every step, timing and error, kept in this browser
     // (last 1,000 entries survive reloads) and downloadable for support.
-    // KTP numbers are always masked; no raw database rows are logged.
+    // KTP/NPWP numbers are always masked; no raw database rows are logged.
     const LOG_KEY = 'bp-checker-log-v1';
     const LOG_MAX = 1000;
     let logEntries = [];
@@ -419,7 +423,7 @@
     }
     function summarizeApi(res, json, ms) {
       const stats = json?.stats || {};
-      const match = json?.similarity_match || json?.exact_name_address_match || json?.exact_ktp_match;
+      const match = json?.similarity_match || json?.exact_name_address_match || json?.exact_npwp_match || json?.exact_ktp_match;
       const out = {
         http: res?.status, client_ms: ms, engine: json?.engine_version,
         backend: json?.search_backend, memory_source: json?.memory_source || json?.memory?.source,
@@ -605,9 +609,13 @@
         const submittedInput = {
           name_1: $('name1').value,
           address: $('address').value,
-          ktp_number: $('ktp').value
+          ktp_number: $('ktp').value,
+          npwp_number: $('npwp').value
         };
-        logEvent('info', 'check.submit', { name_1: submittedInput.name_1, address: submittedInput.address, ktp: maskKtp(submittedInput.ktp_number) });
+        logEvent('info', 'check.submit', {
+          name_1: submittedInput.name_1, address: submittedInput.address,
+          ktp: maskKtp(submittedInput.ktp_number), npwp: maskKtp(submittedInput.npwp_number)
+        });
         let json;
         let quotaRetries = 0;
         let warmingRetries = 0;
@@ -757,7 +765,7 @@
       }
     }
     function loadingHtml() {
-      return `<div class="result-head"><div class="status">Scanning BP database...</div><span class="badge">PROCESSING</span></div><div class="result-body"><p class="reason">Checking exact KTP, exact Name+Address, then Name+Address similarity against every BP.</p></div>`;
+      return `<div class="result-head"><div class="status">Scanning BP database...</div><span class="badge">PROCESSING</span></div><div class="result-body"><p class="reason">Checking exact KTP, exact NPWP, exact Name+Address, then Name+Address similarity against every BP.</p></div>`;
     }
 
     function errorHtml(msg) {
@@ -770,8 +778,9 @@
       const inconclusive = data.decision === 'INCONCLUSIVE';
       const badge = fail || inconclusive ? 'fail' : 'pass';
       const title = data.identity_conflict ? 'Identity Conflict — Review Both BP Records' : fail ? 'Duplicate Found' : inconclusive ? 'Search Incomplete — NOT PASS' : 'No Duplicate Found';
-      const match = data.exact_ktp_match || data.exact_name_address_match || data.similarity_match;
-      const otherExact = data.exact_ktp_match && data.exact_name_address_match && data.exact_ktp_match.bp_id !== data.exact_name_address_match.bp_id ? data.exact_name_address_match : null;
+      const exactMatches = [data.exact_ktp_match, data.exact_npwp_match, data.exact_name_address_match].filter(Boolean);
+      const match = exactMatches[0] || data.similarity_match;
+      const otherExact = match ? exactMatches.filter(x => x !== match && x.bp_id !== match.bp_id) : [];
       result.innerHTML = `
         <div class="result-head">
           <div class="status">${title}</div>
@@ -780,7 +789,7 @@
         <div class="result-body">
           <p class="reason">${escapeHtml(data.reason || '')}</p>
           ${match ? matchHtml(match) : ''}
-          ${otherExact ? '<p class="reason"><strong>Different BP found by name and address:</strong></p>' + matchHtml(otherExact) : ''}
+          ${otherExact.length ? '<p class="reason"><strong>Different BP found by another exact identity signal:</strong></p>' + otherExact.map(matchHtml).join('') : ''}
           ${topCandidatesHtml(data.top_candidates || [])}
           ${inconclusive && data.full_scope_cursor && lastCheckInput ? '<div class="settings"><button id="fullScopeButton" type="button" ' + (fullScopeRunning ? 'disabled' : '') + '>' + (data.full_scope_active ? 'Full Scope Search Running...' : 'Full Scope Search — Relevant Buckets') + '</button><p class="small">Manual action only. Resumes unscanned relevant length buckets in verified batches up to 12,000 rows. PASS only after all eligible buckets finish; not a full-database claim.</p></div>' : ''}
           ${data.full_scope_active ? '<p class="small">Relevant bucket progress: ' + (data.stats?.scanned_candidates ?? 0) + ' / ' + (data.stats?.candidate_space ?? '?') + ' BP records. Keep this tab open.</p>' : ''}
@@ -789,7 +798,7 @@
             <div class="kv"><span>Direct Reject</span><strong>${data.direct_reject_threshold ?? '-'}</strong></div>
             <div class="kv"><span>Scanned</span><strong>${data.stats?.scanned_candidates ?? 0}</strong></div>
             <div class="kv"><span>Compared</span><strong>${data.stats?.compared_candidates ?? 0}</strong></div>
-            <div class="kv"><span>Coverage</span><strong>${data.exact_ktp_match || data.exact_name_address_match ? "Exact verified" : data.stats?.coverage_complete ? (data.search_backend === 'MEMORY_FULL_SCAN' ? "Complete — all " + Number(data.stats.snapshot_records || 0).toLocaleString('en-US') + " BP" : "Complete") : "Partial / not PASS"}</strong></div>
+            <div class="kv"><span>Coverage</span><strong>${data.exact_ktp_match || data.exact_npwp_match || data.exact_name_address_match ? "Exact verified" : data.stats?.coverage_complete ? (data.search_backend === 'MEMORY_FULL_SCAN' ? "Complete — all " + Number(data.stats.snapshot_records || 0).toLocaleString('en-US') + " BP" : "Complete") : "Partial / not PASS"}</strong></div>
             ${data.stats?.bucket_count !== undefined ? '<div class="kv"><span>Search groups completed</span><strong>' + (data.stats.completed_buckets ?? 0) + ' / ' + (data.stats.bucket_count ?? 0) + '</strong></div>' : ''}
             ${data.stats?.pass_basis ? '<div class="kv"><span>PASS basis</span><strong>' + (data.search_backend === 'MEMORY_FULL_SCAN' ? 'Every BP scored or excluded by a proven score bound' : data.stats?.score_bound_index_used ? 'Relevant rows scored or mathematically excluded' : 'All eligible buckets completed and scored') + '</strong></div>' : ''}
             <div class="kv"><span>Exact lookup</span><strong>${data.exact_lookup?.attempted ? `Shard ${data.exact_lookup.shard_present ? "present" : "absent"}; matches ${data.exact_lookup.matching_index_rows}` : "Not requested"}</strong></div>
@@ -847,6 +856,7 @@
         $('name1').value = pending.name_1 || '';
         $('address').value = pending.address || '';
         $('ktp').value = pending.ktp_number || '';
+        $('npwp').value = pending.npwp_number || '';
         $('checkForm').requestSubmit();
       }
     } catch (_) { /* storage unavailable: the user simply re-runs the check */ }
