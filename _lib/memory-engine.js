@@ -819,7 +819,10 @@ export async function memoryCheck(payload,env,snapshot){
   const name=String(payload?.name_1||payload?.name1||'').trim();
   const address=String(payload?.address||'').trim();
   const ktp=normalizeDigits(payload?.ktp_number||payload?.ktp||'');
-  if(!name&&!address&&!ktp)throw fail(400,'Provide Name 1, Address or KTP.');
+  const npwp=normalizeDigits(payload?.npwp_number||payload?.npwp||'');
+  if(!name&&!address&&!ktp&&!npwp)throw fail(400,'Provide Name 1, Address, KTP or NPWP.');
+  if(npwp&&!snap.npwpReady)
+    throw fail(503,'NPWP index is not available in the active snapshot yet. No PASS.');
   const qtext=normalizeText(name+' '+address);
   const threshold=Number(env.SIMILARITY_THRESHOLD||92);
   const direct=getSimilarityDirectRejectThreshold(env);
@@ -829,8 +832,8 @@ export async function memoryCheck(payload,env,snapshot){
   let mark=Date.now();
   const step=(name,extra={})=>{const now=Date.now();trace.push({step:name,ms:now-mark,...extra});mark=now;};
   const base={ok:true,threshold,direct_reject_threshold:direct,meta,
-    input:{name_1:name,address,ktp_masked:maskKtp(ktp),normalized_length:qtext.length},
-    exact_ktp_match:null,exact_name_address_match:null,exact_match_count:0,
+    input:{name_1:name,address,ktp_masked:maskKtp(ktp),npwp_masked:maskKtp(npwp),normalized_length:qtext.length},
+    exact_ktp_match:null,exact_npwp_match:null,exact_name_address_match:null,exact_match_count:0,
     identity_conflict:false,similarity_match:null,top_candidates:[],
     full_scope_cursor:null,full_scope_available:false,full_scope_active:false,
     search_backend:'MEMORY_FULL_SCAN',memory_source:snapshot.source,trace};
@@ -852,33 +855,39 @@ export async function memoryCheck(payload,env,snapshot){
   };
   const ktpHits=await snap.findKtp(ktp,fetchRows);
   step('exact_ktp',{attempted:Boolean(ktp),hits:ktpHits.length});
+  const npwpHits=await snap.findNpwp(npwp,fetchRows);
+  step('exact_npwp',{attempted:Boolean(npwp),hits:npwpHits.length});
   const exactHits=name&&address?await snap.findExact(name,address,fetchRows):[];
   step('exact_name_address',{attempted:Boolean(name&&address),hits:exactHits.length});
   const exactLookup={attempted:Boolean(name&&address),index_version:'1',
     shard_present:Boolean(name&&address),shard_rows:snap.count,
     matching_index_rows:exactHits.length,verified_matches:exactHits.length};
-  if(ktpHits.length||exactHits.length){
-    const conflict=Boolean(ktpHits.length&&exactHits.some(x=>x.bp_id!==ktpHits[0].bp_id));
+  if(ktpHits.length||npwpHits.length||exactHits.length){
+    const exactIds=[ktpHits[0]?.bp_id,npwpHits[0]?.bp_id,...exactHits.map(x=>x.bp_id)].filter(Boolean);
+    const conflict=new Set(exactIds.map(String)).size>1;
     return {...base,decision:'FAIL',identity_conflict:conflict,
       reason:conflict
-        ?'IDENTITY CONFLICT: the KTP and exact Name 1 + Address match different BP IDs. Review both records; do not auto-approve.'
-        :ktpHits.length&&exactHits.length?'KTP and Name 1 + Address exact matches found.'
+        ?'IDENTITY CONFLICT: KTP/NPWP/Name+Address exact checks identify different BP IDs. Review all records; do not auto-approve.'
+        :ktpHits.length&&npwpHits.length&&exactHits.length?'KTP, NPWP and Name 1 + Address exact matches found.'
         :ktpHits.length?'KTP exact match found in protected database.'
+        :npwpHits.length?'NPWP exact match found in protected database.'
         :`Exact Name 1 + Address match found (${exactHits.length} BP record(s)).`,
       exact_ktp_match:ktpHits.length?sanitizeBpRow(ktpHits[0],100,{reason:'KTP Exact Match'}):null,
+      exact_npwp_match:npwpHits.length?sanitizeBpRow(npwpHits[0],100,{reason:'NPWP Exact Match'}):null,
       exact_name_address_match:exactHits.length?
         sanitizeBpRow(exactHits[0],100,{reason:'Exact Name 1 + Address Match'}):null,
       exact_match_count:exactHits.length,exact_lookup:exactLookup,
-      top_candidates:[...ktpHits.slice(1),...exactHits.slice(1)].slice(0,5)
+      top_candidates:[...ktpHits.slice(1),...npwpHits.slice(1),...exactHits.slice(1)].slice(0,5)
         .map(x=>sanitizeBpRow(x,100,{reason:'Exact match'})),
       stats:stats({pass_basis:null})};
   }
   if(qtext.length<3){
-    return {...base,decision:ktp?'PASS':'INCONCLUSIVE',exact_lookup:exactLookup,
-      reason:ktp?'No matching KTP; insufficient text for a text similarity check.'
+    const identityProvided=Boolean(ktp||npwp);
+    return {...base,decision:identityProvided?'PASS':'INCONCLUSIVE',exact_lookup:exactLookup,
+      reason:identityProvided?'No matching KTP/NPWP; insufficient text for a text similarity check.'
         :'Provide more Name 1 / Address information to check text similarity.',
-      stats:stats({coverage_complete:Boolean(ktp),
-        pass_basis:ktp?'KTP_EXACT_INDEX_COMPLETE':null})};
+      stats:stats({coverage_complete:identityProvided,
+        pass_basis:identityProvided?'IDENTITY_EXACT_INDEX_COMPLETE':null})};
   }
   const maxLenDiff=getMaxLenDiff(env,qtext.length);
   const budget=envNumber(env,'SNAPSHOT_MAX_CHECK_MS',25000,1000);
@@ -909,7 +918,7 @@ export async function memoryCheck(payload,env,snapshot){
   return {...base,decision:'PASS',exact_lookup:exactLookup,
     reason:`No duplicate: all ${snap.count.toLocaleString('en-US')} BP records evaluated `+
       `(${scan.eligible.toLocaleString('en-US')} within length tolerance, every one scored or `+
-      'excluded by a proven score upper bound). Exact KTP and Name 1 + Address indexes checked.',
+      'excluded by a proven score upper bound). Exact KTP, NPWP and Name 1 + Address indexes checked.',
     stats:scanStats};
 }
 
