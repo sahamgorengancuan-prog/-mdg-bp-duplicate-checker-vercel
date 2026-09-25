@@ -27,8 +27,9 @@ import {
 
 const gunzipAsync=promisify(gunzip);
 const PACKED_TAB='PACKED_SNAPSHOT';
-const PACKED_HEADER='bp_id\tbp_type_id\tname_1\taddress\tktp_digits';
-const PACKED_VERSION='1';
+const PACKED_HEADER_V1='bp_id\tbp_type_id\tname_1\taddress\tktp_digits';
+const PACKED_HEADER_V2='bp_id\tbp_type_id\tname_1\taddress\tktp_digits\tnpwp_digits';
+const PACKED_VERSIONS=new Set(['1','2']);
 const PART_READ_ROWS=60;          // ~2.4 MB per Google Sheets range
 const MAX_PART_CHARS=50000;       // Google Sheets hard cell limit
 const BUILD_YIELD_EVERY=4000;     // keep the event loop responsive while indexing
@@ -40,7 +41,9 @@ const KEYED_READ_ROWS=20000;      // v14 tab fallback: ~2.6 MB per range
 const fail=(status,message,extra={})=>Object.assign(new Error(message),{status},extra);
 const sha256=buf=>createHash('sha256').update(buf).digest('hex');
 const key52=hex=>parseInt(hex.slice(0,13),16);
-const ktpKey=digits=>key52(createHash('sha1').update(digits).digest('hex'));
+const identityKey=digits=>key52(createHash('sha1').update(digits).digest('hex'));
+const ktpKey=identityKey;
+const npwpKey=identityKey;
 const normKey=text=>key52(createHash('sha1').update(text).digest('hex'));
 const yieldLoop=()=>new Promise(resolve=>setImmediate(resolve));
 const envNumber=(env,name,fallback,min=0)=>{
@@ -137,7 +140,7 @@ export class SnapshotIndex {
   packedRecord(i){
     const f=this.raw.toString('utf8',this.lineStart[i],this.lineEnd[i]).split('\t');
     return {bp_id:f[0],bp_type_id:f[1],name_1:f[2],address:f[3],ktp:f[4],
-      norm_text:this.normText(i)};
+      npwp:f[5]||'',norm_text:this.normText(i)};
   }
   // Packed snapshots hold every source field. v14-tab snapshots hold only the
   // normalized text, so the few rows a FAIL needs are read from BP_DATABASE in
@@ -163,9 +166,28 @@ export class SnapshotIndex {
     if(this.kind==='packed')
       return found.map(i=>this.packedRecord(i)).filter(r=>r.ktp===ktp);
     const recs=await this.records(found,fetchRows);
-    for(const r of recs){
-      if(r.row_hash!==sha256(JSON.stringify([r.bp_id,r.bp_type_id,r.name_1,r.address,ktp])))
+    for(let n=0;n<recs.length;n++){
+      const i=found[n],other=this.npwpByOwner?.[i]||'';
+      const expected=this.identityVersion==='2'
+        ?sha256(JSON.stringify([recs[n].bp_id,recs[n].bp_type_id,recs[n].name_1,recs[n].address,ktp,other]))
+        :sha256(JSON.stringify([recs[n].bp_id,recs[n].bp_type_id,recs[n].name_1,recs[n].address,ktp]));
+      if(recs[n].row_hash!==expected)
         throw fail(503,'KTP posting not bound to authoritative BP row/hash. NO PASS.');
+    }
+    return recs;
+  }
+  async findNpwp(npwp,fetchRows){
+    if(!npwp)return [];
+    if(!this.npwpReady)throw fail(503,'NPWP index is not available in the active snapshot yet. No PASS.');
+    const found=sortedLookup(this.npwpKeys,this.npwpIdx,npwpKey(npwp));
+    if(this.kind==='packed')
+      return found.map(i=>this.packedRecord(i)).filter(r=>r.npwp===npwp);
+    const recs=await this.records(found,fetchRows);
+    for(let n=0;n<recs.length;n++){
+      const i=found[n],ktp=this.ktpByOwner?.[i]||'';
+      const expected=sha256(JSON.stringify([recs[n].bp_id,recs[n].bp_type_id,recs[n].name_1,recs[n].address,ktp,npwp]));
+      if(recs[n].row_hash!==expected)
+        throw fail(503,'NPWP posting not bound to authoritative BP row/hash. NO PASS.');
     }
     return recs;
   }
@@ -324,6 +346,7 @@ class IndexBuilder {
     this.dictIndex=new Map();this.dict=[];
     this.hist=new Uint8Array(ALPHABET*65536);
     this.lengths=[];this.keys=[];this.ktpKeys=[];this.ktpOwners=[];
+    this.npwpKeys=[];this.npwpOwners=[];
     this.exactByNorm=exactByNorm;
   }
   // text: normalizeText() output. exactKey: 52-bit exact Name+Address hash key
@@ -361,6 +384,7 @@ class IndexBuilder {
     return i;
   }
   addKtp(ktp,owner){this.ktpKeys.push(ktpKey(ktp));this.ktpOwners.push(owner);}
+  addNpwp(npwp,owner){this.npwpKeys.push(npwpKey(npwp));this.npwpOwners.push(owner);}
   async finish(snap){
     const count=this.count,maxLen=this.maxLen,dict=this.dict;
     this.normStart.push(this.normLen);this.tokStart.push(this.tokIds.n);
@@ -392,6 +416,11 @@ class IndexBuilder {
     snap.ktpKeys=kSort.keys;
     snap.ktpIdx=Uint32Array.from(kSort.idx,p=>owners[p]);
     snap.ktpCount=kKeys.length;
+    const nKeys=Float64Array.from(this.npwpKeys),nSort=sortByKey(nKeys,nKeys.length);
+    const npwpOwners=this.npwpOwners;
+    snap.npwpKeys=nSort.keys;
+    snap.npwpIdx=Uint32Array.from(nSort.idx,p=>npwpOwners[p]);
+    snap.npwpCount=nKeys.length;
     snap.bandA=new Int32Array(maxLen+2);snap.bandB=new Int32Array(maxLen+2);
     const longestToken=dict.reduce((n,t)=>t.length>n?t.length:n,0);
     snap.rowA=new Int32Array(longestToken+2);snap.rowB=new Int32Array(longestToken+2);
@@ -404,7 +433,8 @@ export async function buildSnapshotIndex(raw,{expectedRecords=null}={}){
   if(!Buffer.isBuffer(raw))raw=Buffer.from(raw);
   let pos=raw.indexOf(10);
   const header=raw.toString('utf8',0,pos<0?raw.length:pos).replace(/\r$/,'');
-  if(header!==PACKED_HEADER)throw fail(503,'PACKED_SNAPSHOT header/schema mismatch. No PASS.');
+  const packedVersion=header===PACKED_HEADER_V2?'2':header===PACKED_HEADER_V1?'1':'';
+  if(!packedVersion)throw fail(503,'PACKED_SNAPSHOT header/schema mismatch. No PASS.');
   const builder=new IndexBuilder(Math.floor(raw.length*0.8));
   const lineStart=new GrowU32(),lineEnd=new GrowU32();
   while(pos>=0&&pos<raw.length){
@@ -414,21 +444,21 @@ export async function buildSnapshotIndex(raw,{expectedRecords=null}={}){
     pos=end<raw.length?end:-1;
     if(end===start)continue;
     const fields=raw.toString('utf8',start,end).split('\t');
-    if(fields.length!==5||!fields[0])
+    if(fields.length!==(packedVersion==='2'?6:5)||!fields[0])
       throw fail(503,'PACKED_SNAPSHOT row '+(builder.count+1)+' is malformed. No PASS.');
-    const [,,name,address,ktp]=fields;
-    // normalizeText() is local per character/word and the joining space breaks
-    // every context, so normalize(name+' '+address) equals the join below
-    // (fuzz-verified; tests re-check it). Saves one normalization per BP.
+    const [,,name,address,ktp,npwp='']=fields;
     const nName=normalizeText(name),nAddress=normalizeText(address);
     const text=nName&&nAddress?nName+' '+nAddress:nName||nAddress;
     lineStart.push(start);lineEnd.push(end);
-    // Identical to exactNameAddressHash(name,address), without re-normalizing.
     const i=builder.add(text,key52(createHash('sha256')
       .update(nName+'\x1f'+nAddress,'utf8').digest('hex')));
     if(ktp){
       if(normalizeDigits(ktp)!==ktp)throw fail(503,'PACKED_SNAPSHOT KTP is not normalized. No PASS.');
       builder.addKtp(ktp,i);
+    }
+    if(npwp){
+      if(normalizeDigits(npwp)!==npwp)throw fail(503,'PACKED_SNAPSHOT NPWP is not normalized. No PASS.');
+      builder.addNpwp(npwp,i);
     }
     if(builder.count%BUILD_YIELD_EVERY===0)await yieldLoop();
   }
@@ -436,7 +466,8 @@ export async function buildSnapshotIndex(raw,{expectedRecords=null}={}){
   if(expectedRecords!==null&&builder.count!==expectedRecords)
     throw fail(503,`PACKED_SNAPSHOT has ${builder.count} BP rows, META expects ${expectedRecords}. No PASS.`);
   const snap=new SnapshotIndex();
-  snap.kind='packed';snap.raw=raw;
+  snap.kind='packed';snap.raw=raw;snap.identityVersion=packedVersion;
+  snap.npwpReady=packedVersion==='2';
   snap.lineStart=lineStart.done();snap.lineEnd=lineEnd.done();
   return builder.finish(snap);
 }
@@ -444,7 +475,7 @@ export async function buildSnapshotIndex(raw,{expectedRecords=null}={}){
 // Build the same index from the v14 tabs every published pair already has:
 // INDEX_LEN_TOKEN postings [norm, BP_DATABASE row, BP ID] and KTP_INDEX
 // [KTP digits, [row, BP ID]]. Used when PACKED_SNAPSHOT is absent/unusable.
-export async function buildKeyedTabsIndex(postingBlocks,ktpBlocks,{bpRows,ktpRows}){
+export async function buildKeyedTabsIndex(postingBlocks,ktpBlocks,npwpBlocks,{bpRows,ktpRows,npwpRows=0,identityVersion='1'}){
   const builder=new IndexBuilder(bpRows*96,{exactByNorm:true});
   const bpIds=[],rows=new GrowU32(),rowToIdx=new Map();
   for await(const block of postingBlocks){
@@ -467,24 +498,46 @@ export async function buildKeyedTabsIndex(postingBlocks,ktpBlocks,{bpRows,ktpRow
   }
   if(builder.count!==bpRows)
     throw fail(503,`INDEX_LEN_TOKEN has ${builder.count} postings, META expects ${bpRows}. No PASS.`);
+  const ktpByOwner=Array(bpRows).fill(''),npwpByOwner=Array(bpRows).fill('');
   let ktpSeen=0;
   for await(const block of ktpBlocks){
     for(const row of block){
       let posting;
       try{posting=JSON.parse(String(row?.[1]));}catch{posting=null;}
-      const [rowNo,bp]=Array.isArray(posting)?posting:[];
+      const [rowNo,bp,postedKtp='',postedNpwp='']=Array.isArray(posting)?posting:[];
       const digits=normalizeDigits(row?.[0]);
       const i=rowToIdx.get(rowNo);
-      if(!digits||i===undefined||bpIds[i]!==bp)
+      if(!digits||i===undefined||bpIds[i]!==bp||
+         (identityVersion==='2'&&normalizeDigits(postedKtp)!==digits))
         throw fail(503,'KTP_INDEX posting does not match INDEX_LEN_TOKEN. No PASS.');
-      builder.addKtp(digits,i);
+      builder.addKtp(digits,i);ktpByOwner[i]=digits;
+      if(identityVersion==='2')npwpByOwner[i]=normalizeDigits(postedNpwp);
       ktpSeen++;
     }
   }
   if(ktpSeen!==ktpRows)
     throw fail(503,`KTP_INDEX has ${ktpSeen} rows, META expects ${ktpRows}. No PASS.`);
+  let npwpSeen=0;
+  for await(const block of npwpBlocks||[]){
+    for(const row of block){
+      let posting;
+      try{posting=JSON.parse(String(row?.[1]));}catch{posting=null;}
+      const [rowNo,bp,postedKtp='',postedNpwp='']=Array.isArray(posting)?posting:[];
+      const digits=normalizeDigits(row?.[0]);
+      const i=rowToIdx.get(rowNo);
+      if(!digits||i===undefined||bpIds[i]!==bp||normalizeDigits(postedNpwp)!==digits)
+        throw fail(503,'NPWP_INDEX posting does not match INDEX_LEN_TOKEN. No PASS.');
+      builder.addNpwp(digits,i);npwpByOwner[i]=digits;
+      if(normalizeDigits(postedKtp))ktpByOwner[i]=normalizeDigits(postedKtp);
+      npwpSeen++;
+    }
+  }
+  if(npwpSeen!==npwpRows)
+    throw fail(503,`NPWP_INDEX has ${npwpSeen} rows, META expects ${npwpRows}. No PASS.`);
   const snap=new SnapshotIndex();
   snap.kind='v14_tabs';snap.bpIds=bpIds;snap.bpRows=rows.done();
+  snap.identityVersion=identityVersion;snap.npwpReady=identityVersion==='2';
+  snap.ktpByOwner=ktpByOwner;snap.npwpByOwner=npwpByOwner;
   return builder.finish(snap);
 }
 
@@ -514,7 +567,7 @@ async function sheetsBatchGet(env,sheetId,ranges,{attempts=5}={}){
 }
 
 export function packedInfo(indexMeta,primaryMeta,control){
-  if(indexMeta.packed_snapshot_version!==PACKED_VERSION)return null;
+  if(!PACKED_VERSIONS.has(String(indexMeta.packed_snapshot_version||'')))return null;
   const parts=Number(indexMeta.packed_parts),records=Number(indexMeta.packed_records);
   const hash=String(indexMeta.packed_sha256||'');
   if(!Number.isSafeInteger(parts)||parts<1||!Number.isSafeInteger(records)||records<1||
@@ -574,12 +627,18 @@ async function* tabBlocks(env,sheetId,tab,count){
 
 async function loadKeyedTabs(env,control,meta){
   const bpRows=Number(meta.total_bp_rows),ktpRows=Number(meta.total_ktp_index_rows);
-  if(!Number.isSafeInteger(bpRows)||bpRows<1||!Number.isSafeInteger(ktpRows)||ktpRows<0)
+  const identityVersion=String(meta.identity_index_version||'1');
+  const npwpRows=identityVersion==='2'?Number(meta.total_npwp_index_rows):0;
+  if(!Number.isSafeInteger(bpRows)||bpRows<1||!Number.isSafeInteger(ktpRows)||ktpRows<0||
+     !Number.isSafeInteger(npwpRows)||npwpRows<0)
     throw fail(503,'v14 META row counts are invalid. No PASS.');
   const book=control.active_index_sheet_id;
+  async function* emptyBlocks(){}
   const index=await buildKeyedTabsIndex(
     tabBlocks(env,book,'INDEX_LEN_TOKEN',bpRows),
-    tabBlocks(env,book,'KTP_INDEX',ktpRows),{bpRows,ktpRows});
+    tabBlocks(env,book,'KTP_INDEX',ktpRows),
+    identityVersion==='2'?tabBlocks(env,book,'NPWP_INDEX',npwpRows):emptyBlocks(),
+    {bpRows,ktpRows,npwpRows,identityVersion});
   // The tabs carry no per-row sync_id: the pair must still be the committed
   // generation after reading them (a sync only ever rewrites the STANDBY pair).
   const after=await readDualControl(env);
