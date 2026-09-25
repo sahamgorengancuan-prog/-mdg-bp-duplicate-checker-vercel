@@ -240,6 +240,8 @@ export async function handleHealth(context) {
       await getSearchIndexMap(context.env, meta, lenForHealth);
       await getIndexMap(context.env, 'INDEX_EXACT_SHARD', 'exact', meta);
       await getIndexMap(context.env, 'INDEX_KTP_SHARD', 'ktp', meta);
+      if (String(meta.identity_index_version || '') === '2')
+        await getIndexMap(context.env, 'INDEX_NPWP_SHARD', 'npwp', meta);
       sheet_ok = true;
     } catch (err) {
       sheet_error = err?.message || String(err);
@@ -367,7 +369,7 @@ function configHint(message = '') {
   const m = String(message).toLowerCase();
   if (m.includes('oauth') || m.includes('refresh token')) return 'Set GOOGLE_OAUTH_CLIENT_ID, GOOGLE_OAUTH_CLIENT_SECRET, and GOOGLE_OAUTH_REFRESH_TOKEN in Vercel Project > Settings > Environment Variables. Authorize with a @wingscorp.com account that has access to the Google Sheet.';
   if (m.includes('sheet_id')) return 'Set SHEET_ID in Vercel Environment Variables if you want to override it (optional — the Wings company Sheet ID is already baked into this file). Redeploy after adding it.';
-  if (m.includes('google sheets api')) return 'Check OAuth account permission, company Google Sheet access, tab names, and whether the sync already created BP_DATABASE/KTP_INDEX/INDEX_LEN/INDEX_KTP_SHARD/META.';
+  if (m.includes('google sheets api')) return 'Check OAuth account permission, company Google Sheet access, tab names, and whether the sync already created BP_DATABASE/KTP_INDEX/NPWP_INDEX/INDEX_LEN/INDEX_KTP_SHARD/INDEX_NPWP_SHARD/META.';
   return 'Check Vercel Environment Variables, OAuth consent/refresh token, Google Sheet access, Google Sheet tab/index readiness, or Vercel Deployment Protection.';
 }
 
@@ -376,10 +378,11 @@ async function duplicateCheck(payload, env) {
   const name1 = String(payload?.name_1 || payload?.name1 || '').trim();
   const address = String(payload?.address || '').trim();
   const ktpInput = normalizeDigits(payload?.ktp_number || payload?.ktp || '');
+  const npwpInput = normalizeDigits(payload?.npwp_number || payload?.npwp || '');
   const queryText = normalizeText(`${name1} ${address}`);
   const textLen = queryText.length;
-  if (!name1 && !address && !ktpInput) {
-    throw httpError(400, 'Input minimal Name 1, Address, atau KTP Number.');
+  if (!name1 && !address && !ktpInput && !npwpInput) {
+    throw httpError(400, 'Input minimal Name 1, Address, KTP Number, atau NPWP Number.');
   }
 
   const threshold = Number(env.SIMILARITY_THRESHOLD || DEFAULT_SIMILARITY_THRESHOLD);
@@ -395,9 +398,10 @@ async function duplicateCheck(payload, env) {
     reason: 'The check has not completed.',
     threshold,
     direct_reject_threshold: directRejectThreshold,
-    input: { name_1: name1, address, ktp_masked: maskKtp(ktpInput), normalized_length: textLen },
+    input: { name_1: name1, address, ktp_masked: maskKtp(ktpInput), npwp_masked: maskKtp(npwpInput), normalized_length: textLen },
     meta,
     exact_ktp_match: null,
+    exact_npwp_match: null,
     exact_name_address_match: null,
     exact_match_count: 0,
     identity_conflict: false,
@@ -424,6 +428,10 @@ async function duplicateCheck(payload, env) {
   if (ktpMatch) {
     result.exact_ktp_match = sanitizeBpRow(ktpMatch, 100, { reason: 'KTP Exact Match' });
   }
+  const npwpMatch = npwpInput ? await findExactNpwp(npwpInput, env, meta) : null;
+  if (npwpMatch) {
+    result.exact_npwp_match = sanitizeBpRow(npwpMatch, 100, { reason: 'NPWP Exact Match' });
+  }
 
   let nameAddressExact = { matches: [], count: 0, bpIds: [], diagnostics: result.exact_lookup };
   if (name1 && address) {
@@ -439,29 +447,29 @@ async function duplicateCheck(payload, env) {
       sanitizeBpRow(m, 100, { reason: 'Exact Name 1 + Address Match' }));
   }
 
-  if (ktpMatch || nameAddressExact.count) {
-    const ktpBpId = String(ktpMatch?.bp_id || '');
-    result.identity_conflict = Boolean(ktpBpId && nameAddressExact.bpIds.some(
-      id => String(id) !== ktpBpId));
+  if (ktpMatch || npwpMatch || nameAddressExact.count) {
+    const ids=[ktpMatch?.bp_id,npwpMatch?.bp_id,...nameAddressExact.bpIds].filter(Boolean).map(String);
+    result.identity_conflict = new Set(ids).size > 1;
     result.decision = 'FAIL';
     result.reason = result.identity_conflict
-      ? 'IDENTITY CONFLICT: the KTP and exact Name 1 + Address match different BP IDs. Review both records; do not auto-approve.'
-      : ktpMatch && nameAddressExact.count
-        ? 'KTP and Name 1 + Address exact matches found.'
-        : ktpMatch
-          ? 'KTP exact match found in protected database.'
+      ? 'IDENTITY CONFLICT: KTP/NPWP/Name+Address exact checks identify different BP IDs. Review all records; do not auto-approve.'
+      : ktpMatch
+        ? 'KTP exact match found in protected database.'
+        : npwpMatch
+          ? 'NPWP exact match found in protected database.'
           : `Exact Name 1 + Address match found (${nameAddressExact.count} BP record(s)).`;
-    result.stats.coverage_complete = true; // Both requested exact paths completed.
+    result.stats.coverage_complete = true;
     result.stats.elapsed_ms = Date.now() - started;
     return result;
   }
 
   if (!queryText || queryText.length < 3) {
-    result.decision = ktpInput ? 'PASS' : 'INCONCLUSIVE';
-    result.reason = ktpInput
-      ? 'No matching KTP; insufficient text for a text similarity check.'
+    const identityProvided = Boolean(ktpInput || npwpInput);
+    result.decision = identityProvided ? 'PASS' : 'INCONCLUSIVE';
+    result.reason = identityProvided
+      ? 'No matching KTP/NPWP; insufficient text for a text similarity check.'
       : 'Provide more Name 1 / Address information to check text similarity.';
-    result.stats.coverage_complete = Boolean(ktpInput);
+    result.stats.coverage_complete = identityProvided;
     result.stats.elapsed_ms = Date.now() - started;
     return result;
   }
@@ -611,7 +619,7 @@ async function duplicateCheck(payload, env) {
     result.reason = `Normal scan stopped safely after ${scanned} of ${candidateSpace} eligible rows (${stoppedForQuota ? 'Sheets read quota' : stoppedForTime ? 'processing-time budget' : 'bounded row budget'}). ${plan.safelyPruned} rows were excluded by safe score bounds. Continue remaining work with the manual Full Scope button; this is NOT a PASS.`;
     result.full_scope_available = true;
     result.full_scope_cursor = createFullScopeCursor({
-      env, meta, name1, address, ktpInput, threshold, directRejectThreshold, weights,
+      env, meta, name1, address, ktpInput, npwpInput, threshold, directRejectThreshold, weights,
       plan, bucketPos: nextBucketPos, nextRow: nextBucketRow,
       scanned, compared, batches, completedBuckets
     });
@@ -673,10 +681,10 @@ function buildBucketPlan(env, searchIndex, textLen, maxCandidates, threshold, re
   return {ordered, candidateSpace, oversized, maxLenDiff, signature, safelyPruned};
 }
 
-function fullScopeFingerprint({name1, address, ktpInput, threshold, directRejectThreshold, weights}) {
+function fullScopeFingerprint({name1, address, ktpInput, npwpInput, threshold, directRejectThreshold, weights}) {
   return createHash('sha256').update(JSON.stringify({
     name: normalizeText(name1), address: normalizeText(address),
-    ktp: ktpInput, threshold, directRejectThreshold, weights
+    ktp: ktpInput, npwp: npwpInput, threshold, directRejectThreshold, weights
   })).digest('hex');
 }
 
@@ -686,11 +694,11 @@ function fullScopeKey(env) {
   return createHmac('sha256', secret).update('bp-duplicate-checker/relevant-buckets/v2').digest();
 }
 
-function createFullScopeCursor({env, meta, name1, address, ktpInput, threshold, directRejectThreshold, weights,
+function createFullScopeCursor({env, meta, name1, address, ktpInput, npwpInput, threshold, directRejectThreshold, weights,
   plan, bucketPos, nextRow, scanned, compared, batches, completedBuckets}) {
   const state = {
     v: 2, engine: ENGINE_VERSION, sync: meta.sync_id,
-    fingerprint: fullScopeFingerprint({name1, address, ktpInput, threshold, directRejectThreshold, weights}),
+    fingerprint: fullScopeFingerprint({name1, address, ktpInput, npwpInput, threshold, directRejectThreshold, weights}),
     scope: plan.signature, total: plan.candidateSpace,
     bucketPos, nextRow, scanned, compared, batches, completedBuckets,
     issuedAt: Date.now()
@@ -755,6 +763,7 @@ async function fullScopeCheck(payload, env) {
   const name1 = String(payload?.name_1 || payload?.name1 || '').trim();
   const address = String(payload?.address || '').trim();
   const ktpInput = normalizeDigits(payload?.ktp_number || payload?.ktp || '');
+  const npwpInput = normalizeDigits(payload?.npwp_number || payload?.npwp || '');
   const queryText = normalizeText(name1 + ' ' + address);
   if (queryText.length < 3) throw httpError(400, 'Full scope requires sufficient Name 1 or Address text.');
   const threshold = Number(env.SIMILARITY_THRESHOLD || DEFAULT_SIMILARITY_THRESHOLD);
@@ -766,7 +775,7 @@ async function fullScopeCheck(payload, env) {
   const maxCandidates = Math.max(1, Number(env.MAX_CANDIDATES || DEFAULT_MAX_CANDIDATES));
   const searchIndex = await getSearchIndexMap(env, meta, lenIndex);
   const plan = buildBucketPlan(env, searchIndex, queryText.length, maxCandidates, threshold, directRejectThreshold, weights, tokens(queryText).size);
-  const query = {name1, address, ktpInput, threshold, directRejectThreshold, weights};
+  const query = {name1, address, ktpInput, npwpInput, threshold, directRejectThreshold, weights};
   const state = readFullScopeCursor(payload.full_scope_cursor, env, meta, query, plan, searchIndex);
   const configuredRows = Number(env.FULL_SCOPE_CHUNK_ROWS || FULL_SCOPE_MAX_ROWS_PER_REQUEST);
   const rowsPerRequest = Number.isFinite(configuredRows)
@@ -856,7 +865,7 @@ async function fullScopeCheck(payload, env) {
   if (finished) {
     return {
       ok: true, decision: 'PASS',
-      reason: 'No duplicate in the fully checked configured length buckets. Exact KTP/name+address were checked in the initial normal request. This is a scoped PASS, not a full-database scan.',
+      reason: 'No duplicate in the fully checked configured length buckets. Exact KTP/NPWP/name+address were checked in the initial normal request. This is a scoped PASS, not a full-database scan.',
       meta, threshold, direct_reject_threshold: directRejectThreshold,
       full_scope_active: true, full_scope_available: false, full_scope_cursor: null, stats
     };
@@ -1035,7 +1044,8 @@ export async function getIndexMap(env, tabName, type, meta) {
     map.set(key, info);
   }
   const expectedKey = type === 'len' ? 'total_bp_rows'
-    : type === 'ktp' ? 'total_ktp_index_rows' : 'total_exact_index_rows';
+    : type === 'ktp' ? 'total_ktp_index_rows'
+    : type === 'npwp' ? 'total_npwp_index_rows' : 'total_exact_index_rows';
   const expected = Number(meta[expectedKey]);
   if (!Number.isSafeInteger(expected) || total !== expected) {
     throw httpError(503, `${tabName} row count ${total} differs from META ${expectedKey} ${meta[expectedKey]}. Run a full sync.`);
