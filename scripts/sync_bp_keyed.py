@@ -33,23 +33,23 @@ READ_BATCH=5000
 INDEX_WRITE_BATCH=5000
 META_ROWS=40            # META is always rewritten as A1:B40 so stale keys vanish
 PACKED_TITLE="PACKED_SNAPSHOT"
-PACKED_VERSION="1"
-PACKED_HEADER=["bp_id","bp_type_id","name_1","address","ktp_digits"]
+PACKED_VERSION="2"
+PACKED_HEADER=["bp_id","bp_type_id","name_1","address","ktp_digits","npwp_digits"]
 PACKED_PART_CHARS=40000 # Google Sheets cell limit is 50,000 characters
 PACKED_WRITE_ROWS=25    # ~1 MB per values.update request
 PACKED_READ_ROWS=60
 # v12/v13 kept these in the PRIMARY workbook; v14+ keeps them only in A2/B2.
-STALE_PRIMARY_TABS=frozenset({"INDEX_LEN_TOKEN","INDEX_LEN","KTP_INDEX",
-    "INDEX_KTP_SHARD","EXACT_INDEX","INDEX_EXACT_SHARD",PACKED_TITLE})
+STALE_PRIMARY_TABS=frozenset({"INDEX_LEN_TOKEN","INDEX_LEN","KTP_INDEX","NPWP_INDEX",
+    "INDEX_KTP_SHARD","INDEX_NPWP_SHARD","EXACT_INDEX","INDEX_EXACT_SHARD",PACKED_TITLE})
 
 def make_records(source: pd.DataFrame) -> Dict[str, dict]:
-    needed = ["bp_id", "bp_type_id", "name_1", "address", "ktp_number"]
+    needed = ["bp_id", "bp_type_id", "name_1", "address", "ktp_number", "npwp_number"]
     absent = [x for x in needed if x not in source.columns]
     if absent:
         raise ValueError(f"Missing source columns: {absent}. No updates made.")
     records = {}
     for record in source[needed].fillna("").itertuples(index=False, name=None):
-        key, bp_type, name, address, ktp = (str(x) for x in record)
+        key, bp_type, name, address, ktp, npwp = (str(x) for x in record)
         key = key.strip()
         if not key or key in records:
             raise ValueError(
@@ -60,14 +60,15 @@ def make_records(source: pd.DataFrame) -> Dict[str, dict]:
         norm = normalize_text(name+" "+address)
         digits = normalize_digits(name+" "+address)
         ktp_digits = normalize_digits(ktp)
+        npwp_digits = normalize_digits(npwp)
         row_hash = hashlib.sha256(json.dumps(
-            [key,bp_type,name,address,ktp_digits],
+            [key,bp_type,name,address,ktp_digits,npwp_digits],
             ensure_ascii=False,separators=(",",":")
         ).encode("utf-8")).hexdigest()
         records[key] = {
             "bp_id":key,"bp_type_id":bp_type,"name_1":name,"address":address,
             "norm_text":norm,"norm_digits":digits,"text_len":len(norm),
-            "ktp_number":ktp_digits,"row_hash":row_hash,
+            "ktp_number":ktp_digits,"npwp_number":npwp_digits,"row_hash":row_hash,
             "len_bucket":str(len(norm)//5).zfill(3),
             "token_count":len({t for t in norm.split(" ") if len(t)>=2}),
             "exact_hash":hashlib.sha256(
@@ -139,9 +140,14 @@ def build_index_rows(records, positions, sync_id):
                                     ensure_ascii=False,separators=(",",":"))]
          for rec,row in source],key=lambda x:(x[0],x[1]))
     ktp=sorted(
-        [[rec["ktp_number"],json.dumps([row,rec["bp_id"]],
+        [[rec["ktp_number"],json.dumps([row,rec["bp_id"],rec["ktp_number"],rec["npwp_number"]],
                                     ensure_ascii=False,separators=(",",":"))]
          for rec,row in source if rec["ktp_number"]],
+        key=lambda x:(x[0][-2:],x[0],x[1]))
+    npwp=sorted(
+        [[rec["npwp_number"],json.dumps([row,rec["bp_id"],rec["ktp_number"],rec["npwp_number"]],
+                                     ensure_ascii=False,separators=(",",":"))]
+         for rec,row in source if rec["npwp_number"]],
         key=lambda x:(x[0][-2:],x[0],x[1]))
     def shards(items,keyer):
         out=[]
@@ -154,18 +160,22 @@ def build_index_rows(records, positions, sync_id):
         return out
     exact_shards=shards(exact,lambda x:x[0][:2])
     ktp_shards=shards(ktp,lambda x:x[0][-2:].zfill(2))
+    npwp_shards=shards(npwp,lambda x:x[0][-2:].zfill(2))
     tabs={
       "INDEX_LEN_TOKEN":[["len_token_key","posting_json"]]+fuzzy,
       "INDEX_LEN":[["len_token_key","row_start","row_end","count","sync_id"]]+groups,
       "KTP_INDEX":[["ktp_digits","posting_json"]]+ktp,
+      "NPWP_INDEX":[["npwp_digits","posting_json"]]+npwp,
       "INDEX_KTP_SHARD":[["ktp_shard","row_start","row_end","count","sync_id"]]+ktp_shards,
+      "INDEX_NPWP_SHARD":[["npwp_shard","row_start","row_end","count","sync_id"]]+npwp_shards,
       "EXACT_INDEX":[["exact_hash","posting_json"]]+exact,
       "INDEX_EXACT_SHARD":[["exact_shard","row_start","row_end","count","sync_id"]]+exact_shards
     }
     assert sum(int(x[3]) for x in groups)==len(records)
     assert sum(int(x[3]) for x in exact_shards)==len(records)
     assert sum(int(x[3]) for x in ktp_shards)==len(ktp)
-    return tabs, len(ktp), len(groups)
+    assert sum(int(x[3]) for x in npwp_shards)==len(npwp)
+    return tabs, len(ktp), len(npwp), len(groups)
 
 def packed_enabled():
     return os.getenv("GSHEET_PACKED_SNAPSHOT","on").strip().lower() not in ("off","0","false","no")
@@ -181,7 +191,7 @@ def build_packed(records):
     for key in sorted(records):
         rec=records[key]
         lines.append("\t".join(clean(rec[f]) for f in
-            ("bp_id","bp_type_id","name_1","address","ktp_number")))
+            ("bp_id","bp_type_id","name_1","address","ktp_number","npwp_number")))
     raw="\n".join(lines).encode("utf-8")
     packed=gzip.compress(raw,compresslevel=9,mtime=0)
     text=base64.b64encode(packed).decode("ascii")
@@ -257,20 +267,22 @@ def prune_stale_primary_tabs(sh,role):
                     "workbook above Google's size limit).",role,titles)
     return titles
 
-def make_meta(sync_id,bp_count,ktp_count,group_count,state):
+def make_meta(sync_id,bp_count,ktp_count,npwp_count,group_count,state):
     data=[
         ["sync_id",sync_id],
         ["last_sync_at",datetime.now().strftime("%Y-%m-%d %H:%M:%S")],
         ["total_bp_rows",str(bp_count)],
         ["total_ktp_index_rows",str(ktp_count)],
+        ["total_npwp_index_rows",str(npwp_count)],
         ["total_exact_index_rows",str(bp_count)],
         ["exact_index_version","1"],
         ["keyed_index_version","14"],
         ["token_index_version","1"],
         ["token_index_groups",str(group_count)],
+        ["identity_index_version","2"],
         ["sync_state",state],
         ["source","PostgreSQL MDG -> protected keyed Google Sheets"],
-        ["schema","KEYED_V14_SHARDED:BP_DATABASE:A:H primary; PACKED_INDEXES:A:B secondary; PACKED_SNAPSHOT:A:D secondary (v15 memory engine)"]
+        ["schema","KEYED_V14_SHARDED:BP_DATABASE:A:H primary; KTP+NPWP packed identity indexes:A:B secondary; PACKED_SNAPSHOT:A:D secondary (v15 memory engine)"]
     ]
     return [["key","value"]]+data
 
@@ -534,8 +546,8 @@ def sync_sheet(records,sync_id):
         positions[rec["bp_id"]]=n
     if len(positions)!=len(records):
         raise ValueError("Unique BP key coverage mismatch. No writes.")
-    tabs,ktp_count,group_count=build_index_rows(records,positions,sync_id)
-    final_meta=make_meta(sync_id,len(records),ktp_count,group_count,"READY")
+    tabs,ktp_count,npwp_count,group_count=build_index_rows(records,positions,sync_id)
+    final_meta=make_meta(sync_id,len(records),ktp_count,npwp_count,group_count,"READY")
     final_meta.extend([["source_digest",digest],
                        ["physical_bp_rows",str(len(existing)+len(creates))]])
     packed_tab=packed_rows(packed,sync_id) if packed else None
@@ -611,10 +623,10 @@ def sync_sheet(records,sync_id):
         raise RuntimeError("Staging tombstone mismatch; not published.")
     logging.info("Verified %s keyed source rows against Google Sheets staging.",
                  f"{len(records):,}")
-    for title in ("INDEX_LEN_TOKEN","INDEX_LEN","KTP_INDEX",
-                  "INDEX_KTP_SHARD","EXACT_INDEX","INDEX_EXACT_SHARD"):
+    for title in ("INDEX_LEN_TOKEN","INDEX_LEN","KTP_INDEX","NPWP_INDEX",
+                  "INDEX_KTP_SHARD","INDEX_NPWP_SHARD","EXACT_INDEX","INDEX_EXACT_SHARD"):
         write_index(ish,title,tabs[title])
-    for title in ("INDEX_LEN_TOKEN","KTP_INDEX","EXACT_INDEX"):
+    for title in ("INDEX_LEN_TOKEN","KTP_INDEX","NPWP_INDEX","EXACT_INDEX"):
         expected=tabs[title]
         if len(expected)>1:
             sheet=ish.worksheet(title)
