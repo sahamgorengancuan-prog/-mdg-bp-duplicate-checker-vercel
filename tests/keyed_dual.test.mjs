@@ -5,10 +5,10 @@ import {handleCheck,handleHealth,normalizeText} from '../_lib/duplicate.js';
 
 const hash=(x)=>createHash('sha256').update(x).digest('hex');
 const exact=(name,address)=>hash(normalizeText(name)+'\x1f'+normalizeText(address));
-const row=(id,name,address,ktp='')=>{
+const row=(id,name,address,ktp='',npwp='')=>{
   const norm=normalizeText(name+' '+address);
-  const digest=hash(JSON.stringify([id,'ZB02',name,address,ktp]));
-  return {id,name,address,ktp,norm,digest,
+  const digest=hash(JSON.stringify([id,'ZB02',name,address,ktp,npwp]));
+  return {id,name,address,ktp,npwp,norm,digest,
     bucket:String(Math.floor(norm.length/5)).padStart(3,'0'),
     tokens:new Set(norm.split(' ').filter(x=>x.length>=2)).size};
 };
@@ -32,7 +32,9 @@ function makeFixture(records){
   }
   const e=source.map(r=>[exact(r.name,r.address),JSON.stringify([at.get(r.id),r.id])])
     .sort((a,b)=>a[0].localeCompare(b[0]));
-  const k=source.filter(r=>r.ktp).map(r=>[r.ktp,JSON.stringify([at.get(r.id),r.id])])
+  const k=source.filter(r=>r.ktp).map(r=>[r.ktp,JSON.stringify([at.get(r.id),r.id,r.ktp,r.npwp||''])])
+    .sort((a,b)=>a[0].slice(-2).localeCompare(b[0].slice(-2))||a[0].localeCompare(b[0]));
+  const n=source.filter(r=>r.npwp).map(r=>[r.npwp,JSON.stringify([at.get(r.id),r.id,r.ktp||'',r.npwp])])
     .sort((a,b)=>a[0].slice(-2).localeCompare(b[0].slice(-2))||a[0].localeCompare(b[0]));
   const shards=(rows,key)=>{
     const out=[];
@@ -49,6 +51,8 @@ function makeFixture(records){
     total_bp_rows:String(source.length),
     total_exact_index_rows:String(e.length),
     total_ktp_index_rows:String(k.length),
+    total_npwp_index_rows:String(n.length),
+    identity_index_version:'2',
     token_index_groups:String(groups.length),source_digest:hash(sync)
   };
   const meta=[['key','value'],...Object.entries(metadata)];
@@ -57,10 +61,13 @@ function makeFixture(records){
     ['INDEX_LEN',[['len_token_key','row_start','row_end','count','sync_id'],...groups]],
     ['EXACT_INDEX',[['exact_hash','posting_json'],...e]],
     ['KTP_INDEX',[['ktp_digits','posting_json'],...k]],
+    ['NPWP_INDEX',[['npwp_digits','posting_json'],...n]],
     ['INDEX_EXACT_SHARD',[['exact_shard','row_start','row_end','count','sync_id'],
       ...shards(e,r=>r[0].slice(0,2))]],
     ['INDEX_KTP_SHARD',[['ktp_shard','row_start','row_end','count','sync_id'],
-      ...shards(k,r=>r[0].slice(-2).padStart(2,'0'))]]
+      ...shards(k,r=>r[0].slice(-2).padStart(2,'0'))]],
+    ['INDEX_NPWP_SHARD',[['npwp_shard','row_start','row_end','count','sync_id'],
+      ...shards(n,r=>r[0].slice(-2).padStart(2,'0'))]]
   ])};
 }
 async function withSheets(t,fn,overrideA=null){
@@ -75,10 +82,10 @@ async function withSheets(t,fn,overrideA=null){
     RATE_LIMIT_PER_MIN:'0',SHEETS_LOCAL_READ_BUDGET_PER_MINUTE:'0',
     RANGE_CACHE_SECONDS:'0'
   };
-  const a=makeFixture(overrideA || [row('BP-A','Alpha Shop','Mawar Street 10','1234567890'),
-                       row('BP-B','Beta Mart','Rindu Street 8')]);
-  const b=makeFixture([row('BP-A','Alpha Changed','Mawar Street 10','1234567890'),
-                       row('BP-B','Beta Mart','Rindu Street 8')]);
+  const a=makeFixture(overrideA || [row('BP-A','Alpha Shop','Mawar Street 10','1234567890','9998887776665554'),
+                       row('BP-B','Beta Mart','Rindu Street 8','','1112223334445556')]);
+  const b=makeFixture([row('BP-A','Alpha Changed','Mawar Street 10','1234567890','9998887776665554'),
+                       row('BP-B','Beta Mart','Rindu Street 8','','1112223334445556')]);
   let pointer='TEST_A';
   let changedOnFinal=false;
   let controlReads=0;
@@ -151,6 +158,13 @@ test('dual mode: exact KTP/name lookup and fuzzy matching stay in active snapsho
     assert.equal(identity.status,200,JSON.stringify(identity.body));
     assert.equal(identity.body.decision,'FAIL');
     assert.equal(identity.body.exact_ktp_match.bp_id,'BP-A');
+    const npwp=await f.check({npwp_number:'9998887776665554'});
+    assert.equal(npwp.status,200,JSON.stringify(npwp.body));
+    assert.equal(npwp.body.decision,'FAIL');
+    assert.equal(npwp.body.exact_npwp_match.bp_id,'BP-A');
+    const wrongUniverse=await f.check({ktp_number:'9998887776665554'});
+    assert.equal(wrongUniverse.body.decision,'PASS',JSON.stringify(wrongUniverse.body));
+    assert.equal(wrongUniverse.body.exact_ktp_match,null);
     const approx=await f.check({name_1:'Alpha Shoppe',address:'Mawar Street 10'});
     assert.equal(approx.status,200,JSON.stringify(approx.body));
     assert.equal(approx.body.decision,'FAIL');
@@ -213,7 +227,7 @@ test('dual mode: KTP posting cannot impersonate another BP row hash',async t=>{
     posting[0]='9999997890'; // Same suffix shard but wrong number
     const result=await f.check({ktp_number:'9999997890'});
     assert.equal(result.status,503);
-    assert.match(result.body.error,/KTP posting not bound/);
+    assert.match(result.body.error,/KTP posting/);
   });
 });
 

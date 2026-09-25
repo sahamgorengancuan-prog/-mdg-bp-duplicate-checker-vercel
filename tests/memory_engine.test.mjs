@@ -5,7 +5,7 @@ import {createHash} from 'node:crypto';
 import {gzipSync} from 'node:zlib';
 import {handleCheck,handleHealth,normalizeText,computeSimilarity,
   getSimilarityWeights,getMaxLenDiff,tokens,numericTokens} from '../_lib/duplicate.js';
-import {buildSnapshotIndex,_resetMemoryEngineForTests} from '../_lib/memory-engine.js';
+import {buildSnapshotIndex,memoryCheck,_resetMemoryEngineForTests} from '../_lib/memory-engine.js';
 import {makeTsv,perturb,rng,makeRecord} from '../tools/synthetic_bp.mjs';
 
 const sha=x=>createHash('sha256').update(x).digest('hex');
@@ -164,7 +164,7 @@ test('memory engine: health, exact KTP, exact name, fuzzy FAIL and full-scan PAS
     assert.equal(pass.body.search_backend,'MEMORY_FULL_SCAN');
     assert.equal(pass.body.memory_source,'packed');
     assert.deepEqual(pass.body.trace.map(t=>t.step),
-      ['acquire_snapshot','exact_ktp','exact_name_address','full_scan']);
+      ['acquire_snapshot','exact_ktp','exact_npwp','exact_name_address','full_scan']);
     assert.equal(pass.body.trace.find(t=>t.step==='full_scan').records,3);
     assert(fuzzy.body.trace.some(t=>t.step==='match_rows'));
     assert.equal(f.reads.length,readsAfterLoad,'checks must not read Google Sheets');
@@ -306,6 +306,23 @@ test('memory engine scan equals brute-force computeSimilarity on every BP',async
       assert.deepEqual(got.top.map(x=>[x.i,x.score]),all.slice(0,5).map(x=>[x.i,x.score]));
     }
   }
+});
+
+test('memory engine: NPWP exact index is isolated from KTP universe',async()=>{
+  const raw=Buffer.from(
+    'bp_id\tbp_type_id\tname_1\taddress\tktp_digits\tnpwp_digits\n'+
+    'BP-N\tZB02\tAlpha Tax\tJl Pajak 10\t1111222233334444\t9999000011112222'
+  );
+  const index=await buildSnapshotIndex(raw,{expectedRecords:1});
+  const snapshot={index,meta:{identity_index_version:'2'},
+    control:{sync_id:'npwp-test'},source:'packed'};
+  const byNpwp=await memoryCheck({npwp_number:'9999000011112222'}, {}, snapshot);
+  assert.equal(byNpwp.decision,'FAIL');
+  assert.equal(byNpwp.exact_npwp_match.bp_id,'BP-N');
+  assert.equal(byNpwp.exact_ktp_match,null);
+  const wrongUniverse=await memoryCheck({ktp_number:'9999000011112222'}, {}, snapshot);
+  assert.equal(wrongUniverse.decision,'PASS');
+  assert.equal(wrongUniverse.exact_ktp_match,null);
 });
 
 test('packed loader rejects malformed rows and wrong record counts',async()=>{

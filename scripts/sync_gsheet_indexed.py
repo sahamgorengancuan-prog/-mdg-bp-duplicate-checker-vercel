@@ -74,10 +74,13 @@ SELECT
     bgv.bp_type_id::text AS bp_type_id,
     COALESCE(bgv.name_1, '')::text AS name_1,
     COALESCE(bgv.address, '')::text AS address,
-    COALESCE(mbdc.ktp_number, '')::text AS ktp_number
+    COALESCE(mbdc.ktp_number, '')::text AS ktp_number,
+    COALESCE(mbtdc.npwp_number, '')::text AS npwp_number
 FROM m_bp_general_view bgv
 LEFT JOIN m_bp_doc_completion mbdc
        ON mbdc.bp_id = bgv.bp_id
+LEFT JOIN m_bp_tax_doc_completion mbtdc
+       ON mbtdc.bp_id = bgv.bp_id
 WHERE bgv.bp_id IS NOT NULL;
 """
 
@@ -147,7 +150,7 @@ def fetch_pg_dataframe() -> pd.DataFrame:
 
 
 def prepare_indexes(df: pd.DataFrame) -> Tuple[pd.DataFrame, ...]:
-    required = ["bp_id", "bp_type_id", "name_1", "address", "ktp_number"]
+    required = ["bp_id", "bp_type_id", "name_1", "address", "ktp_number", "npwp_number"]
     missing = [c for c in required if c not in df.columns]
     if missing:
         raise ValueError(f"Query output missing columns: {missing}")
@@ -173,6 +176,8 @@ def prepare_indexes(df: pd.DataFrame) -> Tuple[pd.DataFrame, ...]:
     )
     df["ktp_digits"] = df["ktp_number"].map(normalize_digits)
     df["ktp_shard"] = df["ktp_digits"].map(ktp_shard)
+    df["npwp_digits"] = df["npwp_number"].map(normalize_digits)
+    df["npwp_shard"] = df["npwp_digits"].map(ktp_shard)
     df["exact_hash"] = [exact_hash(n, a) for n, a in zip(df["name_1"], df["address"])]
 
     # Main database is sorted by length bucket, enabling A1 range lookup.
@@ -227,6 +232,27 @@ def prepare_indexes(df: pd.DataFrame) -> Tuple[pd.DataFrame, ...]:
     else:
         idx_ktp = pd.DataFrame(columns=["ktp_shard", "row_start", "row_end", "count", "sync_id"])
 
+    logging.info("Building NPWP_INDEX...")
+    npwp = df[df["npwp_digits"].str.len() > 0][["_source_row_id", "bp_id", "npwp_digits", "npwp_shard"]].copy()
+    npwp = npwp.merge(row_lookup, on="_source_row_id", how="left", validate="one_to_one")
+    npwp = npwp.dropna(subset=["bp_db_row"])
+    npwp["bp_db_row"] = npwp["bp_db_row"].astype(int)
+    npwp = npwp.sort_values(["npwp_shard", "npwp_digits", "bp_db_row"], kind="mergesort").reset_index(drop=True)
+    npwp["npwp_index_row"] = npwp.index + 2
+    npwp["sync_id"] = sync_id
+    npwp_out = npwp[["npwp_digits", "bp_db_row", "bp_id", "sync_id"]]
+
+    logging.info("Building INDEX_NPWP_SHARD...")
+    if len(npwp):
+        idx_npwp = (
+            npwp.groupby("npwp_shard", sort=True)
+                .agg(row_start=("npwp_index_row", "min"), row_end=("npwp_index_row", "max"), count=("npwp_digits", "count"))
+                .reset_index()
+        )
+        idx_npwp["sync_id"] = sync_id
+    else:
+        idx_npwp = pd.DataFrame(columns=["npwp_shard", "row_start", "row_end", "count", "sync_id"])
+
     logging.info("Building EXACT_INDEX and INDEX_EXACT_SHARD...")
     exact = bp[["exact_hash", "bp_db_row", "bp_id"]].copy()
     exact["exact_shard"] = exact["exact_hash"].str.slice(0, 2)
@@ -241,7 +267,9 @@ def prepare_indexes(df: pd.DataFrame) -> Tuple[pd.DataFrame, ...]:
     )
     idx_exact["sync_id"] = sync_id
 
-    cell_estimate = len(bp_out) * len(bp_out.columns) + len(ktp_out) * len(ktp_out.columns) + len(exact_out) * len(exact_out.columns) + len(idx_token) * len(idx_token.columns) + 10000
+    cell_estimate = (len(bp_out) * len(bp_out.columns) + len(ktp_out) * len(ktp_out.columns)
+                     + len(npwp_out) * len(npwp_out.columns) + len(exact_out) * len(exact_out.columns)
+                     + len(idx_token) * len(idx_token.columns) + 10000)
     if cell_estimate > int(os.environ.get("GSHEET_MAX_CELL_WARNING", "9500000")):
         logging.warning(
             "Estimated Google Sheet cells %s is close to or above safe limit. Consider reducing columns or moving index to a dedicated database.",
@@ -253,8 +281,10 @@ def prepare_indexes(df: pd.DataFrame) -> Tuple[pd.DataFrame, ...]:
         ["last_sync_at", datetime.now().strftime("%Y-%m-%d %H:%M:%S")],
         ["total_bp_rows", str(len(bp_out))],
         ["total_ktp_index_rows", str(len(ktp_out))],
+        ["total_npwp_index_rows", str(len(npwp_out))],
         ["len_bucket_count", str(len(idx_len))],
         ["ktp_shard_count", str(len(idx_ktp))],
+        ["npwp_shard_count", str(len(idx_npwp))],
         ["total_exact_index_rows", str(len(exact_out))],
         ["exact_shard_count", str(len(idx_exact))],
         ["exact_index_version", "1"],
@@ -262,10 +292,11 @@ def prepare_indexes(df: pd.DataFrame) -> Tuple[pd.DataFrame, ...]:
         ["token_index_groups", str(len(idx_token))],
         ["sync_state", "READY"],
         ["source", "PostgreSQL MDG -> Protected Google Sheet"],
-        ["schema", "BP_DATABASE:A:H; INDEX_LEN_TOKEN:A:F; KTP_INDEX:A:D; INDEX_LEN:A:E; INDEX_KTP_SHARD:A:E"],
+        ["identity_index_version", "2"],
+        ["schema", "BP_DATABASE:A:H; INDEX_LEN_TOKEN:A:F; KTP_INDEX:A:D; NPWP_INDEX:A:D; INDEX_LEN:A:E; INDEX_KTP_SHARD:A:E; INDEX_NPWP_SHARD:A:E"],
     ], columns=["key", "value"])
 
-    return bp_out, ktp_out, idx_len, idx_ktp, exact_out, idx_exact, idx_token, meta
+    return bp_out, ktp_out, npwp_out, idx_len, idx_ktp, idx_npwp, exact_out, idx_exact, idx_token, meta
 
 
 def load_oauth_credentials() -> Credentials:
@@ -491,13 +522,13 @@ def main():
     chunk_size = int(os.environ.get("GSHEET_CHUNK_SIZE", "20000"))
 
     df = fetch_pg_dataframe()
-    bp_out, ktp_out, idx_len, idx_ktp, exact_out, idx_exact, idx_token, meta = prepare_indexes(df)
+    bp_out, ktp_out, npwp_out, idx_len, idx_ktp, idx_npwp, exact_out, idx_exact, idx_token, meta = prepare_indexes(df)
 
     gc, authorized_user_email = gsheet_client()
     sh = gc.open_by_key(sheet_id)
     preflight_sheet_capacity(sh, {
-        "BP_DATABASE": bp_out, "KTP_INDEX": ktp_out,
-        "INDEX_LEN": idx_len, "INDEX_KTP_SHARD": idx_ktp,
+        "BP_DATABASE": bp_out, "KTP_INDEX": ktp_out, "NPWP_INDEX": npwp_out,
+        "INDEX_LEN": idx_len, "INDEX_KTP_SHARD": idx_ktp, "INDEX_NPWP_SHARD": idx_npwp,
         "EXACT_INDEX": exact_out, "INDEX_EXACT_SHARD": idx_exact,
         "INDEX_LEN_TOKEN": idx_token,
         "META": meta,
@@ -510,8 +541,10 @@ def main():
     write_dataframe(sh, "META", pending_meta, chunk_size)
     write_dataframe(sh, "BP_DATABASE", bp_out, chunk_size)
     write_dataframe(sh, "KTP_INDEX", ktp_out, chunk_size)
+    write_dataframe(sh, "NPWP_INDEX", npwp_out, chunk_size)
     write_dataframe(sh, "INDEX_LEN", idx_len, chunk_size)
     write_dataframe(sh, "INDEX_KTP_SHARD", idx_ktp, chunk_size)
+    write_dataframe(sh, "INDEX_NPWP_SHARD", idx_npwp, chunk_size)
     write_dataframe(sh, "EXACT_INDEX", exact_out, chunk_size)
     write_dataframe(sh, "INDEX_EXACT_SHARD", idx_exact, chunk_size)
     write_dataframe(sh, "INDEX_LEN_TOKEN", idx_token, chunk_size)
@@ -521,8 +554,8 @@ def main():
     protect_and_hide_tabs(
         sh,
         authorized_user_email,
-        protected_titles=["BP_DATABASE", "KTP_INDEX", "INDEX_LEN", "INDEX_KTP_SHARD", "EXACT_INDEX", "INDEX_EXACT_SHARD", "INDEX_LEN_TOKEN", "META"],
-        hidden_titles=["KTP_INDEX", "INDEX_LEN", "INDEX_KTP_SHARD", "EXACT_INDEX", "INDEX_EXACT_SHARD", "INDEX_LEN_TOKEN"],
+        protected_titles=["BP_DATABASE", "KTP_INDEX", "NPWP_INDEX", "INDEX_LEN", "INDEX_KTP_SHARD", "INDEX_NPWP_SHARD", "EXACT_INDEX", "INDEX_EXACT_SHARD", "INDEX_LEN_TOKEN", "META"],
+        hidden_titles=["KTP_INDEX", "NPWP_INDEX", "INDEX_LEN", "INDEX_KTP_SHARD", "INDEX_NPWP_SHARD", "EXACT_INDEX", "INDEX_EXACT_SHARD", "INDEX_LEN_TOKEN"],
     )
 
     logging.info("DONE. Sheet synced and indexed successfully.")

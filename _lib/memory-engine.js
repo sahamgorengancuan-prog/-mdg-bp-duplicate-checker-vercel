@@ -27,8 +27,9 @@ import {
 
 const gunzipAsync=promisify(gunzip);
 const PACKED_TAB='PACKED_SNAPSHOT';
-const PACKED_HEADER='bp_id\tbp_type_id\tname_1\taddress\tktp_digits';
-const PACKED_VERSION='1';
+const PACKED_HEADER_V1='bp_id\tbp_type_id\tname_1\taddress\tktp_digits';
+const PACKED_HEADER_V2='bp_id\tbp_type_id\tname_1\taddress\tktp_digits\tnpwp_digits';
+const PACKED_VERSIONS=new Set(['1','2']);
 const PART_READ_ROWS=60;          // ~2.4 MB per Google Sheets range
 const MAX_PART_CHARS=50000;       // Google Sheets hard cell limit
 const BUILD_YIELD_EVERY=4000;     // keep the event loop responsive while indexing
@@ -40,7 +41,9 @@ const KEYED_READ_ROWS=20000;      // v14 tab fallback: ~2.6 MB per range
 const fail=(status,message,extra={})=>Object.assign(new Error(message),{status},extra);
 const sha256=buf=>createHash('sha256').update(buf).digest('hex');
 const key52=hex=>parseInt(hex.slice(0,13),16);
-const ktpKey=digits=>key52(createHash('sha1').update(digits).digest('hex'));
+const identityKey=digits=>key52(createHash('sha1').update(digits).digest('hex'));
+const ktpKey=identityKey;
+const npwpKey=identityKey;
 const normKey=text=>key52(createHash('sha1').update(text).digest('hex'));
 const yieldLoop=()=>new Promise(resolve=>setImmediate(resolve));
 const envNumber=(env,name,fallback,min=0)=>{
@@ -137,7 +140,7 @@ export class SnapshotIndex {
   packedRecord(i){
     const f=this.raw.toString('utf8',this.lineStart[i],this.lineEnd[i]).split('\t');
     return {bp_id:f[0],bp_type_id:f[1],name_1:f[2],address:f[3],ktp:f[4],
-      norm_text:this.normText(i)};
+      npwp:f[5]||'',norm_text:this.normText(i)};
   }
   // Packed snapshots hold every source field. v14-tab snapshots hold only the
   // normalized text, so the few rows a FAIL needs are read from BP_DATABASE in
@@ -163,9 +166,28 @@ export class SnapshotIndex {
     if(this.kind==='packed')
       return found.map(i=>this.packedRecord(i)).filter(r=>r.ktp===ktp);
     const recs=await this.records(found,fetchRows);
-    for(const r of recs){
-      if(r.row_hash!==sha256(JSON.stringify([r.bp_id,r.bp_type_id,r.name_1,r.address,ktp])))
+    for(let n=0;n<recs.length;n++){
+      const i=found[n],other=this.npwpByOwner?.[i]||'';
+      const expected=this.identityVersion==='2'
+        ?sha256(JSON.stringify([recs[n].bp_id,recs[n].bp_type_id,recs[n].name_1,recs[n].address,ktp,other]))
+        :sha256(JSON.stringify([recs[n].bp_id,recs[n].bp_type_id,recs[n].name_1,recs[n].address,ktp]));
+      if(recs[n].row_hash!==expected)
         throw fail(503,'KTP posting not bound to authoritative BP row/hash. NO PASS.');
+    }
+    return recs;
+  }
+  async findNpwp(npwp,fetchRows){
+    if(!npwp)return [];
+    if(!this.npwpReady)throw fail(503,'NPWP index is not available in the active snapshot yet. No PASS.');
+    const found=sortedLookup(this.npwpKeys,this.npwpIdx,npwpKey(npwp));
+    if(this.kind==='packed')
+      return found.map(i=>this.packedRecord(i)).filter(r=>r.npwp===npwp);
+    const recs=await this.records(found,fetchRows);
+    for(let n=0;n<recs.length;n++){
+      const i=found[n],ktp=this.ktpByOwner?.[i]||'';
+      const expected=sha256(JSON.stringify([recs[n].bp_id,recs[n].bp_type_id,recs[n].name_1,recs[n].address,ktp,npwp]));
+      if(recs[n].row_hash!==expected)
+        throw fail(503,'NPWP posting not bound to authoritative BP row/hash. NO PASS.');
     }
     return recs;
   }
@@ -324,6 +346,7 @@ class IndexBuilder {
     this.dictIndex=new Map();this.dict=[];
     this.hist=new Uint8Array(ALPHABET*65536);
     this.lengths=[];this.keys=[];this.ktpKeys=[];this.ktpOwners=[];
+    this.npwpKeys=[];this.npwpOwners=[];
     this.exactByNorm=exactByNorm;
   }
   // text: normalizeText() output. exactKey: 52-bit exact Name+Address hash key
@@ -361,6 +384,7 @@ class IndexBuilder {
     return i;
   }
   addKtp(ktp,owner){this.ktpKeys.push(ktpKey(ktp));this.ktpOwners.push(owner);}
+  addNpwp(npwp,owner){this.npwpKeys.push(npwpKey(npwp));this.npwpOwners.push(owner);}
   async finish(snap){
     const count=this.count,maxLen=this.maxLen,dict=this.dict;
     this.normStart.push(this.normLen);this.tokStart.push(this.tokIds.n);
@@ -392,6 +416,11 @@ class IndexBuilder {
     snap.ktpKeys=kSort.keys;
     snap.ktpIdx=Uint32Array.from(kSort.idx,p=>owners[p]);
     snap.ktpCount=kKeys.length;
+    const nKeys=Float64Array.from(this.npwpKeys),nSort=sortByKey(nKeys,nKeys.length);
+    const npwpOwners=this.npwpOwners;
+    snap.npwpKeys=nSort.keys;
+    snap.npwpIdx=Uint32Array.from(nSort.idx,p=>npwpOwners[p]);
+    snap.npwpCount=nKeys.length;
     snap.bandA=new Int32Array(maxLen+2);snap.bandB=new Int32Array(maxLen+2);
     const longestToken=dict.reduce((n,t)=>t.length>n?t.length:n,0);
     snap.rowA=new Int32Array(longestToken+2);snap.rowB=new Int32Array(longestToken+2);
@@ -404,7 +433,8 @@ export async function buildSnapshotIndex(raw,{expectedRecords=null}={}){
   if(!Buffer.isBuffer(raw))raw=Buffer.from(raw);
   let pos=raw.indexOf(10);
   const header=raw.toString('utf8',0,pos<0?raw.length:pos).replace(/\r$/,'');
-  if(header!==PACKED_HEADER)throw fail(503,'PACKED_SNAPSHOT header/schema mismatch. No PASS.');
+  const packedVersion=header===PACKED_HEADER_V2?'2':header===PACKED_HEADER_V1?'1':'';
+  if(!packedVersion)throw fail(503,'PACKED_SNAPSHOT header/schema mismatch. No PASS.');
   const builder=new IndexBuilder(Math.floor(raw.length*0.8));
   const lineStart=new GrowU32(),lineEnd=new GrowU32();
   while(pos>=0&&pos<raw.length){
@@ -414,21 +444,21 @@ export async function buildSnapshotIndex(raw,{expectedRecords=null}={}){
     pos=end<raw.length?end:-1;
     if(end===start)continue;
     const fields=raw.toString('utf8',start,end).split('\t');
-    if(fields.length!==5||!fields[0])
+    if(fields.length!==(packedVersion==='2'?6:5)||!fields[0])
       throw fail(503,'PACKED_SNAPSHOT row '+(builder.count+1)+' is malformed. No PASS.');
-    const [,,name,address,ktp]=fields;
-    // normalizeText() is local per character/word and the joining space breaks
-    // every context, so normalize(name+' '+address) equals the join below
-    // (fuzz-verified; tests re-check it). Saves one normalization per BP.
+    const [,,name,address,ktp,npwp='']=fields;
     const nName=normalizeText(name),nAddress=normalizeText(address);
     const text=nName&&nAddress?nName+' '+nAddress:nName||nAddress;
     lineStart.push(start);lineEnd.push(end);
-    // Identical to exactNameAddressHash(name,address), without re-normalizing.
     const i=builder.add(text,key52(createHash('sha256')
       .update(nName+'\x1f'+nAddress,'utf8').digest('hex')));
     if(ktp){
       if(normalizeDigits(ktp)!==ktp)throw fail(503,'PACKED_SNAPSHOT KTP is not normalized. No PASS.');
       builder.addKtp(ktp,i);
+    }
+    if(npwp){
+      if(normalizeDigits(npwp)!==npwp)throw fail(503,'PACKED_SNAPSHOT NPWP is not normalized. No PASS.');
+      builder.addNpwp(npwp,i);
     }
     if(builder.count%BUILD_YIELD_EVERY===0)await yieldLoop();
   }
@@ -436,7 +466,8 @@ export async function buildSnapshotIndex(raw,{expectedRecords=null}={}){
   if(expectedRecords!==null&&builder.count!==expectedRecords)
     throw fail(503,`PACKED_SNAPSHOT has ${builder.count} BP rows, META expects ${expectedRecords}. No PASS.`);
   const snap=new SnapshotIndex();
-  snap.kind='packed';snap.raw=raw;
+  snap.kind='packed';snap.raw=raw;snap.identityVersion=packedVersion;
+  snap.npwpReady=packedVersion==='2';
   snap.lineStart=lineStart.done();snap.lineEnd=lineEnd.done();
   return builder.finish(snap);
 }
@@ -444,7 +475,7 @@ export async function buildSnapshotIndex(raw,{expectedRecords=null}={}){
 // Build the same index from the v14 tabs every published pair already has:
 // INDEX_LEN_TOKEN postings [norm, BP_DATABASE row, BP ID] and KTP_INDEX
 // [KTP digits, [row, BP ID]]. Used when PACKED_SNAPSHOT is absent/unusable.
-export async function buildKeyedTabsIndex(postingBlocks,ktpBlocks,{bpRows,ktpRows}){
+export async function buildKeyedTabsIndex(postingBlocks,ktpBlocks,npwpBlocks,{bpRows,ktpRows,npwpRows=0,identityVersion='1'}){
   const builder=new IndexBuilder(bpRows*96,{exactByNorm:true});
   const bpIds=[],rows=new GrowU32(),rowToIdx=new Map();
   for await(const block of postingBlocks){
@@ -467,24 +498,46 @@ export async function buildKeyedTabsIndex(postingBlocks,ktpBlocks,{bpRows,ktpRow
   }
   if(builder.count!==bpRows)
     throw fail(503,`INDEX_LEN_TOKEN has ${builder.count} postings, META expects ${bpRows}. No PASS.`);
+  const ktpByOwner=Array(bpRows).fill(''),npwpByOwner=Array(bpRows).fill('');
   let ktpSeen=0;
   for await(const block of ktpBlocks){
     for(const row of block){
       let posting;
       try{posting=JSON.parse(String(row?.[1]));}catch{posting=null;}
-      const [rowNo,bp]=Array.isArray(posting)?posting:[];
+      const [rowNo,bp,postedKtp='',postedNpwp='']=Array.isArray(posting)?posting:[];
       const digits=normalizeDigits(row?.[0]);
       const i=rowToIdx.get(rowNo);
-      if(!digits||i===undefined||bpIds[i]!==bp)
+      if(!digits||i===undefined||bpIds[i]!==bp||
+         (identityVersion==='2'&&normalizeDigits(postedKtp)!==digits))
         throw fail(503,'KTP_INDEX posting does not match INDEX_LEN_TOKEN. No PASS.');
-      builder.addKtp(digits,i);
+      builder.addKtp(digits,i);ktpByOwner[i]=digits;
+      if(identityVersion==='2')npwpByOwner[i]=normalizeDigits(postedNpwp);
       ktpSeen++;
     }
   }
   if(ktpSeen!==ktpRows)
     throw fail(503,`KTP_INDEX has ${ktpSeen} rows, META expects ${ktpRows}. No PASS.`);
+  let npwpSeen=0;
+  for await(const block of npwpBlocks||[]){
+    for(const row of block){
+      let posting;
+      try{posting=JSON.parse(String(row?.[1]));}catch{posting=null;}
+      const [rowNo,bp,postedKtp='',postedNpwp='']=Array.isArray(posting)?posting:[];
+      const digits=normalizeDigits(row?.[0]);
+      const i=rowToIdx.get(rowNo);
+      if(!digits||i===undefined||bpIds[i]!==bp||normalizeDigits(postedNpwp)!==digits)
+        throw fail(503,'NPWP_INDEX posting does not match INDEX_LEN_TOKEN. No PASS.');
+      builder.addNpwp(digits,i);npwpByOwner[i]=digits;
+      if(normalizeDigits(postedKtp))ktpByOwner[i]=normalizeDigits(postedKtp);
+      npwpSeen++;
+    }
+  }
+  if(npwpSeen!==npwpRows)
+    throw fail(503,`NPWP_INDEX has ${npwpSeen} rows, META expects ${npwpRows}. No PASS.`);
   const snap=new SnapshotIndex();
   snap.kind='v14_tabs';snap.bpIds=bpIds;snap.bpRows=rows.done();
+  snap.identityVersion=identityVersion;snap.npwpReady=identityVersion==='2';
+  snap.ktpByOwner=ktpByOwner;snap.npwpByOwner=npwpByOwner;
   return builder.finish(snap);
 }
 
@@ -514,7 +567,7 @@ async function sheetsBatchGet(env,sheetId,ranges,{attempts=5}={}){
 }
 
 export function packedInfo(indexMeta,primaryMeta,control){
-  if(indexMeta.packed_snapshot_version!==PACKED_VERSION)return null;
+  if(!PACKED_VERSIONS.has(String(indexMeta.packed_snapshot_version||'')))return null;
   const parts=Number(indexMeta.packed_parts),records=Number(indexMeta.packed_records);
   const hash=String(indexMeta.packed_sha256||'');
   if(!Number.isSafeInteger(parts)||parts<1||!Number.isSafeInteger(records)||records<1||
@@ -574,12 +627,18 @@ async function* tabBlocks(env,sheetId,tab,count){
 
 async function loadKeyedTabs(env,control,meta){
   const bpRows=Number(meta.total_bp_rows),ktpRows=Number(meta.total_ktp_index_rows);
-  if(!Number.isSafeInteger(bpRows)||bpRows<1||!Number.isSafeInteger(ktpRows)||ktpRows<0)
+  const identityVersion=String(meta.identity_index_version||'1');
+  const npwpRows=identityVersion==='2'?Number(meta.total_npwp_index_rows):0;
+  if(!Number.isSafeInteger(bpRows)||bpRows<1||!Number.isSafeInteger(ktpRows)||ktpRows<0||
+     !Number.isSafeInteger(npwpRows)||npwpRows<0)
     throw fail(503,'v14 META row counts are invalid. No PASS.');
   const book=control.active_index_sheet_id;
+  async function* emptyBlocks(){}
   const index=await buildKeyedTabsIndex(
     tabBlocks(env,book,'INDEX_LEN_TOKEN',bpRows),
-    tabBlocks(env,book,'KTP_INDEX',ktpRows),{bpRows,ktpRows});
+    tabBlocks(env,book,'KTP_INDEX',ktpRows),
+    identityVersion==='2'?tabBlocks(env,book,'NPWP_INDEX',npwpRows):emptyBlocks(),
+    {bpRows,ktpRows,npwpRows,identityVersion});
   // The tabs carry no per-row sync_id: the pair must still be the committed
   // generation after reading them (a sync only ever rewrites the STANDBY pair).
   const after=await readDualControl(env);
@@ -760,7 +819,10 @@ export async function memoryCheck(payload,env,snapshot){
   const name=String(payload?.name_1||payload?.name1||'').trim();
   const address=String(payload?.address||'').trim();
   const ktp=normalizeDigits(payload?.ktp_number||payload?.ktp||'');
-  if(!name&&!address&&!ktp)throw fail(400,'Provide Name 1, Address or KTP.');
+  const npwp=normalizeDigits(payload?.npwp_number||payload?.npwp||'');
+  if(!name&&!address&&!ktp&&!npwp)throw fail(400,'Provide Name 1, Address, KTP or NPWP.');
+  if(npwp&&!snap.npwpReady)
+    throw fail(503,'NPWP index is not available in the active snapshot yet. No PASS.');
   const qtext=normalizeText(name+' '+address);
   const threshold=Number(env.SIMILARITY_THRESHOLD||92);
   const direct=getSimilarityDirectRejectThreshold(env);
@@ -770,8 +832,8 @@ export async function memoryCheck(payload,env,snapshot){
   let mark=Date.now();
   const step=(name,extra={})=>{const now=Date.now();trace.push({step:name,ms:now-mark,...extra});mark=now;};
   const base={ok:true,threshold,direct_reject_threshold:direct,meta,
-    input:{name_1:name,address,ktp_masked:maskKtp(ktp),normalized_length:qtext.length},
-    exact_ktp_match:null,exact_name_address_match:null,exact_match_count:0,
+    input:{name_1:name,address,ktp_masked:maskKtp(ktp),npwp_masked:maskKtp(npwp),normalized_length:qtext.length},
+    exact_ktp_match:null,exact_npwp_match:null,exact_name_address_match:null,exact_match_count:0,
     identity_conflict:false,similarity_match:null,top_candidates:[],
     full_scope_cursor:null,full_scope_available:false,full_scope_active:false,
     search_backend:'MEMORY_FULL_SCAN',memory_source:snapshot.source,trace};
@@ -793,33 +855,39 @@ export async function memoryCheck(payload,env,snapshot){
   };
   const ktpHits=await snap.findKtp(ktp,fetchRows);
   step('exact_ktp',{attempted:Boolean(ktp),hits:ktpHits.length});
+  const npwpHits=await snap.findNpwp(npwp,fetchRows);
+  step('exact_npwp',{attempted:Boolean(npwp),hits:npwpHits.length});
   const exactHits=name&&address?await snap.findExact(name,address,fetchRows):[];
   step('exact_name_address',{attempted:Boolean(name&&address),hits:exactHits.length});
   const exactLookup={attempted:Boolean(name&&address),index_version:'1',
     shard_present:Boolean(name&&address),shard_rows:snap.count,
     matching_index_rows:exactHits.length,verified_matches:exactHits.length};
-  if(ktpHits.length||exactHits.length){
-    const conflict=Boolean(ktpHits.length&&exactHits.some(x=>x.bp_id!==ktpHits[0].bp_id));
+  if(ktpHits.length||npwpHits.length||exactHits.length){
+    const exactIds=[ktpHits[0]?.bp_id,npwpHits[0]?.bp_id,...exactHits.map(x=>x.bp_id)].filter(Boolean);
+    const conflict=new Set(exactIds.map(String)).size>1;
     return {...base,decision:'FAIL',identity_conflict:conflict,
       reason:conflict
-        ?'IDENTITY CONFLICT: the KTP and exact Name 1 + Address match different BP IDs. Review both records; do not auto-approve.'
-        :ktpHits.length&&exactHits.length?'KTP and Name 1 + Address exact matches found.'
+        ?'IDENTITY CONFLICT: KTP/NPWP/Name+Address exact checks identify different BP IDs. Review all records; do not auto-approve.'
+        :ktpHits.length&&npwpHits.length&&exactHits.length?'KTP, NPWP and Name 1 + Address exact matches found.'
         :ktpHits.length?'KTP exact match found in protected database.'
+        :npwpHits.length?'NPWP exact match found in protected database.'
         :`Exact Name 1 + Address match found (${exactHits.length} BP record(s)).`,
       exact_ktp_match:ktpHits.length?sanitizeBpRow(ktpHits[0],100,{reason:'KTP Exact Match'}):null,
+      exact_npwp_match:npwpHits.length?sanitizeBpRow(npwpHits[0],100,{reason:'NPWP Exact Match'}):null,
       exact_name_address_match:exactHits.length?
         sanitizeBpRow(exactHits[0],100,{reason:'Exact Name 1 + Address Match'}):null,
       exact_match_count:exactHits.length,exact_lookup:exactLookup,
-      top_candidates:[...ktpHits.slice(1),...exactHits.slice(1)].slice(0,5)
+      top_candidates:[...ktpHits.slice(1),...npwpHits.slice(1),...exactHits.slice(1)].slice(0,5)
         .map(x=>sanitizeBpRow(x,100,{reason:'Exact match'})),
       stats:stats({pass_basis:null})};
   }
   if(qtext.length<3){
-    return {...base,decision:ktp?'PASS':'INCONCLUSIVE',exact_lookup:exactLookup,
-      reason:ktp?'No matching KTP; insufficient text for a text similarity check.'
+    const identityProvided=Boolean(ktp||npwp);
+    return {...base,decision:identityProvided?'PASS':'INCONCLUSIVE',exact_lookup:exactLookup,
+      reason:identityProvided?'No matching KTP/NPWP; insufficient text for a text similarity check.'
         :'Provide more Name 1 / Address information to check text similarity.',
-      stats:stats({coverage_complete:Boolean(ktp),
-        pass_basis:ktp?'KTP_EXACT_INDEX_COMPLETE':null})};
+      stats:stats({coverage_complete:identityProvided,
+        pass_basis:identityProvided?'IDENTITY_EXACT_INDEX_COMPLETE':null})};
   }
   const maxLenDiff=getMaxLenDiff(env,qtext.length);
   const budget=envNumber(env,'SNAPSHOT_MAX_CHECK_MS',25000,1000);
@@ -850,7 +918,7 @@ export async function memoryCheck(payload,env,snapshot){
   return {...base,decision:'PASS',exact_lookup:exactLookup,
     reason:`No duplicate: all ${snap.count.toLocaleString('en-US')} BP records evaluated `+
       `(${scan.eligible.toLocaleString('en-US')} within length tolerance, every one scored or `+
-      'excluded by a proven score upper bound). Exact KTP and Name 1 + Address indexes checked.',
+      'excluded by a proven score upper bound). Exact KTP, NPWP and Name 1 + Address indexes checked.',
     stats:scanStats};
 }
 
